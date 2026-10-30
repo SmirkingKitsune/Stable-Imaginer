@@ -1,0 +1,56 @@
+# Standalone: one computer runs the server, both engines and keeps every conversation.
+# This is the usual setup. Start from here and set the model files on the Engines screen
+# (they are saved to config/standalone.local.yaml), or here under each `launch`.
+#
+# Another Imaginer instance on the network can lend this one an engine, or show its
+# conversations in this gallery: see `links` below and docs/linked-instances.md.
+#
+# Secrets are not stored here. Set them in the environment (or a gitignored .env):
+#   IMAGINER_SERVER__AUTH_TOKEN  bearer token for this server's /v1 API; needed to link
+
+# Omit data_root to use the per-user default (%LOCALAPPDATA%\imaginer, ~/.local/share/imaginer).
+# data_root: D:/Imaginer
+
+server:
+  host: 127.0.0.1
+  port: 8700
+
+logging:
+  level: INFO
+  format: console
+
+backends:
+  # llama.cpp llama-server with a vision chat model (Qwen3-VL works well).
+  llama:
+    type: llamacpp
+    base_url: http://127.0.0.1:8080
+    launch: {}  # model: <path to the GGUF>, mmproj: <its vision projector>
+    sampling:
+      temperature: 0.7
+      top_p: 0.8
+
+  # stable-diffusion.cpp sd-server with Qwen-Image-2.1. Edit needs llm_vision set;
+  # without it, drop edit and multi_ref here.
+  sdcpp:
+    type: sdcpp
+    base_url: http://127.0.0.1:1234
+    launch: {}  # diffusion_model, vae, llm, llm_vision: paths to the model files
+    declared_capabilities: [t2i, edit, multi_ref, rgba]
+    defaults:
+      width: 1024
+      height: 1024
+      steps: 20
+      cfg_scale: 6.0
+      sampler: euler
+
+routing:
+  chat: llama
+  t2i: sdcpp
+  edit: sdcpp
+
+# Linking with other instances. Off, this instance needs nothing from the network. On, it
+# must be reachable (server.host: 0.0.0.0) and have a token (IMAGINER_SERVER__AUTH_TOKEN).
+links:
+  enabled: false
+  # share:                      # engines linked instances may use
+  #   sdcpp: {remote_start: true}  # and may start when it is stopped, if the model fits

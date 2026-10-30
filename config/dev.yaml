@@ -1,0 +1,45 @@
+# Development profile. No GPU needed: points at the fake engines from `python -m tests.fakes`.
+# Relative paths resolve against the directory you start the server from (the repo root).
+
+data_root: ./.data/dev
+
+server:
+  host: 127.0.0.1
+  port: 8700
+
+logging:
+  level: DEBUG
+  format: console
+
+backends:
+  llama:
+    type: llamacpp
+    base_url: http://127.0.0.1:18080
+  sdcpp:
+    type: sdcpp
+    base_url: http://127.0.0.1:11234
+    declared_capabilities: [t2i, edit, multi_ref, rgba]
+    poll_interval_s: 0.1
+    defaults:
+      width: 512
+      height: 512
+      steps: 4
+      cfg_scale: 6.0
+      sampler: euler
+
+routing:
+  chat: llama
+  t2i: sdcpp
+  edit: sdcpp
+
+# Linking on one machine, for development: run `imaginer serve --profile dev-peer` next to
+# this one (port 8701), then pair them on the Links screen. Both stay on loopback, so no
+# token is needed.
+links:
+  enabled: true
+  name: dev
+  advertise_url: http://127.0.0.1:8700
+  discovery: false
+  share:
+    llama: {}
+    sdcpp: {}

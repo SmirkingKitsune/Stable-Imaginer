@@ -1,0 +1,50 @@
+# NAS: Linux x64, RTX 2000e Ada (16 GB, sm_89). Runs the chat LLM next to the server, and
+# shares it with the desktop over a link. Its own conversations can make images on the
+# desktop's sd-server, which the desktop shares back. See docs/linked-instances.md.
+#
+# Headless? Make the pairing code here with `imaginer link code --profile nas`, and type it
+# on the desktop's Links screen.
+#
+# Secrets come from the environment:
+#   IMAGINER_LLAMA_LOCAL_KEY     API key of the local llama-server, if it was started with one
+#   IMAGINER_SERVER__AUTH_TOKEN  bearer token (required: this server is reachable on the LAN)
+
+data_root: ~/imaginer-data
+
+server:
+  host: 0.0.0.0
+  port: 8700
+
+logging:
+  level: INFO
+  format: json
+
+backends:
+  # llama-server stays on loopback: the desktop reaches it through this server.
+  llama:
+    type: llamacpp
+    base_url: http://127.0.0.1:8080
+    api_key_env: IMAGINER_LLAMA_LOCAL_KEY
+    model: qwen3-vl-8b-instruct
+    sampling:
+      temperature: 0.7
+      top_p: 0.8
+
+  # The desktop's sd-server, used through the link named "desktop". Images are made there
+  # and stored here.
+  sdcpp_desktop:
+    type: linked
+    link: desktop
+    engine: sdcpp
+    kind: image
+
+routing:
+  chat: llama
+  t2i: sdcpp_desktop
+  edit: sdcpp_desktop
+
+links:
+  enabled: true
+  name: nas  # the desktop's backend `llama_nas` refers to its link by this name
+  share:
+    llama: {}  # remote_start: true lets the desktop start it (needs a launch block)

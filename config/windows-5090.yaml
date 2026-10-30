@@ -1,0 +1,75 @@
+# Desktop: Windows 11, RTX 5090 (32 GB, sm_120). An offloading instance: conversations and
+# image generation live here, and chat runs on the NAS's llama-server, which the NAS
+# shares over a link. The desktop shares its sd-server with the NAS in turn.
+#
+# Link the two once: on the NAS, `imaginer link code --profile nas` (or "Allow a link" on
+# its Links screen); here, Linked instances > link with http://nas.local:8700, that code
+# and the name "nas". See docs/linked-instances.md.
+#
+# Secrets are not stored here. Set them in the environment (or a gitignored .env):
+#   IMAGINER_SERVER__AUTH_TOKEN  bearer token for this server's /v1 API (required: it is
+#                                reachable from the network, to link)
+
+# Omit data_root to use the per-user default (%LOCALAPPDATA%\imaginer).
+# data_root: D:/Imaginer
+
+server:
+  host: 0.0.0.0
+  port: 8700
+
+logging:
+  level: INFO
+  format: console
+
+backends:
+  # The NAS's llama-server, used through the link named "nas". The model runs there.
+  llama_nas:
+    type: linked
+    link: nas
+    engine: llama
+    kind: llm
+
+  # stable-diffusion.cpp sd-server with Qwen-Image-2.1 (see README for the launch command).
+  # Edit needs sd-server started with --llm_vision <mmproj>; without it, drop edit/multi_ref here.
+  # It stays on loopback: the NAS reaches it through this server, with the link's token.
+  sdcpp:
+    type: sdcpp
+    base_url: http://127.0.0.1:1234
+    concurrency: 1
+    declared_capabilities: [t2i, edit, multi_ref, rgba]
+    max_ref_images: 10
+    timeouts:
+      read: 120
+    defaults:
+      width: 1024
+      height: 1024
+      steps: 20
+      cfg_scale: 6.0
+      sampler: euler
+      output_format: png
+
+  # Optional in-process reference backend: `uv sync --extra diffusers`, then enable it and point
+  # routing.t2i / routing.edit here. Diffusers samples Qwen-Image-2.1 without guidance
+  # (true_cfg_scale 1.0) at 40 steps, 2048x2048. cpu_offload trades speed for VRAM.
+  diffusers:
+    type: diffusers
+    enabled: false
+    model_id: Qwen/Qwen-Image-2.1
+    device: cuda:0
+    dtype: bfloat16
+    defaults:
+      width: 2048
+      height: 2048
+      steps: 40
+      cfg_scale: 1.0
+
+routing:
+  chat: llama_nas
+  t2i: sdcpp
+  edit: sdcpp
+
+links:
+  enabled: true
+  name: desktop  # the NAS's backend `sdcpp_desktop` refers to its link by this name
+  share:
+    sdcpp: {}  # remote_start: true lets the NAS start it (needs a launch block)

@@ -1,0 +1,50 @@
+# A second development instance (port 8701) for trying linked instances on one machine.
+# It has no chat engine of its own: chat goes to the `dev` instance's llama over the link
+# named "dev". Its images are made by the fake sd-server directly, and shared back.
+#
+#   uv run python -m tests.fakes                  # the fake engines
+#   uv run imaginer serve --profile dev           # port 8700
+#   uv run imaginer serve --profile dev-peer      # port 8701
+#
+# Then on either one: Linked instances > Allow a link, and type the code on the other.
+
+data_root: ./.data/dev-peer
+
+server:
+  host: 127.0.0.1
+  port: 8701
+
+logging:
+  level: DEBUG
+  format: console
+
+backends:
+  dev_llama:
+    type: linked
+    link: dev
+    engine: llama
+    kind: llm
+  sdcpp:
+    type: sdcpp
+    base_url: http://127.0.0.1:11234
+    declared_capabilities: [t2i, edit, multi_ref, rgba]
+    poll_interval_s: 0.1
+    defaults:
+      width: 512
+      height: 512
+      steps: 4
+      cfg_scale: 6.0
+      sampler: euler
+
+routing:
+  chat: dev_llama
+  t2i: sdcpp
+  edit: sdcpp
+
+links:
+  enabled: true
+  name: peer
+  advertise_url: http://127.0.0.1:8701
+  discovery: false
+  share:
+    sdcpp: {}
