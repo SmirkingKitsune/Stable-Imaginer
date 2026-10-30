@@ -119,7 +119,11 @@ class EngineProcess:
 
     async def _spawn(self, run: Run) -> None:
         loop = asyncio.get_running_loop()
-        flags = subprocess.CREATE_NEW_PROCESS_GROUP if sys.platform == "win32" else 0
+        # A statement, not a conditional expression: mypy only narrows platform checks here.
+        if sys.platform == "win32":
+            flags = subprocess.CREATE_NEW_PROCESS_GROUP
+        else:
+            flags = 0
         try:
             proc = await asyncio.to_thread(
                 subprocess.Popen,

@@ -56,7 +56,7 @@ def configure_logging(level: str = "INFO", fmt: str = "console") -> None:
     # We log one line per request ourselves, with the request id.
     logging.getLogger("uvicorn.access").setLevel(logging.WARNING)
     # Chatty third-party loggers that would drown our DEBUG output.
-    for name in ("aiosqlite", "asyncio", "httpx", "httpcore", "multipart", "PIL"):
+    for name in ("aiosqlite", "asyncio", "httpx", "httpcore", "multipart", "PIL", "sse_starlette"):
         logging.getLogger(name).setLevel(logging.WARNING)
 
 

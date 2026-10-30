@@ -479,11 +479,12 @@ Source builds require Git, CMake, a C++ compiler, and the selected accelerator's
 `imaginer llama plan` previews steps, `imaginer llama check-update` checks upstream, and
 `--tag <tag-or-ref>` pins an install. `--force` replaces an existing runtime, including
 when updating `latest`. See [docs/llama-provisioning.md](docs/llama-provisioning.md) for
-all options and the Python interface for future UI integration.
+all options and the Python interface, which the [Engines screen](#engines-screen) also uses.
 
 These commands install the executable and libraries. Start the returned executable with
-the model arguments below, and configure the existing HTTP backend's `base_url` as usual.
-`imaginer serve` does not download, build, or launch engines automatically.
+the model arguments below, and configure the existing HTTP backend's `base_url` as usual,
+or give the backend a `launch` block and start it from the Engines screen. `imaginer serve`
+never downloads or builds engines, and launches one only if its `launch.autostart` is true.
 
 The reference model is **Qwen3-VL-8B-Instruct**: vision and tool calling, and about 6 GB at Q4_K_M
 plus its projector. Download both files from
@@ -636,11 +637,3 @@ uv sync --extra diffusers
 - **llama-server tool calling:** `--jinja` is on by default. The adapter reads
   `/props` → `chat_template_caps.supports_tools` and `modalities.vision` rather than assuming
   either. To run chat on the 5090, use the `win-cuda-13.4` build: CUDA 12.4 can't target `sm_120`.
-
-## Milestones
-
-1. ✅ Skeleton, config, data model + migrations, artifact store, conversation/artifact CRUD
-2. ✅ llama.cpp adapter and streaming chat endpoint (SSE)
-3. ✅ sd.cpp adapter, job queue, `generate_image` tool, artifact lineage
-4. ✅ `edit_image` tool with label resolution, uploads as inputs, cancellation
-5. ✅ Diffusers in-process backend (`uv sync --extra diffusers`), CI completion
