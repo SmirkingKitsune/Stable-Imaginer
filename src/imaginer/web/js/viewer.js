@@ -1,17 +1,21 @@
-// The viewer (designs 2a, 2e): a tile opens here, on the conversation's latest image, with a
-// reel of every other image beside it (above the bar on narrow screens). Focusing the bar,
-// or pressing Conversation, opens the full thread with the draft kept, on the branch of the
-// image shown. Images from other branches than the one shown carry a branch mark in the
-// reel; Retry runs an image's tool call again on a new branch.
+// The viewer (designs 2a, 2e): a tile opens here, on the conversation's latest image. The
+// stage takes all the room the screen has; beside it (below it on narrow screens) a column
+// holds the image's actions, prompt and details over a reel of every image, and collapses
+// to the reel alone. Under the stage, a one-line reply field: focusing it, or pressing
+// Conversation, opens the full thread with the draft kept, on the branch of the image shown.
+// Images from other branches than the one shown carry a branch mark in the reel; Retry runs
+// an image's tool call again on a new branch.
 //
-// Inspection (designs 5a, 5b): a zoom bar in the stage (fit, 1:1, steps up to 400%), drag
-// to pan once the image outgrows the stage, with a minimap. Compare pairs an edit with its
-// edit_source from lineage, as a slider or side by side; zoom applies to both sides.
+// Inspection (designs 5a, 5b): scroll or pinch to zoom about the pointer, drag to pan once
+// the image outgrows the stage, double-click (or double-tap) between fit and 1:1, and a zoom
+// bar (fit, 1:1, steps up to 400%) with a minimap. At fit, a sideways swipe on a touch
+// screen steps through the images. Compare pairs an edit with its edit_source from lineage,
+// as a slider or side by side; zoom applies to both sides.
 
 import { download, setImage } from './api.js';
 import { connectionStrip, toast } from './chrome.js';
 import { corners, h, icon, iconButton, clear } from './dom.js';
-import { imagesSummary, specOf, truncate } from './format.js';
+import { imagesSummary, specOf } from './format.js';
 import { convHash } from './origin.js';
 import { promptBar } from './promptbar.js';
 import {
@@ -23,7 +27,24 @@ const SOURCE_WORD = { upload: 'upload', generated: 'generated', edited: 'edited'
 const STEPS = [0.5, 1, 2, 4]; // zoom levels besides fit
 const MAX_ZOOM = 8;
 const PAN_STEP = 60; // px per arrow key while zoomed
-const SIDE_GAP = 12;
+const WHEEL_RATE = 0.002; // zoom per wheel px: a ~100 px notch is ×1.22
+const PINCH_RATE = 0.01; // a trackpad pinch arrives as ctrl+wheel in small steps
+const LINE_GRAB = 20; // px either side of the compare divider that move it while zoomed
+const SWIPE = 60; // px of sideways travel that steps to the next image at fit
+const DOUBLE_TAP_MS = 300;
+const SIDE_KEY = 'imaginer.viewerSide';
+const ZOOM_HINT = matchMedia('(hover: none)').matches ? 'pinch to zoom' : 'scroll to zoom';
+
+/** The column starts open on wide screens, until the user says otherwise. */
+function sideOpenAtStart() {
+  try {
+    const saved = localStorage.getItem(SIDE_KEY);
+    if (saved) return saved === 'open';
+  } catch {
+    // No storage (private mode): the default below.
+  }
+  return window.innerWidth >= 720;
+}
 
 export function viewerScreen({ id, label, navigate }) {
   let c = null;
@@ -34,8 +55,12 @@ export function viewerScreen({ id, label, navigate }) {
   const view = { zoom: null, panX: 0, panY: 0, w: 0, h: 0 };
   // compare: null, or {before: artifact | null (picking one), mode: 'slider' | 'side', split}
   let compare = null;
-  let drag = null;
+  let drag = null; // {kind: 'split'} | {kind: 'pan', x, y, px, py} | {kind: 'swipe'}
+  let pinch = null; // two fingers down: {p, d0, z0, mx, my, px, py} as the pinch began
+  const pointers = new Map(); // pointerId → {x, y, x0, y0} while down on a stage
+  let tap = null; // the last tap, for a double tap: {x, y, t}
   let spaceHeld = false;
+  let sideOpen = sideOpenAtStart();
 
   const title = h('span.topbar-title', '…');
   const meta = h('span.topbar-meta');
@@ -86,32 +111,43 @@ export function viewerScreen({ id, label, navigate }) {
   main.el.append(minimap, zoomBar);
   const panes = h('div.stage-row', main.el, side.el);
 
-  const prompt = h('span.stage-prompt');
-  const source = h('span.mono-meta.accent');
-  const spec = h('span.mono-meta');
-  const branchMeta = h('span.mono-meta');
-  const pixelNote = h('span.mono-meta');
-  const retryBtn = iconButton('retry', 'Retry → new branch', () => current && retryCurrent());
-  const compareBtn = iconButton('compare', 'Compare (C)', () => toggleCompare());
+  // --- side column: actions, prompt and details, the reel ---------------------------
+
+  const sideLabel = h('span.side-label');
+  const sideKind = h('span.eyebrow');
+  const sideBtn = h('button.icon-btn.side-toggle', {
+    type: 'button', 'aria-label': 'Details', onclick: () => setSide(!sideOpen),
+  }, icon('info', 17));
+  const action = (name, text, hint, onclick) =>
+    h('button.side-action', { type: 'button', title: hint, onclick }, icon(name, 15), h('span', text));
+  const retryBtn = action('retry', 'Retry', 'Retry → new branch', () => current && retryCurrent());
+  const compareBtn = action('compare', 'Compare', 'Compare (C)', () => toggleCompare());
   const seg = (mode, text) => h('button.pick', { type: 'button', onclick: () => setMode(mode) }, text);
   const modeSeg = h('div.tray-seg.cmp-modes', { hidden: true, role: 'group', 'aria-label': 'Compare view' },
     seg('slider', 'Slider'), seg('side', 'Side by side'));
-  const actions = h('span.stage-actions',
+  const actions = h('div.side-actions',
+    action('pencil', 'Edit', 'Edit this image', () => current && editCurrent()),
+    action('brush', 'Mask', 'Mask: paint the area to change', () => current && navigate(convHash(id, 'mask', current.label))),
     retryBtn,
-    iconButton('pencil', 'Edit this image', () => current && editCurrent()),
-    iconButton('brush', 'Mask: paint the area to change', () => current && navigate(convHash(id, 'mask', current.label))),
-    iconButton('download', 'Download', () => current && save(current)));
-  const info = h('div.stage-info',
-    h('div.stage-text', prompt, h('div.stage-meta', source, spec, branchMeta, pixelNote)),
-    modeSeg, compareBtn, actions);
-  const stageCol = h('div.stage-col', panes, info);
+    action('download', 'Download', 'Download', () => current && save(current)));
+  const pixelNote = h('span.mono-meta.side-note');
+  const prompt = h('p.side-prompt');
+  const source = h('span.mono-meta.accent');
+  const spec = h('span.mono-meta');
+  const branchMeta = h('span.mono-meta');
+  const reelCount = h('span.eyebrow');
   const reel = h('div.reel', {
     role: 'listbox', tabindex: '0', 'aria-label': 'Images in this conversation', 'aria-orientation': 'vertical',
   });
-  const body = h('div.viewer-body', stageCol, reel);
+  const sideEl = h('aside.viewer-side',
+    h('div.side-head', h('div.side-title', sideLabel, sideKind), sideBtn),
+    h('div.side-tools', actions, compareBtn, modeSeg, pixelNote),
+    h('div.side-info', prompt, h('div.side-meta', source, spec, branchMeta)),
+    h('div.side-reel', h('div.side-reel-head', reelCount), reel));
 
   const bar = promptBar({
     draftKey: id,
+    compact: true,
     placeholder: 'Reply to open the conversation…',
     isBusy: () => running(id),
     onFocus: () => openChat({ focusBar: true }),
@@ -123,37 +159,54 @@ export function viewerScreen({ id, label, navigate }) {
     onStop: () => stop(id),
   });
   const strip = connectionStrip({ turnRunning: () => running(id) });
-  const el = h('div.screen.viewer', header, strip.el, body, h('div.scrim.short'), h('div.dock', bar.el));
+  const body = h('div.viewer-body', h('div.stage-col', panes, h('div.viewer-dock', bar.el)), sideEl);
+  const el = h('div.screen.viewer', header, strip.el, body);
+
+  function setSide(open, { remember = true } = {}) {
+    sideOpen = open;
+    sideEl.classList.toggle('collapsed', !open);
+    sideBtn.classList.toggle('on', open);
+    sideBtn.title = open ? 'Hide details (I)' : 'Show details (I)';
+    sideBtn.setAttribute('aria-expanded', String(open));
+    if (!remember) return;
+    try {
+      localStorage.setItem(SIDE_KEY, open ? 'open' : 'closed');
+    } catch {
+      // Not persisted in private mode; still applies to this page.
+    }
+  }
+  setSide(sideOpen, { remember: false });
 
   // --- layout -------------------------------------------------------------------
 
+  /** One pane, or before and after side by side ("before" first). */
+  function arrangePanes() {
+    const sideBySide = !!compare?.before && compare.mode === 'side';
+    side.el.hidden = !sideBySide;
+    panes.classList.toggle('side', sideBySide);
+    const first = sideBySide ? side.el : main.el;
+    if (panes.firstChild !== first) panes.prepend(first);
+  }
+
+  /** The layout sizes the stage; measure it, and keep the image where it was. */
   function fit() {
+    arrangePanes();
+    view.w = main.el.clientWidth;
+    view.h = main.el.clientHeight;
     if (!current) return;
-    const narrow = window.innerWidth < 720;
-    const maxW = narrow ? window.innerWidth - 20 : Math.min(1100, window.innerWidth - 200);
-    const maxH = narrow
-      ? window.innerHeight * 0.5
-      : window.innerHeight - 56 - 22 - 64 - 190;
-    const w = current.width || 4;
-    const hgt = current.height || 3;
-    const sideBySide = compare?.mode === 'side' && compare.before;
-    const room = sideBySide ? (maxW - SIDE_GAP) / 2 : maxW;
-    const scale = Math.min(room / w, Math.max(160, maxH) / hgt);
-    view.w = Math.round(w * scale);
-    view.h = Math.round(hgt * scale);
-    for (const p of [main, side]) {
-      p.el.style.width = `${view.w}px`;
-      p.el.style.height = `${view.h}px`;
-    }
-    stageCol.style.width = `${sideBySide ? view.w * 2 + SIDE_GAP : view.w}px`;
-    reel.style.maxHeight = narrow ? '' : `${view.h + 60}px`;
     clampPan();
     paint();
   }
 
-  const fitZoom = () => (current?.width ? view.w / current.width : 1);
+  const fitZoom = () => (current?.width && view.w ? Math.min(view.w / current.width, view.h / current.height) : 1);
   const zoomOf = () => view.zoom ?? fitZoom();
   const isFit = () => view.zoom == null || Math.abs(view.zoom - fitZoom()) < 0.001;
+  const isSlider = () => !!compare?.before && compare.mode === 'slider';
+
+  function overflows() {
+    const z = zoomOf();
+    return current.width * z > view.w + 1 || current.height * z > view.h + 1;
+  }
 
   function clampPan() {
     const z = zoomOf();
@@ -166,6 +219,7 @@ export function viewerScreen({ id, label, navigate }) {
   /** Zoom to z (null = fit), keeping the image point under (ax, ay) in place; the anchor is
    * relative to the stage centre and defaults to it. */
   function setZoom(z, ax = 0, ay = 0) {
+    if (!current || !view.w) return;
     const before = zoomOf();
     const fz = fitZoom();
     let next = z == null ? null : Math.max(Math.min(fz, 0.1), Math.min(MAX_ZOOM, z));
@@ -199,23 +253,26 @@ export function viewerScreen({ id, label, navigate }) {
       Object.assign(img.style, { left: `${left}px`, top: `${top}px`, width: `${w}px`, height: `${hgt}px` });
       img.classList.toggle('pixelated', pixelated);
     }
-    const overflows = w > view.w + 1 || hgt > view.h + 1;
-    const sliding = compare?.before && compare.mode === 'slider';
-    main.el.classList.toggle('pannable', overflows && (!sliding || spaceHeld));
-    main.el.classList.toggle('sliding', !!sliding && !spaceHeld);
-    side.el.classList.toggle('pannable', overflows);
-    main.el.classList.toggle('panning', !!drag && drag.kind === 'pan');
+    const big = overflows();
+    const slider = isSlider();
+    // Zoomed in, a drag pans; on the slider it moves the divider instead, near it or at fit.
+    main.el.classList.toggle('pannable', big);
+    main.el.classList.toggle('sliding', slider && !big && !spaceHeld);
+    if (!slider || !big || spaceHeld) main.el.classList.remove('near-line');
+    side.el.classList.toggle('pannable', big);
+    main.el.classList.toggle('panning', drag?.kind === 'pan' || !!pinch);
 
-    zoomPct.textContent = `${Math.round(z * 100)}%`;
+    const pct = `${Math.round(z * 100)}%`;
+    zoomPct.textContent = pct;
     fitBtn.classList.toggle('on', isFit());
     oneBtn.classList.toggle('on', Math.abs(z - 1) < 0.001);
     pixelNote.textContent = compare?.before
-      ? (compare.mode === 'slider' ? 'drag or ← → to move the divider' : `${Math.round(z * 100)}% · both sides`)
-      : isFit() ? `fit · ${Math.round(z * 100)}%`
+      ? (slider ? (big ? 'drag the divider, or the image to pan' : 'drag or ← → to move the divider') : `${pct} · both sides`)
+      : isFit() ? `fit · ${pct} · ${ZOOM_HINT}`
         : Math.abs(z - 1) < 0.001 ? 'actual size · 1 image px = 1 screen px'
-          : `${Math.round(z * 100)}% · drag to pan`;
+          : `${pct} · drag to pan`;
 
-    minimap.hidden = !overflows || compare?.mode === 'side';
+    minimap.hidden = !big || compare?.mode === 'side';
     if (!minimap.hidden) {
       // At most 132 px on its longer side, in the image's own shape.
       const k = 132 / Math.max(current.width, current.height);
@@ -240,7 +297,6 @@ export function viewerScreen({ id, label, navigate }) {
     compareBtn.setAttribute('aria-pressed', String(on));
     modeSeg.hidden = !ready;
     actions.hidden = on;
-    info.classList.toggle('comparing', on);
     for (const b of modeSeg.children) {
       const selected = b.textContent === (compare?.mode === 'side' ? 'Side by side' : 'Slider');
       b.classList.toggle('on', selected);
@@ -251,8 +307,6 @@ export function viewerScreen({ id, label, navigate }) {
     main.under.hidden = !slider;
     divider.hidden = !slider;
     handle.hidden = !slider;
-    side.el.hidden = !sideBySide;
-    panes.classList.toggle('side', !!sideBySide);
     if (slider) {
       // The "before" image covers the left of the divider, over the "after" image.
       main.under.style.clipPath = `inset(0 ${100 - compare.split}% 0 0)`;
@@ -276,13 +330,9 @@ export function viewerScreen({ id, label, navigate }) {
     if (sideBySide) {
       side.labelChip.textContent = `${compare.before.label} · before`;
       side.kindChip.hidden = true;
-      // Before goes first.
-      if (panes.firstChild !== side.el) panes.prepend(side.el);
-    } else if (panes.firstChild !== main.el) {
-      panes.prepend(main.el);
     }
     if (on && !ready) {
-      pixelNote.textContent = 'pick an image in the reel to compare with';
+      pixelNote.textContent = 'pick an image below to compare with';
     }
   }
 
@@ -299,6 +349,8 @@ export function viewerScreen({ id, label, navigate }) {
     if (current !== target || !compare) return;
     if (before) setBefore(before);
     else {
+      // The reel is where "before" gets picked.
+      if (!sideOpen) setSide(true, { remember: false });
       paint();
       renderReel();
     }
@@ -331,48 +383,132 @@ export function viewerScreen({ id, label, navigate }) {
     paintCompare();
   }
 
-  // --- pointer: pan, divider, ctrl+wheel zoom -------------------------------------------
+  function nearLine(clientX) {
+    const r = main.el.getBoundingClientRect();
+    return Math.abs(clientX - (r.left + (r.width * compare.split) / 100)) <= LINE_GRAB;
+  }
+
+  // --- pointer: drag to pan, pinch and wheel to zoom, the divider, double tap -----------
+
+  /** A point on screen, relative to the centre of pane p. */
+  function anchor(p, x, y) {
+    const r = p.el.getBoundingClientRect();
+    return [x - r.left - r.width / 2, y - r.top - r.height / 2];
+  }
 
   function onDown(e, p) {
-    if (e.button !== 0) return;
-    const sliding = compare?.before && compare.mode === 'slider' && p === main && !spaceHeld;
-    if (sliding) {
-      drag = { kind: 'split' };
-      moveSplit(e.clientX);
-    } else if (p.el.classList.contains('pannable')) {
-      drag = { kind: 'pan', x: e.clientX, y: e.clientY, px: view.panX, py: view.panY };
-    } else return;
+    if (e.button !== 0 || !current) return;
+    pointers.set(e.pointerId, { x: e.clientX, y: e.clientY, x0: e.clientX, y0: e.clientY });
     p.el.setPointerCapture?.(e.pointerId);
+    if (pointers.size === 2) {
+      // A second finger: pinch, whatever the first one was doing.
+      const [a, b] = pointers.values();
+      const [mx, my] = anchor(p, (a.x + b.x) / 2, (a.y + b.y) / 2);
+      pinch = { p, d0: Math.hypot(a.x - b.x, a.y - b.y) || 1, z0: zoomOf(), mx, my, px: view.panX, py: view.panY };
+      drag = null;
+      tap = null;
+    } else if (pointers.size === 1) {
+      if (isSlider() && p === main && !spaceHeld && (!overflows() || nearLine(e.clientX))) {
+        drag = { kind: 'split' };
+        moveSplit(e.clientX);
+      } else if (overflows()) {
+        drag = { kind: 'pan', x: e.clientX, y: e.clientY, px: view.panX, py: view.panY };
+      } else if (e.pointerType !== 'mouse') {
+        drag = { kind: 'swipe' };
+      }
+    }
+    if (!drag && !pinch) return; // a click at fit: only a double one does something
     e.preventDefault();
     paint();
   }
-  function onMove(e) {
-    if (!drag) return;
-    if (drag.kind === 'split') moveSplit(e.clientX);
-    else {
+
+  function onMove(e, p) {
+    const pt = pointers.get(e.pointerId);
+    if (!pt) {
+      // Hovering a zoomed slider: show where a drag moves the divider rather than the image.
+      if (p === main && current) {
+        main.el.classList.toggle('near-line', isSlider() && !spaceHeld && overflows() && nearLine(e.clientX));
+      }
+      return;
+    }
+    pt.x = e.clientX;
+    pt.y = e.clientY;
+    if (pinch) movePinch();
+    else if (drag?.kind === 'split') moveSplit(e.clientX);
+    else if (drag?.kind === 'pan') {
       view.panX = drag.px + (e.clientX - drag.x);
       view.panY = drag.py + (e.clientY - drag.y);
       clampPan();
       paint();
     }
   }
-  function onUp() {
-    if (!drag) return;
-    drag = null;
+
+  function movePinch() {
+    const [a, b] = pointers.values();
+    const [mx, my] = anchor(pinch.p, (a.x + b.x) / 2, (a.y + b.y) / 2);
+    const fz = fitZoom();
+    const scaled = (pinch.z0 * Math.hypot(a.x - b.x, a.y - b.y)) / pinch.d0;
+    const z = Math.max(Math.min(fz, pinch.z0), Math.min(MAX_ZOOM, scaled));
+    view.zoom = Math.abs(z - fz) < 0.001 ? null : z;
+    // The image point that was under the fingers' midpoint stays under it.
+    view.panX = mx - ((pinch.mx - pinch.px) * z) / pinch.z0;
+    view.panY = my - ((pinch.my - pinch.py) * z) / pinch.z0;
+    clampPan();
     paint();
   }
-  function onWheel(e, p) {
-    if (!e.ctrlKey) return; // ctrl+wheel, and trackpad pinches, zoom; plain wheel does nothing
-    e.preventDefault();
-    const r = p.el.getBoundingClientRect();
-    const factor = Math.exp(-e.deltaY * 0.01);
-    setZoom(zoomOf() * factor, e.clientX - r.left - r.width / 2, e.clientY - r.top - r.height / 2);
+
+  function onUp(e, p) {
+    const pt = pointers.get(e.pointerId);
+    if (!pt) return;
+    pointers.delete(e.pointerId);
+    if (pinch) {
+      if (pointers.size < 2) {
+        pinch = null;
+        // The finger left down carries on as a pan.
+        const [rest] = pointers.values();
+        drag = rest && overflows() ? { kind: 'pan', x: rest.x, y: rest.y, px: view.panX, py: view.panY } : null;
+        paint();
+      }
+      return;
+    }
+    const kind = drag?.kind;
+    drag = null;
+    const dx = e.clientX - pt.x0;
+    const dy = e.clientY - pt.y0;
+    if (e.type === 'pointerup' && kind === 'swipe' && Math.abs(dx) > SWIPE && Math.abs(dx) > 2 * Math.abs(dy)) {
+      step(dx < 0 ? 1 : -1);
+    } else if (e.type === 'pointerup' && kind !== 'split' && Math.hypot(dx, dy) < 8) {
+      onTap(e, p);
+    }
+    paint();
   }
+
+  /** Two taps (or clicks) in quick succession: from fit to 1:1 about the point, or back. */
+  function onTap(e, p) {
+    const twice = tap && e.timeStamp - tap.t < DOUBLE_TAP_MS && Math.hypot(e.clientX - tap.x, e.clientY - tap.y) < 30;
+    tap = twice ? null : { x: e.clientX, y: e.clientY, t: e.timeStamp };
+    if (!twice) return;
+    const fz = fitZoom();
+    if (isFit()) setZoom(fz < 1 ? 1 : fz * 2, ...anchor(p, e.clientX, e.clientY));
+    else setZoom(null);
+  }
+
+  function onWheel(e, p) {
+    if (!current) return;
+    e.preventDefault();
+    // Lines (Firefox) and pages to px; a notch is then ~100 px, a trackpad pinch a few.
+    const px = e.deltaY * (e.deltaMode === 1 ? 33 : e.deltaMode === 2 ? 400 : 1);
+    const k = Math.exp(-Math.max(-200, Math.min(200, px)) * (e.ctrlKey ? PINCH_RATE : WHEEL_RATE));
+    const z = zoomOf();
+    // Zooming out stops at fit: past it the stage only gains empty space.
+    setZoom(Math.max(Math.min(z, fitZoom()), z * k), ...anchor(p, e.clientX, e.clientY));
+  }
+
   for (const p of [main, side]) {
     p.el.addEventListener('pointerdown', (e) => onDown(e, p));
-    p.el.addEventListener('pointermove', onMove);
-    p.el.addEventListener('pointerup', onUp);
-    p.el.addEventListener('pointercancel', onUp);
+    p.el.addEventListener('pointermove', (e) => onMove(e, p));
+    p.el.addEventListener('pointerup', (e) => onUp(e, p));
+    p.el.addEventListener('pointercancel', (e) => onUp(e, p));
     p.el.addEventListener('wheel', (e) => onWheel(e, p), { passive: false });
   }
 
@@ -384,10 +520,9 @@ export function viewerScreen({ id, label, navigate }) {
     setImage(main.pic, artifact);
     main.pic.alt = artifact.metadata?.prompt || artifact.label;
     setImage(miniPic, artifact);
-    prompt.textContent = artifact.source === 'upload'
-      ? 'Your upload.'
-      : truncate(artifact.metadata?.prompt || '', 400);
-    prompt.title = artifact.metadata?.prompt || '';
+    sideLabel.textContent = artifact.label;
+    sideKind.textContent = SOURCE_WORD[artifact.source] ?? artifact.source;
+    prompt.textContent = artifact.source === 'upload' ? 'Your upload.' : artifact.metadata?.prompt || '';
     spec.textContent = specOf(artifact);
     source.textContent = artifact.source === 'upload' ? 'your upload'
       : artifact.source === 'edited' ? 'edit_image' : 'generate_image';
@@ -431,7 +566,9 @@ export function viewerScreen({ id, label, navigate }) {
   function renderReel() {
     clear(reel);
     const shown = onPath(c);
-    for (const a of images(c)) {
+    const all = images(c);
+    reelCount.textContent = `Images · ${all.length}`;
+    for (const a of all) {
       const selected = a.id === current?.id;
       const before = compare?.before?.id === a.id;
       const elsewhere = !shown.has(a.id) && attacherOf(c, a.id) !== null;
@@ -473,7 +610,7 @@ export function viewerScreen({ id, label, navigate }) {
   }
 
   function editCurrent() {
-    bar.addArtifact(current, { first: true, prefill: `Edit ${current.label}: ` });
+    bar.addArtifact(current, { first: true, prefill: `Edit @${current.label}: ` });
     openChat({ focusBar: true });
   }
 
@@ -518,13 +655,13 @@ export function viewerScreen({ id, label, navigate }) {
     }
   }
 
-  // --- keys: + − 0 1 zoom, arrows pan (or switch images at fit), C compare -------------
+  // --- keys: + − 0 1 zoom, arrows pan (or switch images at fit), C compare, I details --
 
   const onKey = (e) => {
     if (e.target.closest?.('input, textarea, [contenteditable], .dialog')) return;
     if (e.ctrlKey || e.metaKey || e.altKey) return;
     const zoomed = !isFit();
-    const sliding = compare?.before && compare.mode === 'slider';
+    const sliding = isSlider();
     const arrows = { ArrowLeft: [-1, 0], ArrowRight: [1, 0], ArrowUp: [0, -1], ArrowDown: [0, 1] };
     if (e.key === ' ' && (e.target === document.body || e.target.closest?.('.stage, .reel'))) {
       e.preventDefault();
@@ -534,6 +671,7 @@ export function viewerScreen({ id, label, navigate }) {
     else if (e.key === '0') { e.preventDefault(); setZoom(null); }
     else if (e.key === '1') { e.preventDefault(); setZoom(1); }
     else if (e.key === 'c' || e.key === 'C') { e.preventDefault(); toggleCompare(); }
+    else if (e.key === 'i' || e.key === 'I') { e.preventDefault(); setSide(!sideOpen); }
     else if (e.key === 'Escape' && compare) { e.preventDefault(); toggleCompare(false); }
     else if (e.key in arrows) {
       e.preventDefault();
@@ -554,7 +692,9 @@ export function viewerScreen({ id, label, navigate }) {
   };
   document.addEventListener('keydown', onKey);
   document.addEventListener('keyup', onKeyUp);
-  window.addEventListener('resize', fit);
+  // The stage resizes with the window, the side column, and compare's second pane.
+  const sizer = new ResizeObserver(() => fit());
+  sizer.observe(main.el);
   const unsubscribe = [on(`conv:${id}`, render), on('turns', () => {
     bar.refresh();
     if (current) renderBranch();
@@ -573,7 +713,7 @@ export function viewerScreen({ id, label, navigate }) {
     destroy() {
       document.removeEventListener('keydown', onKey);
       document.removeEventListener('keyup', onKeyUp);
-      window.removeEventListener('resize', fit);
+      sizer.disconnect();
       unsubscribe.forEach((u) => u());
       bar.destroy();
       strip.destroy();

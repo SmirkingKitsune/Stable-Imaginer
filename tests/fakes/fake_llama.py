@@ -166,6 +166,8 @@ class FakeLlama:
         )
         return JSONResponse(
             {
+                # Like llama-server started without --alias: the alias is the path.
+                "model_alias": self.model_path,
                 "model_path": self.model_path,
                 "chat_template_caps": caps,
                 "modalities": {"vision": self.vision},
@@ -224,7 +226,15 @@ class FakeLlama:
     def _echo(body: dict[str, Any]) -> Script:
         """Unscripted behaviour, handy for manual and UI work: "draw <x>" calls
         generate_image and "edit img-N: <x>" calls edit_image (when tools are offered), a
-        tool result gets a short summary, and anything else is echoed back."""
+        tool result gets a short summary, a quality check (a request for a JSON answer)
+        passes unless the request says "flawed", and anything else is echoed back."""
+        if body.get("response_format"):
+            shown = body["messages"][-1]["content"]
+            text = shown[0]["text"] if isinstance(shown, list) else shown
+            verdict: dict[str, Any] = {"verdict": "pass", "issues": []}
+            if "flawed" in text.lower():  # "draw something flawed" runs out of redos
+                verdict = {"verdict": "redo", "issues": ["looks flawed"], "new_seed": True}
+            return FakeLlama.text(json.dumps(verdict), pieces=1)
         final = body["messages"][-1]
         if final["role"] == "tool":
             result = json.loads(final["content"])

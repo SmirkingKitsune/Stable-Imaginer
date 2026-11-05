@@ -119,3 +119,20 @@ class EngineInterruptedError(EngineError):
 
     code = "engine_interrupted"
     title = "Engine stream interrupted"
+
+
+class HubError(ImaginerError):
+    """The Hugging Face Hub couldn't be reached, or answered unexpectedly."""
+
+    status = 502
+    code = "hub_error"
+    title = "Hugging Face Hub error"
+
+
+class HubAccessError(ImaginerError):
+    """A gated or private repo that this machine's Hub token can't read. Not a 401: the
+    server's own token is fine, the Hub's is what's missing."""
+
+    status = 403
+    code = "hub_access"
+    title = "No access to this repo"

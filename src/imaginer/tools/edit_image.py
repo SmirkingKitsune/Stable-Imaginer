@@ -23,8 +23,8 @@ from imaginer.tools.images import (
     ImageOptions,
     apply_user_options,
     run_image_job,
+    sampler_params,
     user_options_note,
-    user_params,
 )
 
 AVAILABLE_LIMIT = 30
@@ -96,7 +96,7 @@ class EditImageTool(Tool):
         if options is not None and options.mask is not None:
             # The user painted this mask for the edit; the model doesn't have to name it.
             args = args.model_copy(update={"mask": options.mask})
-        params = user_params(options)
+        params = sampler_params(ctx)
         labels = [*args.images, *([args.mask] if args.mask else [])]
         resolved = await self._resolve(ctx.conversation_id, labels, mask=args.mask)
 

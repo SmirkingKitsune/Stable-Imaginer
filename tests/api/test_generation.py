@@ -8,7 +8,7 @@ import httpx
 import pytest
 from fastapi import FastAPI
 
-from imaginer.core.config import OrchestrationConfig, RoutingConfig, Settings
+from imaginer.core.config import OrchestrationConfig, QAConfig, RoutingConfig, Settings
 from imaginer.domain.enums import Capability
 from imaginer.main import create_app
 from tests.conftest import SettingsFactory, llama_config, sd_config
@@ -292,7 +292,7 @@ async def test_transparent_needs_rgba(
             "sd": sd_config(fake_sd.url, declared_capabilities={Capability.T2I}),
         },
         routing=RoutingConfig(chat="llama", t2i="sd"),
-        orchestration=OrchestrationConfig(probe_ttl_s=0),
+        orchestration=OrchestrationConfig(probe_ttl_s=0, qa=QAConfig(enabled=False)),
     )
     fake_llama.queue(
         FakeLlama.tool_call("generate_image", {"prompt": "logo", "transparent": True}),

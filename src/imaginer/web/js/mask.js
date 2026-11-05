@@ -347,7 +347,7 @@ export function maskScreen({ id, label, navigate }) {
       const d = draft(id);
       const stale = d.attachments.filter((a) => a.artifact?.kind === 'mask');
       for (const a of stale) d.attachments.splice(d.attachments.indexOf(a), 1);
-      bar.addArtifact(image, { first: true, prefill: `Edit ${label}: ` });
+      bar.addArtifact(image, { first: true, prefill: `Edit @${label}: ` });
       bar.addArtifact(mask);
       navigate(chat, { focusBar: true });
     } catch (err) {
@@ -363,7 +363,7 @@ export function maskScreen({ id, label, navigate }) {
   // --- keys --------------------------------------------------------------------------------
 
   const onKey = (e) => {
-    if (e.target.closest?.('input:not([type=range]), textarea, .dialog')) return;
+    if (e.target.closest?.('input:not([type=range]), textarea, [contenteditable], .dialog')) return;
     if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'z') { e.preventDefault(); undo(); return; }
     if (e.ctrlKey || e.metaKey || e.altKey) return;
     const k = e.key.toLowerCase();
@@ -402,7 +402,7 @@ export function maskScreen({ id, label, navigate }) {
     layout();
     measure();
     // The image goes into the bar first, with the instruction started.
-    bar.addArtifact(image, { first: true, prefill: `Edit ${label}: ` });
+    bar.addArtifact(image, { first: true, prefill: `Edit @${label}: ` });
     // Ready to paint: the B/E/X keys shouldn't type into the bar.
     document.activeElement?.blur();
   }, (err) => {

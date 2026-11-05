@@ -6,7 +6,8 @@ another attempt at a tool call) starts a branch of its own:
 
 * **main** follows the oldest child from the first message down.
 * Any other branch is named after its fork, the deepest message on its path that is not an
-  oldest child: "message 2, edited" for a user message, "retry of img-3" for a tool result.
+  oldest child: "message 2, edited" for a user message, "retry of img-3" for a tool result,
+  or "QA redo of img-3" for one the quality check made.
   Its parent branch is the one that the fork's oldest sibling continues.
 """
 
@@ -95,8 +96,9 @@ def describe(
                 )
                 labels = [images[a].label for a in attachments.get(first.id, []) if a in images]
                 tool = (first.metadata_json or {}).get("tool", "a tool call")
+                redo = "QA redo" if (fork.metadata_json or {}).get("redo_of") else "retry"
                 branch.kind = "retry"
-                branch.name = f"retry of {', '.join(labels) or tool}"
+                branch.name = f"{redo} of {', '.join(labels) or tool}"
                 branch.origin = f"from assistant reply {_count_replies(before)}"
             else:
                 number = sum(1 for m in before if m.role is Role.USER)

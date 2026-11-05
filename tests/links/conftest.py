@@ -17,6 +17,7 @@ from imaginer.core.config import (
     LinkShare,
     LoggingConfig,
     OrchestrationConfig,
+    QAConfig,
     RoutingConfig,
     ServerConfig,
     Settings,
@@ -79,7 +80,9 @@ def make_instance(tmp_path: Path) -> Iterator[InstanceFactory]:
             server=ServerConfig(auth_token=token),  # type: ignore[arg-type]
             backends=backends,
             routing=routing or RoutingConfig(),
-            orchestration=OrchestrationConfig(probe_ttl_s=0, max_tool_iterations=2),
+            orchestration=OrchestrationConfig(
+                probe_ttl_s=0, max_tool_iterations=2, qa=QAConfig(enabled=False)
+            ),
             links=LinksConfig(
                 enabled=True,
                 name=name,

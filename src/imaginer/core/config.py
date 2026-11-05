@@ -98,8 +98,8 @@ class RetryConfig(_Strict):
 class ImageDefaults(_Strict):
     """Per-backend sampler defaults. Engines disagree on good values for the same model."""
 
-    width: int = Field(default=1024, ge=64, le=8192)
-    height: int = Field(default=1024, ge=64, le=8192)
+    width: int = Field(default=2048, ge=64, le=8192, description="Qwen-Image-2.1 is native 2K.")
+    height: int = Field(default=2048, ge=64, le=8192)
     steps: int | None = Field(default=None, ge=1)
     cfg_scale: float | None = None
     sampler: str | None = None
@@ -216,9 +216,7 @@ class DiffusersBackendConfig(_Strict):
     max_ref_images: int = Field(default=10, ge=1)
     size_multiple: int = Field(default=32, ge=8)
     declared_capabilities: set[Capability] | None = None
-    defaults: ImageDefaults = Field(
-        default_factory=lambda: ImageDefaults(width=2048, height=2048, steps=40, cfg_scale=1.0)
-    )
+    defaults: ImageDefaults = Field(default_factory=lambda: ImageDefaults(steps=40, cfg_scale=1.0))
     rgba_prompt_template: str = DEFAULT_RGBA_PROMPT_TEMPLATE
     mask_instruction: str = DEFAULT_MASK_INSTRUCTION
     max_ref_pixels: int | None = Field(default=None, gt=0)
@@ -270,6 +268,17 @@ class RoutingConfig(_Strict):
     edit: str | None = None
 
 
+class QAConfig(_Strict):
+    """The quality check: a vision LLM reviews each image and has it made again if flawed."""
+
+    enabled: bool = Field(
+        default=True, description="For messages that don't say (MessageCreate.qa)."
+    )
+    max_retries: int = Field(
+        default=2, ge=0, le=5, description="New attempts per tool call before keeping the last."
+    )
+
+
 class OrchestrationConfig(_Strict):
     max_tool_iterations: int = Field(default=4, ge=0, le=32)
     job_timeout_s: float = Field(default=900.0, gt=0)
@@ -277,6 +286,7 @@ class OrchestrationConfig(_Strict):
     probe_ttl_s: float = Field(
         default=15.0, ge=0, description="Re-probe an engine before use if its probe is older."
     )
+    qa: QAConfig = Field(default_factory=QAConfig)
 
 
 class ContextConfig(_Strict):
@@ -339,6 +349,35 @@ class LinksConfig(_Strict):
         return {name: share for name, share in self.share.items() if share is not None}
 
 
+class HubConfig(_Strict):
+    """The Hugging Face Hub: search, repo listings and model downloads (docs/huggingface.md).
+
+    The token is never configured here. It comes from ``$HF_TOKEN`` (or the env var
+    ``token_env`` names), else from ``hf auth login``'s token file, as the ``hf`` CLI reads it.
+    """
+
+    enabled: bool = True
+    endpoint: str | None = Field(
+        default=None, description="Default: $HF_ENDPOINT, then https://huggingface.co."
+    )
+    token_env: str = Field(default="HF_TOKEN", description="Env var holding a Hub token.")
+    models_dir: Path | None = Field(
+        default=None, description="Where downloads go. Default: <data_root>/models."
+    )
+    use_hf_cache: bool = Field(
+        default=True,
+        description="Use files that hf, Diffusers or transformers already put in the "
+        "Hugging Face cache instead of downloading them again.",
+    )
+
+    @field_validator("endpoint")
+    @classmethod
+    def _http_url(cls, value: str | None) -> str | None:
+        if value is not None and not value.startswith(("http://", "https://")):
+            raise ValueError("hub.endpoint must start with http:// or https://")
+        return value.rstrip("/") if value else value
+
+
 def is_loopback_host(host: str) -> bool:
     if host == "localhost":
         return True
@@ -374,6 +413,7 @@ class Settings(BaseSettings):
     orchestration: OrchestrationConfig = Field(default_factory=OrchestrationConfig)
     context: ContextConfig = Field(default_factory=ContextConfig)
     links: LinksConfig = Field(default_factory=LinksConfig)
+    hub: HubConfig = Field(default_factory=HubConfig)
 
     @classmethod
     def settings_customise_sources(
@@ -464,6 +504,15 @@ class Settings(BaseSettings):
         kind = BackendKind.LLM if task == "chat" else BackendKind.IMAGE
         candidates = self.enabled_backends(kind)
         return candidates[0] if len(candidates) == 1 else None
+
+    @property
+    def models_dir(self) -> Path:
+        """Where Hub downloads go. Not resolved: a mapped drive stays a drive letter in the
+        paths engines are given."""
+        configured = self.hub.models_dir
+        if configured is None:
+            return self.data_root / "models"
+        return Path(os.path.expandvars(configured)).expanduser().absolute()
 
     @property
     def database_url(self) -> str:

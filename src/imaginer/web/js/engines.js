@@ -8,8 +8,9 @@
 
 import { api, readEvents } from './api.js';
 import { announce, connectionStrip, modal, statusLine, toast } from './chrome.js';
-import { corners, h, icon, iconButton, clear } from './dom.js';
+import { append, corners, h, icon, iconButton, clear } from './dom.js';
 import { clock, plural } from './format.js';
+import { hubDialog, looksLikeRef } from './hub.js';
 import { loadBackends } from './store.js';
 
 const POLL_MS = 5000;
@@ -30,6 +31,8 @@ const roleOf = (e) => (e.kind === 'llm' ? 'chat' : 'image');
 const size = (bytes) => (bytes == null ? '' : bytes >= 1e9 ? `${(bytes / 1e9).toFixed(1)} GB`
   : bytes >= 1e6 ? `${Math.round(bytes / 1e6)} MB` : `${Math.max(1, Math.round(bytes / 1e3))} KB`);
 const endpointOf = (e) => (e.type === 'linked' ? 'linked instance' : e.host ? `${e.host}:${e.port}` : 'in-process');
+const installKey = (job) => (job ? [job.started_at, job.state, job.step, job.label].join('|') : '');
+const downloaded = (job) => (job.state === 'queued' ? 'queued' : `↓ ${Math.floor((100 * job.done_bytes) / (job.total_bytes || 1))}%`);
 
 /** "EXITED · CODE 1", "RUNNING · PID 4120", or the backend's health when we didn't start it. */
 function stateChip(e) {
@@ -62,6 +65,7 @@ function stateLine(e) {
 
 export function enginesScreen({ name: wanted = null, navigate }) {
   let engines = [];
+  let downloads = []; // running Hugging Face downloads, shown against the settings they will set
   let current = wanted;
   let logLines = [];
   let logFilter = 'all';
@@ -101,19 +105,26 @@ export function enginesScreen({ name: wanted = null, navigate }) {
     }
     if (gone) return;
     engines = next;
+    downloads = await api.hubDownloads().then((all) => all.filter((d) => d.state === 'running' || d.state === 'queued'), () => []);
+    if (gone) return;
     if (probe) loadBackends();
     if (!current || !engines.some((e) => e.name === current)) {
       current = (engines.find((e) => e.launchable) ?? engines[0])?.name ?? null;
     }
     // A poll that changes nothing leaves the view alone; one that does waits while a
     // field is being edited, so typing is never lost.
-    const sig = JSON.stringify([engines, current, logFilter]);
+    const sig = signature();
     if (sig === shownSig && !probe) return;
     if (main.contains(document.activeElement) && document.activeElement.matches('input')) {
       deferred = true;
       return;
     }
     render();
+  }
+  /** What the view shows; downloads count in 5% steps, so progress doesn't redraw every poll. */
+  function signature() {
+    const progress = downloads.map((d) => [d.id, d.state, Math.floor((20 * d.done_bytes) / (d.total_bytes || 1))]);
+    return JSON.stringify([engines, current, logFilter, progress]);
   }
   main.addEventListener('focusout', () => setTimeout(() => {
     if (deferred && !main.contains(document.activeElement)) { deferred = false; render(); }
@@ -129,7 +140,7 @@ export function enginesScreen({ name: wanted = null, navigate }) {
   }
 
   function render() {
-    shownSig = JSON.stringify([engines, current, logFilter]);
+    shownSig = signature();
     const profile = engines[0]?.settings_file;
     meta.textContent = [profile && `saves to ${profile.split(/[\\/]/).slice(-2).join('/')}`, plural(engines.length, 'backend')]
       .filter(Boolean).join(' · ');
@@ -205,6 +216,7 @@ export function enginesScreen({ name: wanted = null, navigate }) {
 
     const left = h('div.engine-cells');
     if (e.runtime) left.append(runtimeCell(e));
+    if (e.type === 'diffusers') left.append(modelCell(e));
     if (e.launchable) left.append(filesCell(e));
     else if (e.files.length) left.append(remoteCell(e));
     left.append(h('div.cell-pair', endpointCell(e), capsCell(e)));
@@ -239,14 +251,22 @@ export function enginesScreen({ name: wanted = null, navigate }) {
     for (const f of e.files) {
       const input = h('input.seed-input.path-input', {
         type: 'text', value: f.path ?? '', placeholder: f.what, spellcheck: false, 'aria-label': `${f.flag} (${f.what})`,
-        onchange: () => save(e, { launch: { files: { [f.key]: input.value.trim() || null } } }),
+        title: 'A path on this machine, or a Hugging Face URL or repo:QUANT to pick from',
+        onchange: () => {
+          const value = input.value.trim();
+          if (looksLikeRef(value)) {
+            input.value = f.path ?? '';
+            hubDialog(e, { ref: value, onChange: refresh });
+          } else save(e, { launch: { files: { [f.key]: value || null } } });
+        },
         onkeydown: (ev) => { if (ev.key === 'Enter') input.blur(); },
       });
       const bad = !!(f.path && f.problem);
+      const job = downloads.find((d) => d.assign.includes(`${e.name}.${f.key}`));
       grid.append(
         h('span.mono-meta', { class: bad ? 'strong' : '' }, f.flag),
         h('label.seed-field', { class: bad ? 'bad' : '' }, icon('folder', 13), input),
-        h('span.mono-meta', size(f.size_bytes)),
+        job ? h('span.mono-meta.accent', { title: `downloading ${job.label}` }, downloaded(job)) : h('span.mono-meta', size(f.size_bytes)),
         h('span.file-mark', { class: bad ? 'bad' : f.path ? 'ok' : '', title: f.problem ?? (f.path ? f.format : 'not set') },
           f.path ? icon(bad ? 'alert' : 'check', 15) : null));
       if (bad) grid.append(h('span'), h('span.file-problem', `${f.problem}.`));
@@ -254,9 +274,39 @@ export function enginesScreen({ name: wanted = null, navigate }) {
     const needsVision = e.type === 'sdcpp' && !e.files.find((f) => f.key === 'llm_vision')?.path;
     return h('div.tray-cell',
       h('div.cell-head', h('span.eyebrow', 'Model files'), h('span.spacer'),
-        h('span.tray-hint', 'paths on this machine · checked on save')),
+        h('span.tray-hint.only-wide', 'paths on this machine · checked on save'),
+        h('button.mini', { type: 'button', onclick: () => hubDialog(e, { onChange: refresh }) }, icon('search', 12), 'Hugging Face')),
       grid,
       needsVision && h('span.tray-hint', 'Without --llm_vision, sd-server can only do t2i: drop edit and multi_ref below.'));
+  }
+
+  /** A Diffusers backend's model: a Hub repo id, or a local Diffusers folder. */
+  function modelCell(e) {
+    const input = h('input.seed-input.path-input', {
+      type: 'text', value: e.model_id ?? '', spellcheck: false, 'aria-label': 'Model (model_id)',
+      placeholder: 'a Hugging Face repo id, or a Diffusers folder',
+      onchange: () => {
+        const value = input.value.trim();
+        if (!value) input.value = e.model_id ?? '';
+        else if (looksLikeRef(value)) {
+          input.value = e.model_id ?? '';
+          hubDialog(e, { ref: value, onChange: refresh });
+        } else save(e, { model_id: value });
+      },
+      onkeydown: (ev) => { if (ev.key === 'Enter') input.blur(); },
+    });
+    const job = downloads.find((d) => d.assign.includes(`${e.name}.model_id`));
+    const folder = /^([A-Za-z]:[\\/]|[\\/]|~|\.)/.test(e.model_id ?? '');
+    return h('div.tray-cell',
+      h('div.cell-head', h('span.eyebrow', 'Model'), h('span.spacer'),
+        job && h('span.mono-meta.accent', `downloading · ${downloaded(job)}`),
+        h('button.mini', {
+          type: 'button', onclick: () => hubDialog(e, { ref: folder ? null : e.model_id, onChange: refresh }),
+        }, icon('search', 12), 'Hugging Face')),
+      h('label.seed-field', icon(folder ? 'folder' : 'layers', 13), input),
+      h('span.tray-hint.wrap', folder
+        ? 'A Diffusers folder on this machine. It loads on first use, or at startup with preload.'
+        : 'A Hub repo id: Diffusers fetches it into the Hugging Face cache when it first loads. Download it from Hugging Face here to see progress.'));
   }
 
   function remoteCell(e) {
@@ -384,6 +434,9 @@ export function enginesScreen({ name: wanted = null, navigate }) {
     const ctrl = new AbortController();
     stream = ctrl;
     const name = current;
+    // Every line of install output is an event; the screen shows only the step and outcome,
+    // so it reloads when those change instead of once per line.
+    let shownInstall = installKey(engines.find((x) => x.name === name)?.install);
     await loadLog();
     try {
       const resp = await api.engineEvents(name, ctrl.signal);
@@ -394,12 +447,13 @@ export function enginesScreen({ name: wanted = null, navigate }) {
           if (logLines.length > 2000) logLines.shift();
           const e = engines.find((x) => x.name === name);
           if (e) paintLog(e);
-        } else if (type === 'state' || type === 'install') {
+        } else if (type === 'state') {
           refresh();
-          if (type === 'state') {
-            if (data === 'exited') announce(`${name} exited`);
-            if (data === 'running') announce(`${name} started`);
-          }
+          if (data === 'exited') announce(`${name} exited`);
+          if (data === 'running') announce(`${name} started`);
+        } else if (type === 'install' && installKey(data) !== shownInstall) {
+          shownInstall = installKey(data);
+          refresh();
         }
       });
     } catch {
@@ -571,7 +625,8 @@ export function installDialog(e, onChange = () => {}, { force = false } = {}) {
     }
     const chip = job.state === 'running' ? h('span.state.run', `STEP ${job.step || 1} / ${job.total || '?'}`)
       : job.state === 'succeeded' ? h('span.state.done', 'INSTALLED') : h('span.state.fail', job.state.toUpperCase());
-    box.append(
+    // The dom.js append: the native one would print a missing error or warning as "null".
+    append(box, [
       h('div.dialog-head.row', h('div', h('span.eyebrow.accent', `${e.name} · ${done ? job.state : 'installing'}`),
         h('div.dialog-title', `Install ${exe}`)), chip),
       h('div.install-steps', rows),
@@ -583,7 +638,8 @@ export function installDialog(e, onChange = () => {}, { force = false } = {}) {
         : [
           h('button.btn.btn-secondary', { type: 'button', onclick: cancel }, 'Cancel install'),
           h('button.btn.btn-secondary', { type: 'button', onclick: () => box.close() }, 'Run in background'),
-        ]));
+        ]),
+    ]);
   }
 
   async function load() {

@@ -15,6 +15,7 @@ from imaginer.domain.enums import (
     JobTask,
     LineageRelation,
     MessageStatus,
+    PromptMode,
     Role,
 )
 
@@ -151,6 +152,24 @@ class MessageCreate(_Input):
         default=None,
         description="Stored on the user message as metadata.image_options when any is set.",
     )
+    mode: PromptMode = Field(
+        default=PromptMode.CHAT,
+        description=(
+            "chat: the LLM replies, and draws when asked. raw: no LLM, the content is the "
+            "image prompt as written (attached images make it an edit). interpret: the LLM "
+            "must turn the content into a faithful image prompt. curate: the LLM enriches "
+            "the prompt, or asks questions first when the request is too unclear. Stored as "
+            "metadata.mode unless chat."
+        ),
+    )
+    qa: bool | None = Field(
+        default=None,
+        description=(
+            "Quality check: a vision LLM looks at every image and makes it again (more steps, "
+            "another seed, a fixed prompt) when it has clear flaws. Default: "
+            "orchestration.qa.enabled. Stored as metadata.qa when given."
+        ),
+    )
     parent_id: str | None = Field(
         default=None,
         description=(
@@ -247,7 +266,9 @@ class Branch(BaseModel):
     """A path from a first message to a leaf. Continue it with ``parent_id = leaf_id``."""
 
     leaf_id: str = Field(description="Its newest message. GET .../messages?leaf_id= shows it.")
-    name: str = Field(description="'main', 'message 1, edited' or 'retry of img-3'.")
+    name: str = Field(
+        description="'main', 'message 1, edited', 'retry of img-3' or 'QA redo of img-3'."
+    )
     kind: Literal["main", "edit", "retry"]
     fork_id: str | None = Field(
         description="Its first message of its own, where it leaves its parent branch."
@@ -434,6 +455,9 @@ class EngineInfo(BaseModel):
     loopback: bool = False
     launchable: bool = Field(description="It has launch settings, so it can be started here.")
     files: list[EngineFile] = Field(default_factory=list)
+    model_id: str | None = Field(
+        default=None, description="Diffusers backends: a Hub repo id or a local folder."
+    )
     extra_args: list[str] = Field(default_factory=list)
     autostart: bool = False
     executable: str | None = None
@@ -461,6 +485,12 @@ class EngineUpdate(_Input):
     port: int | None = Field(default=None, ge=1, le=65535)
     declared_capabilities: list[Capability] | None = None
     launch: EngineLaunchUpdate | None = None
+    model_id: str | None = Field(
+        default=None,
+        min_length=1,
+        max_length=1024,
+        description="Diffusers backends: a Hub repo id or a local folder.",
+    )
 
 
 class EngineInstallRequest(_Input):
@@ -468,6 +498,143 @@ class EngineInstallRequest(_Input):
     accelerator: str = Field(default="", max_length=16, description="Empty: detect.")
     version: str = Field(default="latest", max_length=64)
     force: bool = False
+
+
+# --- Hugging Face Hub (docs/huggingface.md) -------------------------------------------
+
+
+class HubStatus(BaseModel):
+    enabled: bool
+    endpoint: str
+    token: bool = Field(description="Whether a Hub token is set. The token itself never is.")
+    token_source: str | None = Field(default=None, description="'$HF_TOKEN' or 'hf auth login'.")
+    models_dir: str = Field(description="Where downloads go.")
+    hf_cache: str | None = Field(
+        default=None, description="The Hugging Face cache searched for copies, if any."
+    )
+
+
+class HubSettingsUpdate(_Input):
+    models_dir: str | None = Field(
+        default=None, min_length=1, max_length=1024, description="Where downloads go."
+    )
+
+
+class HubRepoSummary(BaseModel):
+    id: str
+    url: str
+    task: str | None = None
+    library: str | None = None
+    downloads: int | None = None
+    likes: int | None = None
+    gated: bool = False
+    updated_at: str | None = None
+    formats: list[Literal["gguf", "diffusers", "safetensors"]] = Field(default_factory=list)
+
+
+class HubLocal(BaseModel):
+    """A copy already on this machine."""
+
+    source: Literal["models_dir", "hf_cache"]
+    path: str = Field(description="The first file, or the folder for a Diffusers pipeline.")
+    in_use: list[str] = Field(
+        default_factory=list, description="'<engine>.<setting>' already pointed at it."
+    )
+
+
+class HubFile(BaseModel):
+    path: str
+    size_bytes: int | None = None
+
+
+class HubVariant(BaseModel):
+    """One loadable model in a repo: a file, or the shards of one."""
+
+    id: str = Field(description="Its first file's path in the repo.")
+    name: str
+    component: Literal["model", "mmproj", "diffusion_model", "vae", "text_encoder", "lora", "other"]
+    format: Literal["gguf", "safetensors"]
+    quant: str | None = None
+    size_bytes: int
+    shards: int = Field(default=1, description="Weight files; an index isn't counted.")
+    files: list[HubFile] = Field(description="Everything to download, the entry first.")
+    local: HubLocal | None = None
+    partial_bytes: int = Field(default=0, description="Already in the models folder.")
+
+
+class HubPipeline(BaseModel):
+    """A Diffusers pipeline: what a diffusers backend loads, as a whole."""
+
+    pipeline_class: str | None = None
+    components: list[str]
+    size_bytes: int
+    file_count: int
+    compatible: bool
+    problem: str | None = None
+    local: HubLocal | None = None
+    partial_bytes: int = 0
+
+
+class HubRole(BaseModel):
+    """One of the engine's model settings, and what in the repo can fill it."""
+
+    key: str = Field(description="The launch setting, e.g. 'mmproj', or 'model_id'.")
+    flag: str | None = None
+    what: str
+    current: str | None = Field(default=None, description="What it is set to now.")
+    candidates: list[str] = Field(default_factory=list, description="Variant ids.")
+    suggested: str | None = None
+
+
+class HubRepo(BaseModel):
+    id: str
+    url: str
+    revision: str
+    sha: str | None = None
+    task: str | None = None
+    library: str | None = None
+    gated: bool = False
+    downloads: int | None = None
+    likes: int | None = None
+    base_models: list[str] = Field(default_factory=list)
+    kind: Literal["gguf", "diffusers", "comfy", "transformers", "safetensors", "unknown"]
+    notes: list[str] = Field(default_factory=list)
+    variants: list[HubVariant] = Field(default_factory=list)
+    pipeline: HubPipeline | None = None
+    engine: str | None = None
+    roles: list[HubRole] = Field(default_factory=list)
+    quant: str | None = Field(default=None, description="From a 'repo:QUANT' reference.")
+    path: str | None = Field(default=None, description="A file or folder the reference named.")
+
+
+class HubDownloadRequest(_Input):
+    repo: str = Field(min_length=3, max_length=500, description="A repo id or Hub reference.")
+    revision: str | None = Field(default=None, max_length=200, description="Default: main.")
+    variant: str | None = Field(
+        default=None, max_length=1024, description="A variant id; none: the Diffusers pipeline."
+    )
+    engine: str | None = Field(default=None, description="Set this engine's setting when done.")
+    key: str | None = Field(default=None, description="The launch setting, or 'model_id'.")
+
+
+class HubDownload(BaseModel):
+    id: str
+    repo: str
+    revision: str
+    label: str
+    state: Literal["queued", "running", "succeeded", "failed", "cancelled"]
+    total_bytes: int
+    done_bytes: int
+    file_count: int
+    file_index: int
+    current_file: str | None = None
+    target: str
+    assign: list[str] = Field(default_factory=list, description="'<engine>.<setting>'.")
+    speed_bps: float | None = None
+    started_at: datetime
+    finished_at: datetime | None = None
+    error: str | None = None
+    warning: str | None = None
 
 
 # --- linked instances -----------------------------------------------------------------

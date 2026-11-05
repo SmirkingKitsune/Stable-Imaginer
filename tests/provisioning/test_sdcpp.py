@@ -150,9 +150,14 @@ def test_release_install_and_reuse(tmp_path, monkeypatch):
         shared, "_download", lambda url, path, emit: path.write_bytes(archives[url].read_bytes())
     )
     monkeypatch.setattr(shared, "validate_server", lambda binary: "sd-server")
-    installer = sd.SdCppProvisioner(cfg)
+    lines: list[str] = []
+    installer = sd.SdCppProvisioner(cfg, log_sink=lambda text, err: lines.append(text))
     binary = installer.ensure_runtime()
     assert binary.read_bytes() == b"server"
+    # The quiet stretches after the downloads say what they are.
+    assert f"[2/2] Downloading {ASSETS[2]}" in lines
+    assert "Staging sd-server.exe and its libraries" in lines
+    assert f"Installed sd-server.exe {TAG} (release)" in lines
     assert (binary.parent / "cublas64_12.dll").read_bytes() == b"cuda"
     assert (binary.parent / "stable-diffusion.dll").read_bytes() == b"engine"
     state = sd.read_active_runtime(cfg.provision_dir)

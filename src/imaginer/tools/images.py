@@ -65,6 +65,11 @@ def user_params(options: ImageRequestOptions | None) -> dict[str, Any]:
     return {k: v for k, v in params.items() if v is not None}
 
 
+def sampler_params(ctx: ToolContext) -> dict[str, Any]:
+    """The call's sampler overrides: the user's, plus any a quality check picked."""
+    return {**ctx.sampler, **user_params(ctx.image_options)}
+
+
 def user_options_note(options: ImageRequestOptions | None) -> dict[str, Any]:
     """Tells the model which settings came from the user rather than from its call."""
     picked = options.model_dump(exclude_none=True) if options is not None else {}

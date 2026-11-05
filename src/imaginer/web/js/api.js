@@ -191,6 +191,19 @@ export const api = {
     return resp.text();
   },
 
+  // --- Hugging Face Hub ---
+  hub: () => getJson('v1/hub'),
+  updateHub: (patch) => sendJson('PATCH', 'v1/hub', patch),
+  /** {q, format, sort, limit, base_model, relation} */
+  hubSearch: (params) => getJson(`v1/hub/search?${new URLSearchParams(params)}`),
+  /** A repo's layout, matched to engine's model settings. ref: anything a person pastes. */
+  hubRepo: (ref, engine = null) => getJson(`v1/hub/repo?${new URLSearchParams(engine ? { ref, engine } : { ref })}`),
+  hubDownloads: () => getJson('v1/hub/downloads'),
+  hubDownload: (body) => sendJson('POST', 'v1/hub/downloads', body),
+  cancelHubDownload: (id) => sendJson('POST', `v1/hub/downloads/${id}/cancel`),
+  /** Live `download` events; read them with readEvents. */
+  hubEvents: (signal) => request('GET', 'v1/hub/events', { signal, headers: { Accept: 'text/event-stream' } }),
+
   // --- linked instances ---
   links: () => getJson('v1/links'),
   discovered: () => getJson('v1/links/discovered'),

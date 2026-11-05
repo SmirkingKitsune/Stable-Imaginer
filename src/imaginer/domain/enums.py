@@ -21,6 +21,15 @@ class Role(StrEnum):
     TOOL = "tool"
 
 
+class PromptMode(StrEnum):
+    """How a user message reaches the image model."""
+
+    CHAT = "chat"  # the LLM chats, and draws when asked, writing its own prompt
+    RAW = "raw"  # no LLM: the message is the image prompt, word for word
+    INTERPRET = "interpret"  # the LLM must turn the message into a faithful image prompt
+    CURATE = "curate"  # the LLM enriches the prompt, or asks first when it's too unclear
+
+
 class MessageStatus(StrEnum):
     STREAMING = "streaming"
     COMPLETE = "complete"

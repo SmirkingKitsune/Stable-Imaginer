@@ -421,7 +421,8 @@ def detect_driver_cuda_version() -> tuple[int, ...] | None:
     either rejecting a usable release or attempting an impossible compile.
     """
     output = _run_text(("nvidia-smi",))
-    match = re.search(r"CUDA Version:\s*([0-9.]+)", output)
+    # Newer drivers print "CUDA UMD Version" where older ones print "CUDA Version".
+    match = re.search(r"CUDA (?:UMD )?Version:\s*([0-9.]+)", output)
     if not match:
         return None
     try:
@@ -908,10 +909,11 @@ def build_release_plan(cfg: ProvisionConfig) -> list[InstallStep]:
         # Copy the whole directory so companion shared libraries travel with the
         # executable, then layer in libraries that landed elsewhere in staging
         # (Windows backend archives unpack alongside, not into, the base).
+        emit(f"Staging {cfg.exe_name} and its libraries", False)
         shutil.copytree(server.parent, next_bin, dirs_exist_ok=True, symlinks=True)
         for pattern in ("*.dll", "*.so", "*.so.*", "*.dylib"):
             for library in staging.rglob(pattern):
-                if library.is_file():
+                if library.is_file() and library.parent != server.parent:
                     shutil.copy2(library, next_bin / library.name)
 
         target = next_bin / cfg.exe_name
@@ -1180,6 +1182,10 @@ def _download(
 ) -> None:
     request = Request(url, headers={"User-Agent": USER_AGENT, "Accept": "application/octet-stream"})
     with urlopen(request, timeout=timeout) as response, destination.open("wb") as output:
+        try:
+            total = int(response.headers.get("Content-Length") or 0)
+        except ValueError:
+            total = 0
         downloaded = 0
         next_report = 8 * 1024**2
         while True:
@@ -1189,8 +1195,18 @@ def _download(
             output.write(chunk)
             downloaded += len(chunk)
             if emit is not None and downloaded >= next_report:
-                emit(f"Downloaded {downloaded / 1024**2:.0f} MiB", False)
+                emit(_download_line(downloaded, total), False)
                 next_report += 8 * 1024**2
+
+
+def _download_line(downloaded: int, total: int) -> str:
+    """With a known size, the percentage is CMake's `[ 42%]`, so the step's progress
+    fraction follows downloads too."""
+    mib = downloaded / 1024**2
+    if total <= 0:
+        return f"Downloaded {mib:.0f} MiB"
+    percent = min(100, downloaded * 100 // total)
+    return f"[{percent:3d}%] Downloaded {mib:.0f} of {total / 1024**2:.0f} MiB"
 
 
 def _safe_archive_target(destination: Path, member_name: str) -> Path:
@@ -1266,7 +1282,7 @@ def validate_server(binary: Path, timeout: float = 20.0) -> str:
 def _swap_staged_bin(bin_dir: Path, next_bin: Path) -> None:
     """Replace the live runtime while retaining and restoring the previous one."""
     previous = bin_dir.parent / "bin.previous"
-    shutil.rmtree(previous, ignore_errors=True)
+    _discard_dir(previous)
     bin_dir.parent.mkdir(parents=True, exist_ok=True)
     if bin_dir.exists():
         bin_dir.replace(previous)
@@ -1276,6 +1292,21 @@ def _swap_staged_bin(bin_dir: Path, next_bin: Path) -> None:
         if previous.exists() and not bin_dir.exists():
             previous.replace(bin_dir)
         raise
+
+
+def _discard_dir(path: Path) -> None:
+    """Delete ``path``, or move it aside when something still holds files in it.
+
+    On Windows a server still running from an older runtime (one started by hand, say)
+    keeps its executable and loaded libraries undeletable, though their directory can
+    still be renamed. Left half-deleted, ``bin.previous`` would block every later swap
+    with "Access is denied". Copies moved aside are deleted on a later install.
+    """
+    for stale in path.parent.glob(f"{path.name}.stale-*"):
+        shutil.rmtree(stale, ignore_errors=True)
+    shutil.rmtree(path, ignore_errors=True)
+    if path.exists():
+        path.replace(path.with_name(f"{path.name}.stale-{datetime.now():%Y%m%d-%H%M%S-%f}"))
 
 
 def _install_source_build(cfg: ProvisionConfig, emit: Emit) -> None:

@@ -1,39 +1,61 @@
 // Pieces every screen shares: the brand, the engine status line, dialogs and menus.
 
-import { corners, h, icon, clear } from './dom.js';
-import { connection, defaultBackend, offline, on, reconnectNow } from './store.js';
+import { append, corners, h, icon, clear } from './dom.js';
+import { backendWork, connection, defaultBackend, offline, on, reconnectNow } from './store.js';
 
 export const brand = () => h('a.brand', { href: '#/' }, h('span.brand-mark'), 'Stable-Imaginer');
 
-/** "● chat · qwen3-vl-8b  ● image · sdcpp"; a hollow dot when the engine is not ready,
- * "offline" for both while the server can't be reached. */
+/**
+ * "● chat · qwen3-vl-8b  ● image · sdcpp". Each dot says what its engine is doing: filled
+ * when ready, pulsing while it works on a turn this page follows, a blinking ring while it
+ * loads, a struck ring when it is down, a plain ring with none or while the server can't be
+ * reached. The tooltip says it in words.
+ */
 export function statusLine({ short = false } = {}) {
   // A button: it opens the engine popover (design 1d).
   const el = h('button.status-line.status-btn', {
     type: 'button', 'aria-haspopup': 'dialog', 'aria-expanded': 'false', title: 'Engines',
     onclick: () => import('./engines.js').then((m) => m.enginePopover(el)),
   });
+  // Built once and updated in place: job progress re-renders often, and rebuilding the dot
+  // would restart its animation.
+  const items = ['chat', 'image'].map((role) => {
+    const dot = h('span.dot');
+    const text = short ? null : h('span.status-text');
+    return { role, dot, text, el: h('span.status-item', dot, text) };
+  });
+  el.append(...items.map((i) => i.el), icon('chevronDown', 13));
   const render = () => {
-    clear(el);
-    const chat = defaultBackend('chat');
-    const image = defaultBackend('t2i');
     const down = offline();
-    for (const [role, b, text] of [
-      ['chat', chat, chat?.model ? modelName(chat.model) : chat?.name],
-      ['image', image, image?.name],
-    ]) {
-      const title = down ? `${role}: the server is unreachable`
-        : b ? `${role}: ${b.name} (${b.status}${b.detail ? `, ${b.detail}` : ''})` : `no ${role} backend`;
-      el.append(h('span.status-item', { title },
-        h('span.dot', { class: b?.status === 'ok' && !down ? '' : 'off' }),
-        short ? null : `${role} · ${down ? 'offline' : text ?? 'none'}`));
+    const work = backendWork();
+    for (const item of items) {
+      const b = defaultBackend(item.role === 'chat' ? 'chat' : 't2i');
+      const [kind, word] = down ? ['off', 'the server is unreachable'] : dotState(b, work.get(b?.name));
+      item.dot.className = `dot ${kind}`.trim();
+      item.el.title = b && !down
+        ? [`${item.role}: ${b.name}`, b.model && modelName(b.model) !== b.name && b.model, word].filter(Boolean).join(' · ')
+        : `${item.role}: ${word}`;
+      if (item.text) {
+        const name = item.role === 'chat' ? modelName(b?.model) || b?.name : b?.name;
+        item.text.textContent = `${item.role} · ${down ? 'offline' : name ?? 'none'}`;
+      }
     }
-    el.append(icon('chevronDown', 13));
-    el.setAttribute('aria-label', `Engines: ${[...el.querySelectorAll('.status-item')].map((s) => s.title).join('; ')}`);
+    el.setAttribute('aria-label', `Engines: ${items.map((i) => i.el.title).join('; ')}`);
   };
   render();
-  const off = on('backends', render);
-  return { el, destroy: off };
+  const offs = [on('backends', render), on('turns', render)];
+  return { el, destroy: () => offs.forEach((off) => off()) };
+}
+
+/** The status dot's class and its words for backend `b`, given what it is doing for a turn. */
+function dotState(b, work) {
+  if (!b) return ['off', 'none set'];
+  if (work) return ['busy', work.progress != null ? `${work.word} ${Math.round(work.progress * 100)}%` : work.word];
+  if (b.status === 'ok') return ['', 'ready'];
+  if (b.status === 'degraded') return ['warm', b.detail ? `loading (${b.detail})` : 'loading'];
+  if (b.status === 'unknown') return ['warm', 'checking'];
+  if (!b.enabled) return ['off', 'disabled'];
+  return ['fail', b.detail ? `down (${b.detail})` : 'down'];
 }
 
 // --- connection strip (designs 4a, 4b) -------------------------------------------------
@@ -82,13 +104,13 @@ export function connectionStrip({ onReload = null, turnRunning = () => false } =
     } else if (s.status === 'offline') {
       const note = [`${s.max} attempts over ${span((s.gaveUpAt ?? Date.now()) - s.startedAt)}`];
       if (turnRunning()) note.push('the turn keeps running on the server');
-      el.append(
+      append(el, [
         icon('wifiOff', 16),
         h('span.conn-title', "Couldn't reconnect"),
         h('span.mono-meta', note.join(' · ')),
         h('span.spacer'),
         onReload && h('button.btn-line', { type: 'button', onclick: () => onReload() }, 'Reload conversation'),
-        h('button.btn.btn-primary', { type: 'button', onclick: () => reconnectNow() }, icon('retry', 14), 'Reconnect'));
+        h('button.btn.btn-primary', { type: 'button', onclick: () => reconnectNow() }, icon('retry', 14), 'Reconnect')]);
     } else if (s.status === 'restored') {
       const note = s.resumedFrom
         ? [`resumed from event #${s.resumedFrom}`, `caught up ${s.caughtUp ?? 0} event${s.caughtUp === 1 ? '' : 's'}`]
@@ -111,10 +133,14 @@ export function connectionStrip({ onReload = null, turnRunning = () => false } =
   };
 }
 
-/** "Qwen3VL-8B-Instruct-Q4_K_M.gguf" → "qwen3vl-8b-instruct" */
+/** "C:\…\Qwen3VL-8B-Instruct-UD-Q4_K_XL.gguf" → "qwen3vl-8b-instruct" */
 export function modelName(model) {
   if (!model) return '';
-  return model.replace(/\.gguf$/i, '').replace(/[-_.]?(Q\d.*|F16|BF16|FP16)$/i, '').toLowerCase();
+  return model.split(/[\\/]/).pop()
+    .replace(/\.(gguf|safetensors)$/i, '')
+    .replace(/-\d{5}-of-\d{5}$/i, '')
+    .replace(/[-_.]?(UD[-_.])?(I?Q\d.*|F16|BF16|FP16|F32)$/i, '')
+    .toLowerCase();
 }
 
 // --- dialogs (design 7a: focus trap + restore) -------------------------------------

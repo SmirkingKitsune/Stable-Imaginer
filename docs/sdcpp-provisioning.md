@@ -3,8 +3,9 @@
 The `imaginer.provisioning.sdcpp` service installs `sd-server` and its companion libraries.
 It shares the llama.cpp provisioner's execution, locking, progress, cancellation, staging,
 and log retention. It has its own release matching, source configuration, metadata, and
-update checks. Model downloads are not included. The Engines screen in the web UI runs the
-same installs (`POST /v1/engines/{name}/install`) and can start an installed engine.
+update checks. Model downloads are not included here: the Engines screen's Hugging Face
+dialog handles those (see [huggingface.md](huggingface.md)). The Engines screen in the web
+UI runs the same installs (`POST /v1/engines/{name}/install`) and can start an installed engine.
 
 ## Commands
 

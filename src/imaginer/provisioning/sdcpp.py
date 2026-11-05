@@ -332,16 +332,20 @@ def _stage_install(
         raise ProvisionError(f"{cfg.exe_name} not found under {root}")
     next_bin = cfg.provision_dir / "bin.next"
     shutil.rmtree(next_bin, ignore_errors=True)
+    # The CUDA libraries run to gigabytes: say so before copying them, and copy each once.
+    emit(f"Staging {cfg.exe_name} and its libraries", False)
     shutil.copytree(server.parent, next_bin, symlinks=False)
     for pattern in ("*.dll", "*.so", "*.so.*", "*.dylib"):
         for library in root.rglob(pattern):
-            if library.is_file():
+            if library.is_file() and library.parent != server.parent:
                 shutil.copy2(library, next_bin / library.name)
     binary = next_bin / cfg.exe_name
     binary.chmod(binary.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
+    emit(f"Validating {cfg.exe_name}", False)
     emit(shared.validate_server(binary), False)
     shared._swap_staged_bin(cfg.provision_dir / "bin", next_bin)
     _write_state(cfg, version, method)
+    emit(f"Installed {cfg.exe_name} {version} ({method})", False)
 
 
 def _install_source(cfg: shared.ProvisionConfig, emit: shared.Emit) -> None:
@@ -367,15 +371,16 @@ def build_install_plan(cfg: shared.ProvisionConfig) -> list[InstallStep]:
                 names = select_release_assets(list(assets), cfg, driver)
             except ProvisionError:
                 continue
+            emit(f"Release {release['tag_name']}: selected {', '.join(names)}", False)
             staging = cfg.release_dir / "staging"
             shutil.rmtree(staging, ignore_errors=True)
             staging.mkdir(parents=True)
-            for name in names:
+            for index, name in enumerate(names, 1):
                 # GitHub names are external input, including the download destination.
                 if Path(name).name != name:
                     raise ProvisionError(f"Unsafe release asset name: {name}")
                 archive = shared._safe_archive_target(cfg.release_dir, name)
-                emit(f"Downloading {name}", False)
+                emit(f"[{index}/{len(names)}] Downloading {name}", False)
                 shared._download(assets[name], archive, emit)
                 _extract_release(archive, staging, emit)
             _stage_install(cfg, staging, str(release["tag_name"]), "release", emit)

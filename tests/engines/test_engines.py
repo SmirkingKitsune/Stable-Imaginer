@@ -1,6 +1,7 @@
 """The Engines screen's backend: launch commands, model files, processes, installs, API."""
 
 import asyncio
+import json
 import struct
 import subprocess
 import sys
@@ -20,6 +21,7 @@ from imaginer.engines import installer, launch, service
 from imaginer.engines.supervisor import Supervisor
 from imaginer.main import create_app
 from tests.conftest import SettingsFactory, sd_config
+from tests.fakes.live import LiveServer
 
 
 def _gguf(path: Path) -> Path:
@@ -405,6 +407,29 @@ async def test_start_and_install_exclude_each_other(
         await asyncio.sleep(0.02)
     after = await engines_client.post("/v1/engines/sd/start")
     assert after.status_code == 422  # no longer the install: now it's the missing model
+
+
+async def test_events_open_with_the_install_as_it_stands(
+    profile: Path, fake_provisioner: None
+) -> None:
+    # An install that ends before its follower subscribes must not leave it waiting.
+    with LiveServer(create_app(load_settings(str(profile))), lifespan="on") as live:
+        async with httpx.AsyncClient(base_url=live.url, timeout=10) as client:
+            await client.post("/v1/engines/sd/install", json={"accelerator": "cpu"})
+            for _ in range(200):
+                if (await client.get("/v1/engines/sd")).json()["install"]["state"] != "running":
+                    break
+                await asyncio.sleep(0.02)
+            first: dict[str, str] = {}
+            async with client.stream("GET", "/v1/engines/sd/events") as response:
+                async for line in response.aiter_lines():
+                    if not line and first:
+                        break
+                    if line and not line.startswith(":"):
+                        name, _, value = line.partition(": ")
+                        first[name] = value
+    assert first["event"] == "install"
+    assert json.loads(first["data"])["state"] == "succeeded"
 
 
 async def test_remote_engines_keep_their_path_and_install_nothing_here(

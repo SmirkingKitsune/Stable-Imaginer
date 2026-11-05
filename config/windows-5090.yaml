@@ -41,8 +41,8 @@ backends:
     timeouts:
       read: 120
     defaults:
-      width: 1024
-      height: 1024
+      width: 2048
+      height: 2048
       steps: 20
       cfg_scale: 6.0
       sampler: euler
@@ -50,7 +50,7 @@ backends:
 
   # Optional in-process reference backend: `uv sync --extra diffusers`, then enable it and point
   # routing.t2i / routing.edit here. Diffusers samples Qwen-Image-2.1 without guidance
-  # (true_cfg_scale 1.0) at 40 steps, 2048x2048. cpu_offload trades speed for VRAM.
+  # (true_cfg_scale 1.0) at 40 steps. cpu_offload trades speed for VRAM.
   diffusers:
     type: diffusers
     enabled: false

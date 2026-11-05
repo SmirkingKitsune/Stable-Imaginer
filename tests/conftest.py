@@ -16,6 +16,7 @@ from imaginer.core.config import (
     LlamaCppBackendConfig,
     LoggingConfig,
     OrchestrationConfig,
+    QAConfig,
     RetryConfig,
     RoutingConfig,
     SdCppBackendConfig,
@@ -123,7 +124,8 @@ def chat_settings(make_settings: SettingsFactory, fake_llama: FakeLlama) -> Sett
     return make_settings(
         backends={"llama": llama_config(fake_llama.url)},
         routing=RoutingConfig(chat="llama"),
-        orchestration=OrchestrationConfig(probe_ttl_s=0),
+        # Scripted turns leave the quality check out; tests/api/test_modes.py turns it on.
+        orchestration=OrchestrationConfig(probe_ttl_s=0, qa=QAConfig(enabled=False)),
     )
 
 
@@ -180,5 +182,7 @@ def studio_settings(
     return make_settings(
         backends={"llama": llama_config(fake_llama.url), "sd": sd_config(fake_sd.url)},
         routing=RoutingConfig(chat="llama", t2i="sd", edit="sd"),
-        orchestration=OrchestrationConfig(probe_ttl_s=0, max_tool_iterations=2),
+        orchestration=OrchestrationConfig(
+            probe_ttl_s=0, max_tool_iterations=2, qa=QAConfig(enabled=False)
+        ),
     )

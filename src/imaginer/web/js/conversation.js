@@ -12,6 +12,7 @@ import { setImage } from './api.js';
 import { announce, connectionStrip, dialog, menu, modelName, statusLine, toast } from './chrome.js';
 import { corners, h, icon, iconButton, clear } from './dom.js';
 import { argsLine, clock, imagesSummary, parseArgs, plural, ratioOf, specOf, truncate } from './format.js';
+import { caretToEnd, mentionChip, mentionEditor, previewMentions, splitMentions } from './mentions.js';
 import { convHash } from './origin.js';
 import { promptBar } from './promptbar.js';
 import {
@@ -66,6 +67,7 @@ export function conversationScreen({ id, navigate, focusBar = false }) {
     h('p.rail-hint', 'Retry an image or edit any of your messages to start a branch. Each branch keeps its own images and labels.'));
 
   const thread = h('div.thread');
+  previewMentions(thread);
   const scroller = h('div.thread-scroll', thread);
   const bar = promptBar({
     draftKey: id,
@@ -230,8 +232,34 @@ export function conversationScreen({ id, navigate, focusBar = false }) {
     }));
   }
 
+  /** The text with each "@label" of an image here as a chip that opens it. */
+  function withMentions(text) {
+    const image = (label) => {
+      const a = byLabel(c, label);
+      return a?.mime?.startsWith('image/') ? a : null;
+    };
+    return splitMentions(text, image).map((p) => {
+      if (typeof p === 'string') return p;
+      const a = image(p.ref);
+      return mentionChip(a.label, (img) => setImage(img, a), {
+        tag: 'a.mention', href: convHash(id, a.label), 'aria-label': `Open ${a.label}`, source: sourceWord(a),
+      });
+    });
+  }
+
+  function sourceWord(a) {
+    return a.kind === 'mask' ? 'mask' : a.source;
+  }
+
   function userBlock(m) {
-    const opts = m.metadata?.image_options;
+    const opts = m.metadata?.image_options ?? {};
+    const sent = [
+      m.metadata?.mode && `${m.metadata.mode} mode`, m.metadata?.qa === false && 'QA off',
+      opts.width ? `${opts.width}×${opts.height}` : opts.aspect_ratio, opts.n && `×${opts.n}`,
+      opts.seed != null && `seed ${opts.seed}`, opts.steps && `${opts.steps} steps`,
+      opts.cfg_scale != null && `cfg ${opts.cfg_scale}`, opts.negative_prompt && 'negative',
+      opts.transparent && 'transparent', opts.mask, opts.backend,
+    ].filter(Boolean);
     const alternatives = siblingsOf(c, m);
     return h('section.msg.user',
       h('div.msg-head.user-head',
@@ -243,21 +271,19 @@ export function conversationScreen({ id, navigate, focusBar = false }) {
           onclick: () => startEdit(m),
         }, icon('branch', 13), 'Edit & branch')),
       attachmentChips(m),
-      m.content_text && h('p.msg-text', m.content_text),
-      opts && h('div.mono-meta.msg-opts', icon('sliders', 12), [
-        opts.width ? `${opts.width}×${opts.height}` : opts.aspect_ratio, opts.n && `×${opts.n}`,
-        opts.seed != null && `seed ${opts.seed}`, opts.steps && `${opts.steps} steps`,
-        opts.cfg_scale != null && `cfg ${opts.cfg_scale}`, opts.negative_prompt && 'negative',
-        opts.transparent && 'transparent', opts.mask, opts.backend,
-      ].filter(Boolean).join(' · ')));
+      m.content_text && h('p.msg-text', withMentions(m.content_text)),
+      sent.length > 0 && h('div.mono-meta.msg-opts', icon('sliders', 12), sent.join(' · ')));
   }
 
   /** Design 2d: the message as an editor. Sending forks; everything below stays put. */
   function editorBlock(m) {
-    const input = h('textarea.edit-text', {
-      rows: 2, 'aria-label': 'Edit your message',
-      oninput: () => { editText = input.value; },
-      onkeydown: (e) => {
+    // "@" picks one of the message's own images: the edit keeps its attachments.
+    const attached = m.attachments.map((aid) => c.artifacts.get(aid)).filter((a) => a?.mime?.startsWith('image/'));
+    const input = mentionEditor({
+      images: () => attached.map((a) => ({ ref: a.label, source: sourceWord(a), fill: (img) => setImage(img, a) })),
+      className: 'edit-text', label: 'Edit your message',
+      onInput: (text) => { editText = text; },
+      onKey: (e) => {
         if (e.key === 'Enter' && !e.shiftKey && !e.isComposing) {
           e.preventDefault();
           submitEdit(m);
@@ -266,13 +292,13 @@ export function conversationScreen({ id, navigate, focusBar = false }) {
         }
       },
     });
-    input.value = editText;
+    input.setText(editText);
     const branch = currentBranch(c)?.name ?? 'this branch';
     return h('section.msg.user.editing.blueprint',
       corners(),
       head('Editing your message', `creates branch ${c.branches.length + 1}`),
       attachmentChips(m),
-      input,
+      input.el,
       h('div.edit-row',
         h('span.edit-hint', `Messages below stay on ${branch}. Nothing is deleted.`),
         h('button.btn-line', { type: 'button', onclick: stopEdit }, icon('chevronLeft', 15), 'Cancel'),
@@ -287,7 +313,7 @@ export function conversationScreen({ id, navigate, focusBar = false }) {
   function assistantBlock(messages, ctx) {
     const lead = messages[0];
     const streaming = messages.some((m) => m.status === 'streaming');
-    const model = modelName(lead.model) || lead.backend || 'assistant';
+    const model = lead.metadata?.mode === 'raw' ? 'raw prompt' : modelName(lead.model) || lead.backend || 'assistant';
     const parts = [];
     for (const m of messages) {
       if (m.reasoning_text) parts.push(reasoning(m));
@@ -359,6 +385,8 @@ export function conversationScreen({ id, navigate, focusBar = false }) {
       h('span.tool-args', { title: argsLine(shown, call.function.arguments) }, argsLine(shown, call.function.arguments)),
       !outs.length && attemptSwitch,
       state)];
+    const qa = qaLine(result?.metadata?.qa);
+    if (qa) parts.push(qa);
     if (outcome?.status === 'error') {
       parts.push(h('div.tool-error',
         h('span', `${outcome.error?.code ?? 'error'}: ${outcome.error?.detail ?? ''}`),
@@ -376,6 +404,29 @@ export function conversationScreen({ id, navigate, focusBar = false }) {
       parts.push(inputs.length ? h('div.fig-with-lineage', figs, lineage(inputs, args?.mask, outs)) : figs);
     }
     return h('div.tool', parts);
+  }
+
+  /** The quality check on one attempt (metadata.qa): checking, passed, redone, flagged, skipped. */
+  function qaLine(qa) {
+    if (!qa || (qa.status === 'checking' && !running(id))) return null;
+    const issues = (qa.issues ?? []).join('; ');
+    const fixed = (qa.earlier ?? []).flatMap((e) => e.issues ?? []).join('; ');
+    const [tag, kind, text] = {
+      checking: ['QA · CHECKING', 'run', 'Llama is looking at the image'],
+      passed: ['QA ✓', 'done', qa.attempt > 1 ? `passed on attempt ${qa.attempt}${fixed ? ` · fixed: ${fixed}` : ''}` : 'passed'],
+      redone: ['QA · REDONE', 'wait', [issues, qa.changes && `→ ${changesText(qa.changes)}`].filter(Boolean).join(' ')],
+      flagged: ['QA · FLAGGED', 'fail', `kept with: ${issues || 'issues the check could not fix'}`],
+      skipped: ['QA · SKIPPED', 'wait', qa.detail ?? ''],
+    }[qa.status] ?? ['QA', 'wait', qa.status];
+    return h('div.qa-line', { title: text }, h(`span.state.${kind}`, tag), h('span.qa-text', text));
+  }
+
+  function changesText(changes) {
+    return [
+      changes.prompt && `prompt "${truncate(changes.prompt, 48)}"`, changes.negative_prompt && 'negative prompt',
+      changes.steps && `${changes.steps} steps`, changes.cfg_scale != null && `cfg ${changes.cfg_scale}`,
+      changes.new_seed && 'new seed',
+    ].filter(Boolean).join(', ');
   }
 
   function retryButton(result, title) {
@@ -445,7 +496,7 @@ export function conversationScreen({ id, navigate, focusBar = false }) {
         h('span.label-chip', a.label),
         h('div.fig-actions',
           h('button.mini.primary', {
-            type: 'button', onclick: () => bar.addArtifact(a, { first: true, prefill: `Edit ${a.label}: ` }),
+            type: 'button', onclick: () => bar.addArtifact(a, { first: true, prefill: `Edit @${a.label}: ` }),
           }, icon('pencil', 13), 'Edit'),
           h('button.mini', {
             type: 'button', title: 'Paint a mask for an edit', onclick: () => navigate(convHash(id, 'mask', a.label)),
@@ -509,8 +560,7 @@ export function conversationScreen({ id, navigate, focusBar = false }) {
     editText = m.content_text ?? '';
     render();
     const input = thread.querySelector('.edit-text');
-    input?.focus();
-    input?.setSelectionRange(input.value.length, input.value.length);
+    if (input) caretToEnd(input);
     input?.closest('.msg')?.scrollIntoView({ block: 'nearest' });
   }
 
@@ -524,7 +574,10 @@ export function conversationScreen({ id, navigate, focusBar = false }) {
     const attachments = m.attachments.map((aid) => c.artifacts.get(aid)).filter(Boolean).map((artifact) => ({ artifact }));
     if (!text && !attachments.length) return;
     try {
-      await send(id, { text, attachments, options: m.metadata?.image_options ?? null, editOf: m.id });
+      await send(id, {
+        text, attachments, options: m.metadata?.image_options ?? null,
+        mode: m.metadata?.mode ?? null, qa: m.metadata?.qa ?? null, editOf: m.id,
+      });
       editing = null;
       render();
     } catch (err) {
@@ -573,6 +626,8 @@ export function conversationScreen({ id, navigate, focusBar = false }) {
 
   const dockSize = new ResizeObserver(() => {
     thread.style.paddingBottom = `${dock.offsetHeight + 56}px`;
+    // Whatever scrolls into view (the caret while editing a message) stops above the dock.
+    scroller.style.scrollPaddingBottom = `${dock.offsetHeight + 32}px`;
   });
   dockSize.observe(dock);
   const unsubscribe = [on(`conv:${id}`, render), on('turns', render)];

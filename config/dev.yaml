@@ -21,8 +21,8 @@ backends:
     declared_capabilities: [t2i, edit, multi_ref, rgba]
     poll_interval_s: 0.1
     defaults:
-      width: 512
-      height: 512
+      width: 2048
+      height: 2048
       steps: 4
       cfg_scale: 6.0
       sampler: euler

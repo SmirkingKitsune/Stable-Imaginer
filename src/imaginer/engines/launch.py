@@ -5,7 +5,9 @@ else is remote and only its endpoint is managed. The listen address comes from t
 backend's ``base_url``, so the adapter and the process always agree on it.
 """
 
+import json
 import os
+import re
 import struct
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -84,17 +86,32 @@ def check_files(config: BackendConfig) -> list[FileCheck]:
     checks = []
     for key, flag, what in file_specs(config):
         raw = getattr(launch, key, None) if launch is not None else None
-        checks.append(check_file(key, flag, what, Path(raw) if raw else None))
+        checks.append(check_file(key, flag, what, Path(raw) if raw else None, engine=config.type))
     return checks
 
 
-def check_file(key: str, flag: str, what: str, path: Path | None) -> FileCheck:
+def check_file(
+    key: str, flag: str, what: str, path: Path | None, *, engine: str | None = None
+) -> FileCheck:
+    """``engine`` adds what that engine can't load: llama-server reads GGUF only, from a split
+    GGUF's first shard; sd-server reads sharded safetensors through their index (a
+    ``*.safetensors.index.json``, or a folder holding ``model.safetensors.index.json``), so
+    one shard on its own would load part of a model."""
     if path is None:
         return FileCheck(key, flag, what, None)
     expanded = Path(os.path.expandvars(path)).expanduser()
     shown = str(path)
+    if expanded.is_dir():
+        index = expanded / ROOT_INDEX
+        if engine == "sdcpp" and index.is_file() and not (expanded / "model_index.json").exists():
+            return _check_index(key, flag, what, shown, index)
+        return FileCheck(key, flag, what, shown, exists=True, problem=_folder_problem(expanded))
     if not expanded.is_file():
         return FileCheck(key, flag, what, shown, problem="file not found")
+    if expanded.name.endswith(".json"):
+        if engine == "llamacpp":
+            return FileCheck(key, flag, what, shown, exists=True, problem=GGUF_ONLY)
+        return _check_index(key, flag, what, shown, expanded)
     try:
         size = expanded.stat().st_size
         with expanded.open("rb") as fh:
@@ -105,9 +122,69 @@ def check_file(key: str, flag: str, what: str, path: Path | None) -> FileCheck:
     problem = None
     if fmt == "unknown":
         problem = "not a GGUF or safetensors file"
+    elif engine == "llamacpp" and fmt == "safetensors":
+        problem = GGUF_ONLY
+    else:
+        problem = _shard_problem(expanded, fmt, engine)
     return FileCheck(
         key, flag, what, shown, exists=True, size_bytes=size, format=fmt, problem=problem
     )
+
+
+GGUF_ONLY = "llama-server loads GGUF files only"
+ROOT_INDEX = "model.safetensors.index.json"
+_SHARD = re.compile(r"^(?P<base>.+)-(?P<n>\d{5})-of-(?P<total>\d{5})\.(?:gguf|safetensors)$")
+
+
+def _shard_problem(path: Path, fmt: FileFormat, engine: str | None) -> str | None:
+    shard = _SHARD.match(path.name)
+    if shard is None:
+        return None
+    n, total = int(shard["n"]), int(shard["total"])
+    if fmt == "gguf":
+        if n != 1:
+            first = f"{shard['base']}-00001-of-{shard['total']}.gguf"
+            return f"shard {n} of {total}: point at the first one, {first}"
+        return None
+    if engine != "sdcpp":
+        return None
+    index = path.with_name(f"{shard['base']}.safetensors.index.json")
+    if index.is_file():
+        return f"one of {total} shards: point at {index.name} to load them all"
+    return f"one of {total} shards, with no {index.name} beside it to load them all"
+
+
+def _folder_problem(folder: Path) -> str:
+    if (folder / "model_index.json").is_file():
+        return (
+            "a Diffusers pipeline folder: point at its transformer, vae or text_encoder "
+            "weights (the .safetensors.index.json where they are sharded)"
+        )
+    return "a folder, not a model file"
+
+
+def _check_index(key: str, flag: str, what: str, shown: str, index: Path) -> FileCheck:
+    """A safetensors index: its weight_map names the shards, which must all be beside it."""
+    try:
+        data = json.loads(index.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        data = None
+    weight_map = data.get("weight_map") if isinstance(data, dict) else None
+    if not isinstance(weight_map, dict) or not weight_map:
+        problem = "not a safetensors index (no weight_map)"
+        return FileCheck(key, flag, what, shown, exists=True, problem=problem)
+    shards = sorted({str(name) for name in weight_map.values()})
+    size = 0
+    missing = []
+    for name in shards:
+        try:
+            size += (index.parent / name).stat().st_size
+        except OSError:
+            missing.append(name)
+    if missing:
+        problem = f"{len(missing)} of its {len(shards)} shards are missing, e.g. {missing[0]}"
+        return FileCheck(key, flag, what, shown, exists=True, problem=problem)
+    return FileCheck(key, flag, what, shown, exists=True, size_bytes=size, format="safetensors")
 
 
 def sniff_format(head: bytes, size: int) -> FileFormat:

@@ -1,10 +1,13 @@
 // The prompt bar (design 1a "chip row"): text, attachments, and quick-option chips that
-// open a tray for aspect ratio, image count, seed and image backend. Each option maps to
-// MessageCreate.image_options; "auto" leaves the choice to the model.
+// open a tray for the prompt mode, the quality check, aspect ratio, image count, seed and
+// image backend. The image options map to MessageCreate.image_options ("auto" leaves the
+// choice to the model); mode and qa go with the message itself. Typing "@" picks one of
+// the attached images and puts it in the text as a chip (see mentions.js).
 
 import { setImage } from './api.js';
 import { append, corners, h, icon, clear } from './dom.js';
-import { ASPECTS, truncate } from './format.js';
+import { ASPECTS } from './format.js';
+import { mentionEditor, uploadRef } from './mentions.js';
 import {
   clearDraft, connection, defaultBackend, draft, imageBackends, imageEngine, on, options, requestOptions,
   setOption,
@@ -12,13 +15,32 @@ import {
 
 const STATUS_WORD = { ok: 'ready', degraded: 'loading', down: 'down', unavailable: 'off', unknown: '…' };
 const SOURCE_WORD = { upload: 'upload', generated: 'generated', edited: 'edited', derived: 'derived' };
+/** How the text reaches the image model (MessageCreate.mode). */
+const MODES = {
+  chat: { label: 'Chat', icon: 'chat', hint: 'Llama replies, and draws when you ask for an image' },
+  raw: {
+    label: 'Raw', icon: 'terminal', placeholder: 'Image prompt, sent to the image model as written…',
+    hint: 'no Llama: your text is the prompt; attached images are edited',
+  },
+  interpret: {
+    label: 'Interpret', icon: 'arrowRight', placeholder: 'Describe the image…',
+    hint: 'Llama turns your words into a faithful prompt and draws right away',
+  },
+  curate: {
+    label: 'Curate', icon: 'pencil', placeholder: 'An idea to build on…',
+    hint: 'Llama enriches your prompt, or asks first when it is too unclear',
+  },
+};
 
 /** pending: extra attachments shown but not yet in the draft, e.g. a mask being painted:
- * () => [{label, src, thumb}] with thumb an element. */
+ * () => [{label, src, thumb}] with thumb an element. compact: the viewer's one-line reply
+ * field (design 2a), the draft's text alone; it opens the conversation on focus, so it
+ * carries none of the bar's controls. */
 export function promptBar({
-  draftKey, placeholder, onSubmit, onStop, isBusy = () => false, onFocus, pending = () => [],
+  draftKey, placeholder, onSubmit, onStop, isBusy = () => false, onFocus, pending = () => [], compact = false,
 }) {
   const d = draft(draftKey);
+  let basePlaceholder = placeholder;
   let trayOpen = false;
   let sending = false;
   let error = null;
@@ -27,10 +49,12 @@ export function promptBar({
     type: 'file', accept: 'image/*', multiple: true, hidden: true,
     onchange: () => { addFiles(fileInput.files); fileInput.value = ''; },
   });
-  const textarea = h('textarea.pbar-text', {
-    rows: 2, placeholder, 'aria-label': 'Prompt',
-    oninput: () => { d.text = textarea.value; grow(); renderActions(); },
-    onkeydown: (e) => {
+  // The draft keeps the text plain, each image reference (a chip in the editor) as "@label".
+  const editor = mentionEditor({
+    images: () => d.attachments.map((att) => ({ ref: refOf(att), source: sourceOf(att), fill: (img) => fillThumb(img, att) })),
+    className: 'pbar-text', label: 'Prompt',
+    onInput: (text) => { d.text = text; renderActions(); },
+    onKey: (e) => {
       if (e.key === 'Enter' && !e.shiftKey && !e.isComposing) {
         e.preventDefault();
         submit();
@@ -38,17 +62,10 @@ export function promptBar({
         toggleTray(false);
       }
     },
-    onpaste: (e) => {
-      const files = [...(e.clipboardData?.files ?? [])].filter((f) => f.type.startsWith('image/'));
-      if (files.length) {
-        e.preventDefault();
-        addFiles(files);
-      }
-    },
+    onFiles: addFiles,
   });
-  textarea.value = d.text;
 
-  const atts = h('div.pbar-atts');
+  const atts = compact ? h('span.mono-meta.pbar-count') : h('div.pbar-atts');
   const chips = h('div.pbar-chips');
   const optionsBtn = h('button.pbar-opt-btn', {
     type: 'button', title: 'Quick options', 'aria-label': 'Quick options',
@@ -58,24 +75,43 @@ export function promptBar({
   const tray = h('div.pbar-tray.blueprint', { hidden: true });
   const errorLine = h('div.pbar-error', { hidden: true });
 
-  const bar = h('div.pbar.blueprint', corners(), atts, textarea, h('div.pbar-row',
-    h('button.pbar-attach', {
-      type: 'button', title: 'Attach images', 'aria-label': 'Attach images',
-      onclick: () => fileInput.click(),
-    }, icon('paperclip')),
-    chips, optionsBtn, actions,
-  ));
-  const el = h('div.pbar-wrap', tray, errorLine, bar, fileInput);
+  const bar = compact
+    ? h('div.pbar.blueprint.compact', corners(), h('div.pbar-row', icon('chat', 16), editor.el, atts, actions))
+    : h('div.pbar.blueprint', corners(), atts, editor.el, h('div.pbar-row',
+      h('button.pbar-attach', {
+        type: 'button', title: 'Attach images', 'aria-label': 'Attach images',
+        onclick: () => fileInput.click(),
+      }, icon('paperclip')),
+      chips, optionsBtn, actions,
+    ));
+  const el = h('div.pbar-wrap', !compact && [tray, errorLine], bar, fileInput);
   if (onFocus) el.addEventListener('focusin', () => onFocus());
 
   // --- pieces ---------------------------------------------------------------
 
-  function grow() {
-    textarea.style.height = 'auto';
-    textarea.style.height = `${Math.min(textarea.scrollHeight, 220)}px`;
+  /** What an attachment is called in the text: its label, or for an upload a name from
+   * the file until the server labels it (store.send rewrites the references then). */
+  const refOf = (att) => att.artifact?.label ?? att.ref;
+
+  function sourceOf(att) {
+    const maskFor = att.artifact?.metadata?.mask_for;
+    return att.artifact?.kind === 'mask' ? `mask${maskFor ? ` · ${maskFor}` : ''}`
+      : att.artifact ? SOURCE_WORD[att.artifact.source] ?? att.artifact.source : 'upload';
+  }
+
+  function fillThumb(img, att) {
+    if (att.artifact) setImage(img, att.artifact);
+    else img.src = att.preview;
   }
 
   function renderAtts() {
+    if (compact) {
+      const n = d.attachments.length + pending().length;
+      atts.hidden = !n;
+      atts.textContent = `${n} image${n === 1 ? '' : 's'}`;
+      editor.sync();
+      return;
+    }
     clear(atts);
     const extra = pending();
     atts.hidden = !d.attachments.length && !extra.length;
@@ -83,15 +119,11 @@ export function promptBar({
       h('div.att-text', h('span.att-label', p.label), h('span.att-src', p.src))));
     for (const att of d.attachments) {
       const thumb = h('img.att-thumb', { alt: '' });
-      if (att.artifact) setImage(thumb, att.artifact);
-      else thumb.src = att.preview;
-      const label = att.artifact ? att.artifact.label : truncate(att.file.name || 'image', 18);
-      const maskFor = att.artifact?.metadata?.mask_for;
-      const src = att.artifact?.kind === 'mask' ? `mask${maskFor ? ` · ${maskFor}` : ''}`
-        : att.artifact ? SOURCE_WORD[att.artifact.source] ?? att.artifact.source : 'upload';
+      fillThumb(thumb, att);
+      const label = refOf(att);
       atts.append(h('div.att',
         thumb,
-        h('div.att-text', h('span.att-label', label), h('span.att-src', src)),
+        h('div.att-text', h('span.att-label', label), h('span.att-src', sourceOf(att))),
         h('button.att-x', {
           type: 'button', title: `Remove ${label}`, 'aria-label': `Remove ${label}`,
           onclick: () => removeAttachment(att),
@@ -99,6 +131,7 @@ export function promptBar({
       ));
     }
     atts.append(...after);
+    editor.sync();
   }
 
   function shape(ratio, scale = 0.65) {
@@ -113,6 +146,12 @@ export function promptBar({
     return options.backend ?? defaultBackend('t2i')?.name ?? 'image';
   }
 
+  const mode = () => MODES[options.mode] ?? MODES.chat;
+
+  function renderPlaceholder() {
+    editor.setPlaceholder(mode().placeholder ?? basePlaceholder);
+  }
+
   function renderChips() {
     clear(chips);
     const chip = (...children) => h('button.chip', { type: 'button', onclick: () => toggleTray() }, children);
@@ -121,6 +160,8 @@ export function promptBar({
     const sampler = [options.steps && `${options.steps} steps`, options.cfg_scale != null && `cfg ${options.cfg_scale}`].filter(Boolean);
     const engine = imageEngine();
     append(chips, [
+      chip(icon(mode().icon, 14), mode().label.toLowerCase()),
+      chip(icon(options.qa ? 'check' : 'ban', 14), options.qa ? 'QA' : 'QA off'),
       options.sizeExact
         ? pinned(icon('ruler', 14), `${options.width}×${options.height}`)
         : chip(shape(options.aspect_ratio), options.aspect_ratio ?? 'auto'),
@@ -149,7 +190,7 @@ export function promptBar({
   /** The size an aspect ratio gets: the backend's default area in that shape. */
   function sizeFor(aspect, defaults) {
     const mult = defaults?.size_multiple ?? 32;
-    const [dw, dh] = [defaults?.width ?? 1024, defaults?.height ?? 1024];
+    const [dw, dh] = [defaults?.width ?? 2048, defaults?.height ?? 2048];
     if (!aspect) return [dw, dh];
     const [a, b] = aspect.split(':').map(Number);
     const w = Math.sqrt((dw * dh * a) / b);
@@ -285,7 +326,20 @@ export function promptBar({
         ? `rgba ✓${engine.type === 'sdcpp' ? ' · prompt-driven on sd-server' : ''}`
         : `${engine?.name ?? 'this backend'} has no rgba`));
 
+    const modeCell = h('div.tray-cell.span-3', h('span.eyebrow', 'Mode'),
+      h('div.tray-seg', Object.entries(MODES).map(([key, m]) =>
+        pick(options.mode === key, m.label, () => setOption({ mode: key })))),
+      h('span.tray-hint', mode().hint));
+    const qaCell = h('div.tray-cell', h('span.eyebrow', 'Quality check'),
+      h('div.tray-seg',
+        pick(!options.qa, 'Off', () => setOption({ qa: false })),
+        pick(options.qa, 'On', () => setOption({ qa: true }))),
+      h('span.tray-hint', options.qa
+        ? 'Llama looks at each image and redoes flawed ones'
+        : 'images are shown as the engine makes them'));
+
     tray.append(
+      modeCell, qaCell,
       h('div.tray-cell', h('span.eyebrow', 'Aspect'), aspects),
       h('div.tray-cell', h('span.eyebrow', 'Count'), counts,
         h('span.tray-hint', options.seedFixed && n > 1
@@ -319,6 +373,10 @@ export function promptBar({
 
   function renderActions() {
     clear(actions);
+    if (compact) {
+      if (isBusy()) actions.append(h('span.mono-meta.pbar-busy', h('span.dot.busy'), 'working'));
+      return;
+    }
     // Design 4b: once reconnecting gives up, the draft stays and Send waits for the server.
     const down = connection().status === 'offline';
     if (isBusy() && !down) {
@@ -327,7 +385,8 @@ export function promptBar({
       }, corners(), h('span.stop-square'), 'Stop'));
       return;
     }
-    const empty = !textarea.value.trim() && !d.attachments.length;
+    // Raw mode sends the text as the prompt, so attachments alone are not enough.
+    const empty = !d.text.trim() && (options.mode === 'raw' || !d.attachments.length);
     actions.append(h('button.send.blueprint', {
       type: 'button', title: 'Send', 'aria-label': 'Send', disabled: empty || sending || down,
       onclick: submit,
@@ -353,9 +412,12 @@ export function promptBar({
   }
 
   function render() {
+    renderPlaceholder();
     renderAtts();
-    renderChips();
-    renderTray();
+    if (!compact) {
+      renderChips();
+      renderTray();
+    }
     renderActions();
     renderError();
   }
@@ -371,11 +433,12 @@ export function promptBar({
   function addFiles(files) {
     for (const file of files) {
       if (!file.type.startsWith('image/')) continue;
-      d.attachments.push({ file, preview: URL.createObjectURL(file) });
+      const ref = uploadRef(file.name, new Set(d.attachments.map(refOf)));
+      d.attachments.push({ file, preview: URL.createObjectURL(file), ref });
     }
     renderAtts();
     renderActions();
-    textarea.focus();
+    editor.el.focus();
   }
 
   function addArtifact(artifact, { first = false, prefill = null } = {}) {
@@ -384,15 +447,16 @@ export function promptBar({
       if (first) d.attachments.unshift(att);
       else d.attachments.push(att);
     }
-    if (prefill && !textarea.value.trim()) {
-      textarea.value = d.text = prefill;
-      grow();
-    }
+    if (prefill && !d.text.trim()) setText(prefill);
     renderAtts();
     renderChips();
     renderActions();
-    textarea.focus();
-    textarea.setSelectionRange(textarea.value.length, textarea.value.length);
+    editor.focusEnd();
+  }
+
+  function setText(text) {
+    d.text = text;
+    editor.setText(text);
   }
 
   function removeAttachment(att) {
@@ -404,8 +468,9 @@ export function promptBar({
   }
 
   async function submit() {
-    const text = textarea.value.trim();
-    if (sending || isBusy() || connection().status === 'offline' || (!text && !d.attachments.length)) return;
+    const text = d.text.trim();
+    if (sending || isBusy() || connection().status === 'offline') return;
+    if (!text && (options.mode === 'raw' || !d.attachments.length)) return;
     sending = true;
     error = null;
     renderActions();
@@ -413,10 +478,9 @@ export function promptBar({
     try {
       const opts = requestOptions();
       if (maskLabel()) opts.mask = maskLabel();
-      await onSubmit({ text, attachments: [...d.attachments], options: opts });
+      await onSubmit({ text, attachments: [...d.attachments], options: opts, mode: options.mode, qa: options.qa });
       clearDraft(draftKey);
-      textarea.value = '';
-      grow();
+      setText('');
       trayOpen = false;
     } catch (err) {
       error = describe(err);
@@ -427,18 +491,18 @@ export function promptBar({
   }
 
   const unsubscribe = [on('options', render), on('backends', render), on('conn', () => { renderActions(); renderError(); })];
+  setText(d.text);
   render();
-  setTimeout(grow);
 
   return {
     el,
     refresh: renderActions,
     refreshAtts: () => { renderAtts(); renderChips(); },
-    setPlaceholder: (text) => { textarea.placeholder = text; },
-    focus: () => textarea.focus(),
+    setPlaceholder: (text) => { basePlaceholder = text; renderPlaceholder(); },
+    focus: () => editor.el.focus(),
     addFiles,
     addArtifact,
-    destroy: () => unsubscribe.forEach((u) => u()),
+    destroy: () => { editor.close(); unsubscribe.forEach((u) => u()); },
   };
 }
 

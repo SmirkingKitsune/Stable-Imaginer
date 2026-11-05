@@ -75,9 +75,10 @@ async def engine_log_file(name: str, container: ContainerDep) -> FileResponse:
 
 @router.get("/{name}/events", response_class=EventSourceResponse, responses=_STREAM_DOC)
 async def engine_events(name: str, container: ContainerDep) -> EventSourceResponse:
-    """Live `line` and `state` events from the engine process, and `install` progress."""
+    """Live `line` and `state` events from the engine process, and `install` progress.
+    The latest install, if there is one, is sent first as it stands."""
     service = container.engines
-    await service.get(name)  # 404 for unknown names
+    engine = await service.get(name)  # 404 for unknown names
     proc = service.supervisor.get(name)
     queue: asyncio.Queue[ServerSentEvent] = asyncio.Queue(maxsize=1000)
 
@@ -98,8 +99,11 @@ async def engine_events(name: str, container: ContainerDep) -> EventSourceRespon
             put(ServerSentEvent(data=info.model_dump_json(), event="install"))
 
     unsubscribe = [proc.subscribe(on_process)]
-    engine_type = (await service.get(name)).type
-    unsubscribe.append(service.installer.subscribe(engine_type, on_install))
+    unsubscribe.append(service.installer.subscribe(engine.type, on_install))
+    # The install as it stands: one that ended before this stream opened (a quick failure,
+    # or a dialog reopened late) would otherwise leave its follower waiting for good.
+    if engine.install is not None:
+        put(ServerSentEvent(data=engine.install.model_dump_json(), event="install"))
 
     async def events() -> AsyncIterator[ServerSentEvent]:
         try:

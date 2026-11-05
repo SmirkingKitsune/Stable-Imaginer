@@ -8,8 +8,8 @@ from imaginer.tools.images import (
     ImageOptions,
     apply_user_options,
     run_image_job,
+    sampler_params,
     user_options_note,
-    user_params,
 )
 
 
@@ -47,7 +47,7 @@ class GenerateImageTool(Tool):
     async def run(self, args: GenerateImageArgs, ctx: ToolContext) -> ToolOutcome:
         options = ctx.image_options
         args = apply_user_options(args, options)
-        params = user_params(options)
+        params = sampler_params(ctx)
         require = {Capability.RGBA} if args.transparent else set()
         lease = await self._registry.image_backend(
             "t2i", options.backend if options else None, require=require

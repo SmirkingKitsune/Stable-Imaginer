@@ -159,9 +159,7 @@ class ContextBuilder:
         parts: list[dict[str, Any]] = [{"type": "text", "text": f"{text}\n\n{note}".strip()}]
         for artifact in shown:
             parts.append({"type": "text", "text": f"{artifact.label}:"})
-            parts.append(
-                {"type": "image_url", "image_url": {"url": await self._data_url(artifact)}}
-            )
+            parts.append({"type": "image_url", "image_url": {"url": await self.data_url(artifact)}})
         return {"role": message.role.value, "content": parts}
 
     async def _tool_images(self, artifacts: list[orm.Artifact]) -> dict[str, Any]:
@@ -170,12 +168,11 @@ class ContextBuilder:
         ]
         for artifact in artifacts:
             parts.append({"type": "text", "text": f"{artifact.label}:"})
-            parts.append(
-                {"type": "image_url", "image_url": {"url": await self._data_url(artifact)}}
-            )
+            parts.append({"type": "image_url", "image_url": {"url": await self.data_url(artifact)}})
         return {"role": "user", "content": parts}
 
-    async def _data_url(self, artifact: orm.Artifact) -> str:
+    async def data_url(self, artifact: orm.Artifact) -> str:
+        """The artifact as a downscaled data: URL for a vision LLM (cached)."""
         key = (artifact.id, self._config.image_max_side)
         cached = self._image_cache.get(key)
         if cached is not None:

@@ -37,8 +37,8 @@ backends:
     launch: {}  # diffusion_model, vae, llm, llm_vision: paths to the model files
     declared_capabilities: [t2i, edit, multi_ref, rgba]
     defaults:
-      width: 1024
-      height: 1024
+      width: 2048
+      height: 2048
       steps: 20
       cfg_scale: 6.0
       sampler: euler
@@ -47,6 +47,12 @@ routing:
   chat: llama
   t2i: sdcpp
   edit: sdcpp
+
+# Hugging Face: the Engines screen finds models on the Hub and downloads them here, or uses
+# copies already in the Hugging Face cache (docs/huggingface.md). Gated repos need HF_TOKEN
+# in the environment, or `hf auth login`.
+# hub:
+#   models_dir: D:/models   # default: <data_root>/models
 
 # Linking with other instances. Off, this instance needs nothing from the network. On, it
 # must be reachable (server.host: 0.0.0.0) and have a token (IMAGINER_SERVER__AUTH_TOKEN).

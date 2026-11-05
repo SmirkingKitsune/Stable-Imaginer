@@ -11,7 +11,8 @@
 import { api, readEvents } from './api.js';
 import { announce } from './chrome.js';
 import { titleFrom } from './format.js';
-import { place } from './origin.js';
+import { renameMentions } from './mentions.js';
+import { baseOf, place } from './origin.js';
 
 // --- topics ---------------------------------------------------------------------
 
@@ -79,6 +80,26 @@ export async function loadBackends() {
 
 export const defaultBackend = (task) => state.backends.find((b) => b.default_for.includes(task));
 export const imageBackends = () => state.backends.filter((b) => b.kind === 'image' && b.enabled);
+
+/**
+ * What the turns this page follows have the shown backends doing, by name: an image job
+ * running ('generating', with its progress 0..1) or waiting ('queued'), and otherwise the
+ * chat model ('writing': answering, calling a tool or checking an image).
+ */
+export function backendWork() {
+  const work = new Map();
+  for (const c of state.convs.values()) {
+    if (!c.turn?.running || baseOf(c.id) !== backendsBase) continue;
+    const live = [...c.jobs.values()].filter((j) => j.status === 'running' || j.status === 'queued');
+    for (const j of live) {
+      if (work.get(j.backend)?.word === 'generating') continue;
+      work.set(j.backend, j.status === 'queued' ? { word: 'queued' } : { word: 'generating', progress: jobProgress(j) });
+    }
+    const chat = defaultBackend('chat')?.name;
+    if (!live.length && chat) work.set(chat, { word: 'writing' });
+  }
+  return work;
+}
 
 // --- connection (design 4a/4b) ----------------------------------------------------
 // One recovery loop for the whole page. A dropped turn stream or a failed engine poll
@@ -434,8 +455,13 @@ export function progressOf(id) {
   if (!c?.turn?.running) return null;
   const live = [...c.jobs.values()].filter((j) => j.status === 'running' || j.status === 'queued');
   const job = live[live.length - 1];
-  const p = job?.progress;
-  if (!p?.total_steps) return job ? 0 : null;
+  return job ? jobProgress(job) ?? 0 : null;
+}
+
+/** A job's progress over all its images as 0..1, or null before it reports steps. */
+function jobProgress(job) {
+  const p = job.progress;
+  if (!p?.total_steps) return null;
   return Math.min(1, ((p.image ?? 1) - 1 + p.step / p.total_steps) / (p.images ?? 1));
 }
 
@@ -445,19 +471,25 @@ export function progressOf(id) {
  * accepted the turn; the turn then streams in the background. A brand-new conversation
  * whose first message is refused is deleted again, so a failed send leaves nothing behind.
  * The message continues the branch shown, or with editOf replaces that message on a new one.
+ * mode and qa (the prompt mode and the quality check) are sent as given; null leaves them
+ * to the server's defaults.
  */
-export async function send(cid, { text, attachments, options, editOf = null }) {
+export async function send(cid, { text, attachments, options, mode = null, qa = null, editOf = null }) {
   const fresh = !cid;
   const c = fresh ? adopt(await api.createConversation(titleFrom(text))) : await ensureLoaded(cid);
   try {
     const ids = [];
+    const labelled = new Map(); // an upload's "@name" in the text -> the label it got
     for (const att of attachments) {
       const artifact = att.artifact ?? (await api.upload(c.id, att.file));
       c.artifacts.set(artifact.id, artifact);
       ids.push(artifact.id);
+      if (att.ref && att.ref !== artifact.label) labelled.set(att.ref, artifact.label);
     }
-    const body = { content: text, attachments: ids };
+    const body = { content: renameMentions(text, labelled), attachments: ids };
     if (options && Object.keys(options).length) body.image_options = options;
+    if (mode && mode !== 'chat') body.mode = mode;
+    if (qa != null) body.qa = qa;
     if (editOf) body.edit_of = editOf;
     else if (leafOf(c)) body.parent_id = leafOf(c).id;
     await start(c, (signal) => api.postMessage(c.id, body, signal));
@@ -677,11 +709,13 @@ export function clearDraft(key) {
 const OPTIONS_KEY = 'imaginer.imageOptions';
 
 /** {aspect_ratio, n, seedFixed, seed, backend, sizeExact, width, height, steps, cfg_scale,
- * negative, transparent}; null fields mean "let the model (or the backend) decide". */
+ * negative, transparent, mode, qa}; null fields mean "let the model (or the backend) decide".
+ * mode is the prompt mode (chat, raw, interpret, curate) and qa the quality check. */
 export const options = (() => {
   const base = {
     aspect_ratio: null, n: null, seedFixed: false, seed: 41207, backend: null,
     sizeExact: false, width: 1184, height: 888, steps: null, cfg_scale: null, negative: '', transparent: false,
+    mode: 'chat', qa: true,
   };
   try {
     return { ...base, ...JSON.parse(localStorage.getItem(OPTIONS_KEY) || '{}') };

@@ -103,4 +103,5 @@ describes whether an update needs a download or compilation.
 Cancellation is polled while commands are silent as well as during output. Downloads and
 in-process actions check cancellation at progress boundaries; a blocked network read can
 take up to its timeout. Compilation subprocess trees are terminated on cancellation.
-Progress fractions refer to the current CMake step, not a predicted overall duration.
+Progress fractions refer to the current CMake step or download, not a predicted overall
+duration. Downloads report a percentage when the server sends the file's size.

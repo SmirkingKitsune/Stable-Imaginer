@@ -2,6 +2,7 @@
 
 import io
 import json
+import shutil
 import sys
 import tarfile
 import time
@@ -12,6 +13,9 @@ import pytest
 
 from imaginer.cli import main
 from imaginer.provisioning import llamacpp as lp
+
+# Taken before conftest's autouse fixture swaps it for a fixed version.
+REAL_DRIVER_PROBE = lp.detect_driver_cuda_version
 
 
 def config(root: Path, **kwargs) -> lp.ProvisionConfig:
@@ -41,6 +45,60 @@ def test_release_installs_libraries_and_records_state(tmp_path, monkeypatch):
     assert state["version"] == "b42"
     assert state["ladder"][0]["ok"]
     assert lp.LlamaProvisioner(cfg).ensure_runtime() == binary
+
+
+def test_download_reports_a_percentage_the_progress_bar_reads(tmp_path, monkeypatch):
+    payload = b"x" * (20 * 1024**2)
+
+    response = io.BytesIO(payload)
+    response.headers = {"Content-Length": str(len(payload))}  # type: ignore[attr-defined]
+    monkeypatch.setattr(lp, "urlopen", lambda request, timeout: response)
+    lines: list[str] = []
+    lp._download("https://example.invalid/a.zip", tmp_path / "a.zip", lambda t, e: lines.append(t))
+    assert (tmp_path / "a.zip").read_bytes() == payload
+    assert lines == ["[ 40%] Downloaded 8 of 20 MiB", "[ 80%] Downloaded 16 of 20 MiB"]
+    assert lp.parse_progress_fraction(lines[0]) == 0.4
+    assert lp._download_line(8 * 1024**2, 0) == "Downloaded 8 MiB"  # no Content-Length
+
+
+def test_swap_moves_aside_a_previous_runtime_it_cannot_delete(tmp_path, monkeypatch):
+    # On Windows a server still running from bin.previous keeps its files undeletable.
+    for name, content in [("bin.previous", b"oldest"), ("bin", b"old"), ("bin.next", b"new")]:
+        (tmp_path / name).mkdir()
+        (tmp_path / name / "llama-server.exe").write_bytes(content)
+    real_rmtree = shutil.rmtree
+
+    def held(path, *args, **kwargs):
+        if Path(path).name != "bin.previous":
+            real_rmtree(path, *args, **kwargs)
+
+    monkeypatch.setattr(shutil, "rmtree", held)
+    lp._swap_staged_bin(tmp_path / "bin", tmp_path / "bin.next")
+    assert (tmp_path / "bin/llama-server.exe").read_bytes() == b"new"
+    assert (tmp_path / "bin.previous/llama-server.exe").read_bytes() == b"old"
+    [stale] = tmp_path.glob("bin.previous.stale-*")
+    assert (stale / "llama-server.exe").read_bytes() == b"oldest"
+
+    # Once released, the copy moved aside goes with the next install.
+    monkeypatch.setattr(shutil, "rmtree", real_rmtree)
+    (tmp_path / "bin.next").mkdir()
+    (tmp_path / "bin.next/llama-server.exe").write_bytes(b"newer")
+    lp._swap_staged_bin(tmp_path / "bin", tmp_path / "bin.next")
+    assert (tmp_path / "bin/llama-server.exe").read_bytes() == b"newer"
+    assert not list(tmp_path.glob("bin.previous.stale-*"))
+
+
+@pytest.mark.parametrize(
+    "header,version",
+    [
+        ("NVIDIA-SMI 617.42   KMD Version: 617.42   CUDA UMD Version: 13.4", (13, 4)),
+        ("NVIDIA-SMI 572.16   Driver Version: 572.16   CUDA Version: 12.8", (12, 8)),
+        ("NVIDIA-SMI has failed because it couldn't communicate with the driver", None),
+    ],
+)
+def test_driver_cuda_version_reads_old_and_new_nvidia_smi_headers(monkeypatch, header, version):
+    monkeypatch.setattr(lp, "_run_text", lambda argv: header)
+    assert REAL_DRIVER_PROBE() == version
 
 
 def test_failed_validation_preserves_previous_runtime(tmp_path, monkeypatch):

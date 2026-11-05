@@ -11,6 +11,7 @@ from imaginer.core.config import (
     BackendConfig,
     DiffusersBackendConfig,
     OrchestrationConfig,
+    QAConfig,
     RoutingConfig,
 )
 from imaginer.main import create_app
@@ -34,7 +35,7 @@ async def test_generate_then_edit_on_diffusers(
     settings = make_settings(
         backends={"llama": llama_config(fake_llama.url), "diff": diffusers_config()},
         routing=RoutingConfig(chat="llama", t2i="diff", edit="diff"),
-        orchestration=OrchestrationConfig(probe_ttl_s=0),
+        orchestration=OrchestrationConfig(probe_ttl_s=0, qa=QAConfig(enabled=False)),
     )
     fake_llama.queue(
         FakeLlama.tool_call("generate_image", {"prompt": "a red barn", "transparent": True}),

@@ -29,6 +29,7 @@ from imaginer.backends.registry import BackendRegistry
 from imaginer.core.config import (
     BackendConfig,
     ConfigError,
+    DiffusersBackendConfig,
     LinkedBackendConfig,
     Settings,
     local_overrides_path,
@@ -108,6 +109,7 @@ class EngineService:
             files=[dto.EngineFile(**vars_of(c)) for c in launch.check_files(config)]
             if launch.file_specs(config)
             else [],
+            model_id=config.model_id if isinstance(config, DiffusersBackendConfig) else None,
             extra_args=list(launch_cfg.extra_args) if launch_cfg is not None else [],
             autostart=bool(launch_cfg and launch_cfg.autostart),
             executable=str(exe) if exe is not None else None,
@@ -285,6 +287,10 @@ class EngineService:
             if body.launch.executable is not None:
                 block["executable"] = body.launch.executable.strip() or None
             patch["launch"] = block
+        if body.model_id is not None:
+            if not isinstance(config, DiffusersBackendConfig):
+                raise InvalidRequestError(f"{name} is not a Diffusers backend; it has no model_id")
+            patch["model_id"] = body.model_id.strip()
         if not patch:
             return
 

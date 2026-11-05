@@ -27,6 +27,9 @@ class ToolContext:
     tool_call_id: str
     emit: Emit
     image_options: ImageRequestOptions | None = None  # the user's picks for this turn
+    # Sampler settings (steps, cfg_scale) the quality check chose for a new attempt.
+    # It never picks one the user set, so the two don't overlap.
+    sampler: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass(kw_only=True)

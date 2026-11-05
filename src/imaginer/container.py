@@ -11,6 +11,7 @@ from imaginer.db import migrate
 from imaginer.db.engine import Database
 from imaginer.domain.enums import BackendKind
 from imaginer.engines.service import EngineService
+from imaginer.hub.service import HubService
 from imaginer.links.admin import LinkAdmin
 from imaginer.links.gallery import Gallery
 from imaginer.links.serve import PeerEngines
@@ -19,6 +20,7 @@ from imaginer.orchestration.context_builder import ContextBuilder
 from imaginer.orchestration.event_bus import TurnManager
 from imaginer.orchestration.gates import EngineGates
 from imaginer.orchestration.jobs import JobManager
+from imaginer.orchestration.qa import QualityChecker
 from imaginer.orchestration.turn_runner import TurnRunner
 from imaginer.services.artifacts import ArtifactService
 from imaginer.services.conversations import ConversationService
@@ -44,6 +46,7 @@ class Container:
     jobs: JobManager
     turn_runner: TurnRunner
     engines: EngineService
+    hub: HubService
     gates: EngineGates
     links: LinkService
     peers: PeerEngines
@@ -83,17 +86,19 @@ class Container:
             [GenerateImageTool(registry, jobs), EditImageTool(registry, jobs, artifacts)]
         )
         turns = TurnManager()
+        context = ContextBuilder(
+            db,
+            store,
+            settings.context,
+            feed_outputs_to_vision=settings.orchestration.feed_outputs_to_vision,
+        )
         turn_runner = TurnRunner(
             db=db,
             registry=registry,
             turns=turns,
-            context=ContextBuilder(
-                db,
-                store,
-                settings.context,
-                feed_outputs_to_vision=settings.orchestration.feed_outputs_to_vision,
-            ),
+            context=context,
             tools=tools,
+            qa=QualityChecker(db, context, jobs),
             config=settings.orchestration,
         )
 
@@ -115,6 +120,7 @@ class Container:
             jobs=jobs,
             turn_runner=turn_runner,
             engines=engines,
+            hub=HubService(settings, engines),
             gates=gates,
             links=links,
             peers=PeerEngines(settings, registry, engines, gates),
@@ -145,6 +151,7 @@ class Container:
         for task in self._tasks:
             with contextlib.suppress(asyncio.CancelledError):
                 await task
+        await self.hub.aclose()  # before engines: a finished download may update one
         await self.engines.aclose()
         await self.registry.aclose()
         await self.links.aclose()

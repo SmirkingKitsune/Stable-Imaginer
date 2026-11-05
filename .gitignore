@@ -30,8 +30,10 @@ htmlcov/
 .claude/
 .codex/
 .cursor/
+.gemini/
 .aider*
 AGENTS.md
+AGENTS.override.md
 AGENTS.local.md
 CLAUDE.md
 CLAUDE.local.md

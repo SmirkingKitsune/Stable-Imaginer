@@ -3,7 +3,7 @@ from typing import Any
 import pytest
 
 from imaginer.backends.base import ChatRequest
-from imaginer.backends.llamacpp import LlamaCppBackend
+from imaginer.backends.llamacpp import LlamaCppBackend, _model_name
 from imaginer.backends.openai_http.transport import HttpTransport
 from imaginer.domain.enums import BackendStatus, Capability
 from imaginer.domain.errors import EngineError, EngineUnavailableError
@@ -41,6 +41,13 @@ async def test_health_probes_capabilities_and_model(fake_llama: FakeLlama) -> No
     assert backend.capabilities() == ALL
     assert backend.model == "Qwen3VL-8B-Instruct-Q4_K_M.gguf"
     await backend.aclose()
+
+
+def test_model_name_is_the_file_name_when_the_alias_is_a_path() -> None:
+    path = r"C:\Users\me\.cache\huggingface\hub\models--x--Qwen3-8B-GGUF\Qwen3-8B-UD-Q4_K_XL.gguf"
+    assert _model_name({"model_alias": path, "model_path": path}) == "Qwen3-8B-UD-Q4_K_XL.gguf"
+    assert _model_name({"model_alias": "qwen3", "model_path": path}) == "qwen3"
+    assert _model_name({"model_path": "/models/a.gguf"}) == "a.gguf"
 
 
 async def test_configured_model_name_wins(fake_llama: FakeLlama) -> None:

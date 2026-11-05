@@ -134,11 +134,10 @@ def _capabilities_from_props(props: dict[str, Any]) -> set[Capability]:
 
 
 def _model_name(props: dict[str, Any]) -> str | None:
-    alias = props.get("model_alias")
-    if isinstance(alias, str) and alias:
-        return alias
-    path = props.get("model_path")
-    if isinstance(path, str) and path:
-        # Paths may come from either OS; take the last component either way.
-        return PurePath(path.replace("\\", "/")).name
+    # Without --alias, llama-server reports the model's path as its alias too.
+    for key in ("model_alias", "model_path"):
+        value = props.get(key)
+        if isinstance(value, str) and value:
+            # Paths may come from either OS; take the last component either way.
+            return PurePath(value.replace("\\", "/")).name
     return None

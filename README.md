@@ -51,10 +51,12 @@ The `dev` profile expects the fake engines, which need no GPU. Start them in a s
 uv run python -m tests.fakes
 ```
 
-The fake chat model echoes your message back, with two exceptions:
+The fake chat model echoes your message back, with these exceptions:
 
 - `draw ...` calls `generate_image`. The fake sd-server paints a solid colour derived from the seed.
 - `edit img-1: ...` calls `edit_image` on that image.
+- Its quality check passes every image, unless the request says "flawed": `draw a flawed cat`
+  is redone until the attempts run out.
 
 Without uv: `python -m venv .venv`, activate it, then `pip install -e . --group dev`
 (needs pip 25.1 or newer).
@@ -83,6 +85,8 @@ for nesting, for example `IMAGINER_SERVER__PORT=9000` or `IMAGINER_DATA_ROOT=D:/
   The server binds to `127.0.0.1` by default and warns if you bind it more widely without a token.
   Linking with other instances over the network requires it.
 - Engine API keys: each backend's `api_key_env` names the env var that holds its key.
+- Hugging Face token, for gated repos: `HF_TOKEN`, or log in once with `hf auth login`. The
+  server reads it the way the `hf` CLI does (see [docs/huggingface.md](docs/huggingface.md)).
 
 Sampler defaults (steps, CFG, sampler, sigmas, size) are **per backend**, because engines
 disagree. For Qwen-Image-2.1, the sd.cpp docs use CFG 6.0 with euler, while Diffusers samples
@@ -90,8 +94,10 @@ without guidance (CFG 1.0) at 40 steps.
 
 More image settings:
 
-- **Sizes** are rounded to `size_multiple` (default 32, which Qwen-Image-2.1 requires).
-  An `aspect_ratio` keeps the default image's pixel area.
+- **Sizes** default to 2048x2048, Qwen-Image-2.1's native 2K. They are rounded to
+  `size_multiple` (default 32, which Qwen-Image-2.1 requires). An `aspect_ratio` keeps the
+  default image's pixel area. A 2K image is about four times the work of a 1K one; if
+  sd-server runs out of VRAM decoding it, add `--vae-tiling` to `launch.extra_args`.
 - **Sigmas:** `defaults.sigmas` accepts a list of numbers or the preset
   `qwen-image-2.1-turbo`, for the Turbo checkpoint: 8 steps, CFG 1.0.
 - **Progress:** an sdcpp backend's `preview` (default `proj`) is how sd-server reports step
@@ -276,7 +282,7 @@ a leaf. Clients that ignore branches keep working: without `parent_id`, a messag
   | field | meaning |
   |---|---|
   | `leaf_id` | the branch's newest message |
-  | `name`, `kind` | `main`; `message 2, edited` (`edit`); `retry of img-3` (`retry`) |
+  | `name`, `kind` | `main`; `message 2, edited` (`edit`); `retry of img-3` or `QA redo of img-3` (`retry`) |
   | `fork_id`, `parent_leaf_id` | where it leaves its parent branch, and that branch's leaf |
   | `origin` | `from your first message`, `from assistant reply 1` |
   | `depth` | 0 for main, 1 for a branch of main, ... |
@@ -332,6 +338,41 @@ two tools. Both also take `negative_prompt`, `aspect_ratio`, `width`, `height`, 
   and the user message stores them as `metadata.image_options`. An unknown or non-image
   `backend` is refused with 422 before the turn starts.
 
+### Prompt modes and the quality check
+
+A message's `mode` says how its text reaches the image model:
+
+| `mode` | what happens |
+|---|---|
+| `chat` (default) | The chat model replies, and calls the image tools when it decides to, writing its own prompt |
+| `raw` | No chat model. The text is the image prompt, word for word: a new image, or an edit of the attached images (in order; a painted mask still goes in `image_options.mask`). The turn stores an assistant message that makes the call, so later turns see an ordinary tool call, and ends without a reply. Works with no chat backend at all |
+| `interpret` | The chat model must call an image tool first (`tool_choice: required`), with a prompt that says what you asked for and adds nothing you didn't |
+| `curate` | The chat model enriches the prompt (subject, setting, composition, lighting, style, mood), or asks up to three questions first when the request is too vague or contradicts itself |
+
+`interpret` and `curate` need a chat backend with tool calling and an image backend; `raw`
+needs an image backend and some text. The user message stores a mode other than `chat` as
+`metadata.mode`, and a retry runs in the mode of the message it came from.
+
+The **quality check** (`qa`, default `orchestration.qa.enabled: true`) has a vision chat
+model look at every image an image tool makes, with the request, the prompt and the settings
+used. It answers in JSON (`response_format`) with `pass`, or `redo` and what to change:
+
+- **Changes:** more steps for noise or unfinished detail, a higher or lower `cfg_scale` for
+  washed-out or burnt results, a revised prompt for wrong or missing content, or a new seed.
+  Without a new seed the attempt keeps its seed, so more steps refine the same image.
+- **Your settings win:** the check never changes a setting you set in `image_options`, and in
+  `raw` mode it never changes the prompt.
+- **Attempts:** a redo runs the call again as a new attempt beside the rejected one, like
+  Retry, at most `orchestration.qa.max_retries` (default 2) times. After that the last
+  attempt is kept and flagged with its issues.
+- **Results:** each attempt records the check in `metadata.qa` and in its content, which the
+  assistant reads: `status` (`passed`, `redone`, `flagged` or `skipped`), `attempt`, `issues`,
+  `changes`, and for later attempts the `earlier` attempts' issues. A redone attempt's
+  successor has `metadata.redo_of`.
+- **Skipped, never failed:** without a chat backend that can see images (in `raw` mode it is
+  borrowed only if one is ready), or when the check fails or answers something unreadable,
+  the image is kept with `status: skipped` and a `detail`.
+
 ## Web UI
 
 The server also serves a browser UI at `/`. It is plain HTML, CSS and ES modules in
@@ -343,10 +384,12 @@ It follows the "Imaginer Main Interface" design, which is built on the Industry 
   more as you scroll. Hover a tile for its label, title and age. A running turn shows its
   progress on the tile. Past the last tile, the prompt bar rises into the open space.
 - **Prompt bar:** text, attachments (pick, paste or drop images) and quick-option chips. The
-  chips open a tray for aspect ratio, image count, seed and image backend, and a second row for
+  chips open a tray with the prompt mode (Chat, Raw, Interpret, Curate) and the quality check
+  (on by default), then aspect ratio, image count, seed and image backend, and a row for
   exact size, steps, CFG, a negative prompt and transparency, each showing the backend's own
-  default. These are sent as `image_options`, "auto" leaves the choice to the model, and they
-  persist in the browser. Only settings that differ from the default get a chip.
+  default. These are sent as `mode`, `qa` and `image_options`, "auto" leaves the choice to
+  the model, and they persist in the browser. Beyond mode, QA and the basics, only settings
+  that differ from the default get a chip.
 - **Search:** the server searches every conversation (archived ones too, if asked), page by page,
   with a bar tracking progress. Results show where they matched, highlighted. Esc clears, Enter
   opens the first result.
@@ -362,7 +405,9 @@ It follows the "Imaginer Main Interface" design, which is built on the Industry 
 - **Conversation:** streaming replies and collapsible reasoning. Each tool call shows as a row
   with its job state. A running job shows step progress, engine settings and a Cancel button.
   Outputs show their seed and size, plus Edit and Reference actions that put the image into the
-  bar, and Retry. Edits list their lineage.
+  bar, and Retry. Edits list their lineage. Under the row, the quality check shows as checking,
+  passed, redone (with its issues and changes), flagged or skipped; redone attempts stay
+  reachable with the attempt switcher.
 - **Branches:** Retry on an image runs its call again as a new attempt, and Edit & branch on any
   of your messages sends a new version of it. Both start a branch and nothing is deleted.
   "‹ 1 / 2 ›" switchers sit at each fork (on an edited message, and "attempt ‹ 1 / 2 ›" on a
@@ -371,7 +416,8 @@ It follows the "Imaginer Main Interface" design, which is built on the Industry 
   continues the branch shown.
 - **Engines:** the status line in any header opens the default engines, with Start and Log for
   local ones. Engine settings (`#/engines`) shows each backend's runtime, model files, endpoint,
-  capabilities and startup log, and installs runtimes. See [Engines screen](#engines-screen).
+  capabilities and startup log, installs runtimes, and finds and downloads models from Hugging
+  Face. See [Engines screen](#engines-screen).
 - **Connection:** when the server can't be reached, a strip under the header counts down
   retries (1, 2, 4, 8, 16 s), running jobs dim to their last known step, and drafts are kept.
   Once back, running turns pick up from their last event.
@@ -457,6 +503,20 @@ token.
 - **Starting during an install:** an engine can't start while its runtime is being installed,
   and the runtime can't be installed while an engine using it runs.
 - **Shutdown:** stopping the server cancels a running install and waits for it to clean up.
+
+**Models from Hugging Face:** press **Hugging Face** on an engine's model files to search the
+Hub, or paste a Hub URL or llama.cpp's `owner/name:QUANT` into any path field. The server
+reads the repo's layout and shows which file can fill each setting, with a suggestion. It
+knows GGUF quants and their shards and projectors, Diffusers pipelines, ComfyUI repackages
+and transformers checkpoints. It uses a copy already in the models folder or the Hugging
+Face cache in place. Otherwise it downloads the file in the background, resumable and
+checked against the Hub's SHA-256, and sets the setting when the download is done. A
+Diffusers backend's `model_id` can be picked or downloaded the same way. See
+[docs/huggingface.md](docs/huggingface.md).
+
+Model files are checked against what each engine loads: llama-server takes GGUF only, from a
+split GGUF's first shard. sd-server also takes sharded safetensors through their
+`*.safetensors.index.json`, and points out a lone shard that would load only part of a model.
 
 ### llama-server (chat)
 
@@ -558,6 +618,18 @@ The model is Qwen-Image-2.1 with three parts. Put them in one folder:
 - **Text encoder:** `Qwen3VL-8B-Instruct-Q4_K_M.gguf` plus `mmproj-Qwen3VL-8B-Instruct-F16.gguf`.
   These are the same files as the chat model. The mmproj is required for editing.
 
+sd-server can also read the Diffusers repo,
+[Qwen/Qwen-Image-2.1](https://huggingface.co/Qwen/Qwen-Image-2.1), at full precision. Its
+loader takes safetensors indexes (stable-diffusion.cpp #1769, July 2026) and converts this
+model's Diffusers tensor names:
+
+- `--diffusion-model transformer/diffusion_pytorch_model.safetensors.index.json`
+- `--vae vae/diffusion_pytorch_model.safetensors`
+- `--llm text_encoder/model.safetensors.index.json`
+
+Point at the index files, not a single shard. The Engines screen's **Hugging Face** dialog
+offers all three.
+
 Get [stable-diffusion.cpp](https://github.com/leejet/stable-diffusion.cpp/releases), tested with
 `master-1024-77b72a2`:
 
@@ -614,7 +686,7 @@ uv sync --extra diffusers
   loading. Health probes alone do not retry a failed load.
 - **Loading:** the model loads on first use, or at startup with `preload: true`. Requests made
   during the load wait for it.
-- **Its defaults** (`steps: 40`, `cfg_scale: 1.0`, 2048x2048) differ from sd.cpp's on purpose.
+- **Its defaults** (`steps: 40`, `cfg_scale: 1.0`) differ from sd.cpp's on purpose.
   Diffusers samples Qwen-Image-2.1 without guidance. `sampler`, `scheduler` and `flow_shift` don't
   apply and are ignored.
 - **Seeds** use a CPU generator to improve reproducibility. Identical images across GPUs,
