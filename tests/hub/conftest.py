@@ -35,6 +35,8 @@ LLM_REPO = "acme/Chat-8B-GGUF"
 IMAGE_REPO = "acme/Image-2-GGUF"
 PIPELINE_REPO = "acme/Image-2"
 GATED_REPO = "acme/Gated-GGUF"
+LORA_REPO = "acme/Image-2-Lightning"
+LORA_FILE = "Image-2-Lightning-8steps.safetensors"  # a LoRA, though not named one
 MODEL_INDEX = {
     "_class_name": "QwenImage21Pipeline",
     "_diffusers_version": "0.42.1",
@@ -87,6 +89,11 @@ def hub() -> FakeHub:
                 tags=["diffusers", "safetensors"],
             ),
             GATED_REPO: FakeRepo({"g-Q4_K_M.gguf": gguf(900, 8)}, tags=["gguf"], gated=True),
+            LORA_REPO: FakeRepo(
+                {"README.md": b"# lightning", LORA_FILE: weights(600, 9)},
+                pipeline_tag="text-to-image",
+                tags=["lora", "base_model:adapter:acme/Image-2"],
+            ),
         }
     )
 

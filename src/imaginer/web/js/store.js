@@ -4,6 +4,7 @@
 //   'gallery'   the conversation list, from this server and every linked instance
 //   'turns'     any turn's running state or job progress (gallery tiles)
 //   `conv:<id>` anything in one conversation
+//   'loras'     the LoRA library (display names, weights, words, compatibility, pins)
 //
 // A conversation's messages form a tree (parent_id): edits and retried tool calls are
 // siblings. Each conversation shows one path through it, see pathOf().
@@ -11,7 +12,7 @@
 import { api, readEvents } from './api.js';
 import { announce } from './chrome.js';
 import { titleFrom } from './format.js';
-import { renameMentions } from './mentions.js';
+import { loraNamesIn, renameMentions } from './mentions.js';
 import { baseOf, place } from './origin.js';
 
 // --- topics ---------------------------------------------------------------------
@@ -65,9 +66,14 @@ export function backendsFrom(base) {
   loadBackends();
 }
 
+let lorasSig = null; // the LoRAs the backends list: a change reloads the library
+
 export async function loadBackends() {
   try {
     state.backends = await api.backends(backendsBase);
+    const sig = JSON.stringify(state.backends.map((b) => [b.name, b.model, b.available_loras]));
+    if (lorasSig !== null && sig !== lorasSig && !backendsBase) loadLoras();
+    lorasSig = sig;
     // The regular poll can find the server again after the retries ran out.
     if (state.conn.status === 'offline' && !looping) restored();
   } catch (err) {
@@ -79,6 +85,48 @@ export async function loadBackends() {
 }
 
 export const defaultBackend = (task) => state.backends.find((b) => b.default_for.includes(task));
+
+// --- the LoRA library -------------------------------------------------------------
+
+let library = null; // GET /v1/loras
+let libraryIndex = new Map(); // `${engine}\n${path}` -> {item, use}
+let libraryLoad = null;
+
+/** Load (or reload) the library. Resolves with it; a failure keeps the last one. */
+export function loadLoras() {
+  libraryLoad ??= api.loras().then((lib) => {
+    library = lib;
+    libraryIndex = new Map();
+    for (const item of lib.items) for (const use of item.engines) libraryIndex.set(`${use.engine}\n${use.path}`, { item, use });
+    emit('loras');
+    return lib;
+  }, () => library).finally(() => { libraryLoad = null; });
+  return libraryLoad;
+}
+
+export const loraLibrary = () => library;
+
+/** What the library knows of a LoRA engine lists as path: {item, use}, or null (the
+ * library isn't loaded, or the engine lives on a linked instance whose LoRAs these are). */
+export function libraryLora(engine, path) {
+  if (backendsBase) return null;
+  return libraryIndex.get(`${engine}\n${path}`) ?? null;
+}
+
+// Where the user was working (a conversation, or the gallery) before opening a settings
+// screen: "Use in next prompt" in the library goes back there.
+let workPlace = '#/';
+export function notePlace(hash) { workPlace = hash || '#/'; }
+export const lastPlace = () => workPlace;
+
+// LoRAs to put in the next prompt bar that opens ("Use in next prompt" in the library).
+let queued = [];
+export function queueLoras(loras) { queued = loras.slice(); }
+export function takeQueuedLoras() {
+  const out = queued;
+  queued = [];
+  return out;
+}
 export const imageBackends = () => state.backends.filter((b) => b.kind === 'image' && b.enabled);
 
 /**
@@ -476,7 +524,7 @@ function jobProgress(job) {
  */
 export async function send(cid, { text, attachments, options, mode = null, qa = null, editOf = null }) {
   const fresh = !cid;
-  const c = fresh ? adopt(await api.createConversation(titleFrom(text))) : await ensureLoaded(cid);
+  const c = fresh ? adopt(await api.createConversation(titleFrom(loraNamesIn(text)))) : await ensureLoaded(cid);
   try {
     const ids = [];
     const labelled = new Map(); // an upload's "@name" in the text -> the label it got
@@ -709,13 +757,15 @@ export function clearDraft(key) {
 const OPTIONS_KEY = 'imaginer.imageOptions';
 
 /** {aspect_ratio, n, seedFixed, seed, backend, sizeExact, width, height, steps, cfg_scale,
- * negative, transparent, mode, qa}; null fields mean "let the model (or the backend) decide".
+ * negative, transparent, preset, loras, mode, qa}; null fields mean "let the model (or the
+ * backend) decide". preset names one of the image backend's presets (its LoRAs and sampler
+ * settings); loras ([{path, weight}], paths as the backend lists them) go on top of it;
  * mode is the prompt mode (chat, raw, interpret, curate) and qa the quality check. */
 export const options = (() => {
   const base = {
     aspect_ratio: null, n: null, seedFixed: false, seed: 41207, backend: null,
     sizeExact: false, width: 1184, height: 888, steps: null, cfg_scale: null, negative: '', transparent: false,
-    mode: 'chat', qa: true,
+    preset: null, loras: [], mode: 'chat', qa: true,
   };
   try {
     return { ...base, ...JSON.parse(localStorage.getItem(OPTIONS_KEY) || '{}') };
@@ -748,6 +798,10 @@ export function requestOptions() {
   if (options.cfg_scale != null) out.cfg_scale = options.cfg_scale;
   if (options.negative.trim()) out.negative_prompt = options.negative.trim();
   if (options.transparent && imageEngine()?.capabilities.includes('rgba')) out.transparent = true;
+  const preset = imagePreset();
+  if (preset) out.preset = preset.name;
+  const loras = imageLoras();
+  if (loras.length) out.loras = loras.map(({ path, weight }) => ({ path, weight }));
   const backend = options.backend && imageBackends().find((b) => b.name === options.backend);
   if (backend && !backend.default_for.includes('t2i')) out.backend = backend.name;
   return out;
@@ -756,3 +810,14 @@ export function requestOptions() {
 /** The image backend the next message will use. */
 export const imageEngine = () =>
   (options.backend && imageBackends().find((b) => b.name === options.backend)) || defaultBackend('t2i') || null;
+
+/** The picked preset, if the image backend the next message will use has it. */
+export const imagePreset = () =>
+  (options.preset && imageEngine()?.image_presets?.find((p) => p.name === options.preset)) || null;
+
+/** The picked LoRAs the image backend the next message will use lists (others wait, picked,
+ * for a backend that has them). */
+export function imageLoras() {
+  const listed = new Set(imageEngine()?.available_loras ?? []);
+  return (Array.isArray(options.loras) ? options.loras : []).filter((l) => listed.has(l.path));
+}

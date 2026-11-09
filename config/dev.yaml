@@ -18,7 +18,7 @@ backends:
   sdcpp:
     type: sdcpp
     base_url: http://127.0.0.1:11234
-    declared_capabilities: [t2i, edit, multi_ref, rgba]
+    declared_capabilities: [t2i, edit, multi_ref, rgba, lora]
     poll_interval_s: 0.1
     defaults:
       width: 2048
@@ -26,6 +26,12 @@ backends:
       steps: 4
       cfg_scale: 6.0
       sampler: euler
+    presets:  # the fake engines list draft-8-steps.safetensors as a LoRA
+      draft:
+        description: step-distill LoRA
+        loras: [{path: draft-8-steps}]
+        steps: 2
+        cfg_scale: 1.0
 
 routing:
   chat: llama

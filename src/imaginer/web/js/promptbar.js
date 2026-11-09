@@ -1,17 +1,22 @@
 // The prompt bar (design 1a "chip row"): text, attachments, and quick-option chips that
-// open a tray for the prompt mode, the quality check, aspect ratio, image count, seed and
-// image backend. The image options map to MessageCreate.image_options ("auto" leaves the
-// choice to the model); mode and qa go with the message itself. Typing "@" picks one of
-// the attached images and puts it in the text as a chip (see mentions.js).
+// open a tray for the prompt mode, the quality check, aspect ratio, image count, seed,
+// image backend, its presets and its LoRAs. The image options map to
+// MessageCreate.image_options ("auto" leaves the choice to the model); mode and qa go with
+// the message itself. Typing "@" picks one of the attached images, or one of the image
+// backend's LoRAs for this message only, and puts it in the text as a chip (see mentions.js).
 
 import { setImage } from './api.js';
+import { toast } from './chrome.js';
 import { append, corners, h, icon, clear } from './dom.js';
-import { ASPECTS } from './format.js';
-import { mentionEditor, uploadRef } from './mentions.js';
+import { ASPECTS, loraName, lorasWord } from './format.js';
+import { loraItems, loraText, mentionEditor, uploadRef } from './mentions.js';
 import {
-  clearDraft, connection, defaultBackend, draft, imageBackends, imageEngine, on, options, requestOptions,
-  setOption,
+  clearDraft, connection, defaultBackend, draft, imageBackends, imageEngine, imageLoras, imagePreset, libraryLora,
+  loadLoras, loraLibrary, on, options, requestOptions, setOption, takeQueuedLoras,
 } from './store.js';
+
+const MAX_LORAS = 8; // ImageRequestOptions.loras
+const LORA_FILTER_FROM = 12; // listed LoRAs before the cell gets a filter field
 
 const STATUS_WORD = { ok: 'ready', degraded: 'loading', down: 'down', unavailable: 'off', unknown: '…' };
 const SOURCE_WORD = { upload: 'upload', generated: 'generated', edited: 'edited', derived: 'derived' };
@@ -52,6 +57,7 @@ export function promptBar({
   // The draft keeps the text plain, each image reference (a chip in the editor) as "@label".
   const editor = mentionEditor({
     images: () => d.attachments.map((att) => ({ ref: refOf(att), source: sourceOf(att), fill: (img) => fillThumb(img, att) })),
+    loras: () => (compact ? [] : engineLoras(imageEngine())),
     className: 'pbar-text', label: 'Prompt',
     onInput: (text) => { d.text = text; renderActions(); },
     onKey: (e) => {
@@ -159,6 +165,8 @@ export function promptBar({
     const pinned = (...children) => h('button.chip.pinned', { type: 'button', onclick: () => toggleTray() }, children);
     const sampler = [options.steps && `${options.steps} steps`, options.cfg_scale != null && `cfg ${options.cfg_scale}`].filter(Boolean);
     const engine = imageEngine();
+    const preset = imagePreset();
+    const loras = imageLoras();
     append(chips, [
       chip(icon(mode().icon, 14), mode().label.toLowerCase()),
       chip(icon(options.qa ? 'check' : 'ban', 14), options.qa ? 'QA' : 'QA off'),
@@ -167,6 +175,8 @@ export function promptBar({
         : chip(shape(options.aspect_ratio), options.aspect_ratio ?? 'auto'),
       chip(icon('copies', 14), options.n ? `×${options.n}` : '×auto'),
       chip(icon('hash', 14), options.seedFixed ? `seed ${options.seed}` : 'seed random'),
+      preset && pinned(icon('layers', 14), preset.name),
+      loras.length > 0 && pinned(icon('puzzle', 14), h('span.chip-text', lorasWord(loras))),
       sampler.length > 0 && pinned(icon('steps', 14), sampler.join(' · ')),
       options.negative.trim() && pinned(icon('ban', 14), 'negative'),
       options.transparent && engine?.capabilities.includes('rgba') && pinned(h('span.shape.checker'), 'transparent'),
@@ -275,15 +285,27 @@ export function promptBar({
         ? `rounded to ${mult} · ${mp} MP`
         : `${aw}×${ah} · ${mp} MP · ${options.aspect_ratio ? 'default area' : `${engine?.name ?? 'backend'} default`}`));
 
+    // Presets: named LoRAs + sampler settings from the backend's config.
+    const presets = engine?.image_presets ?? [];
+    const preset = imagePreset();
+    const presetCell = presets.length > 0 && h('div.tray-cell.span-all', h('span.eyebrow', 'Preset'),
+      h('div.tray-seg.wrap',
+        pick(!preset, 'None', () => setOption({ preset: null })),
+        presets.map((p) => pick(preset?.name === p.name, p.name, () => setOption({ preset: p.name })))),
+      h('span.tray-hint', preset ? presetSummary(preset) : `${engine.name} defaults`));
+    const loraCell = engine?.available_loras?.length > 0 && lorasCell(engine, preset);
+
     const stepChoices = [...new Set([8, 20, 40, options.steps].filter(Boolean))].sort((a, b) => a - b);
     const stepsCell = h('div.tray-cell', h('span.eyebrow', 'Steps'),
       h('div.tray-opts',
         pick(!options.steps, 'auto', () => setOption({ steps: null }), 'count wide'),
         stepChoices.map((k) => pick(options.steps === k, String(k), () => setOption({ steps: k }), 'count'))),
-      h('span.tray-hint', defaults?.steps ? `${engine.name} default ${defaults.steps}` : 'engine default'));
+      h('span.tray-hint', preset?.steps ? `${preset.name} preset ${preset.steps}`
+        : defaults?.steps ? `${engine.name} default ${defaults.steps}` : 'engine default'));
 
-    const cfgDefaults = engines.filter((b) => b.image_defaults?.cfg_scale != null)
-      .map((b) => `${b.name} ${b.image_defaults.cfg_scale.toFixed(1)}`);
+    const cfgDefaults = preset?.cfg_scale != null ? [`${preset.name} preset ${preset.cfg_scale.toFixed(1)}`]
+      : engines.filter((b) => b.image_defaults?.cfg_scale != null)
+        .map((b) => `${b.name} ${b.image_defaults.cfg_scale.toFixed(1)}`);
     const cfgInput = numberInput({
       value: options.cfg_scale, placeholder: defaults?.cfg_scale != null ? defaults.cfg_scale.toFixed(1) : 'auto',
       label: 'CFG scale', step: 0.5, min: 0, max: 30,
@@ -366,9 +388,80 @@ export function promptBar({
               h('span.engine-meta', `${b.model ?? b.type} · ${STATUS_WORD[b.status] ?? b.status}`)));
           })
           : h('span.tray-hint', 'No image backend is configured.')),
+      ...(presetCell ? [presetCell] : []),
+      ...(loraCell ? [loraCell] : []),
       sizeCell, stepsCell, cfgCell,
       negCell, alphaCell,
     );
+  }
+
+  /** The backend's LoRAs (as it lists them) to add to this message's images, each with a
+   * weight. Picks for LoRAs this backend doesn't list are kept for one that does. */
+  function lorasCell(engine, preset) {
+    const listed = engine.available_loras;
+    const items = engineLoras(engine);
+    const byPath = new Map(items.map((i) => [i.path, i]));
+    const picks = imageLoras();
+    const picked = new Map(picks.map((l) => [l.path, l]));
+    const kept = (Array.isArray(options.loras) ? options.loras : []).filter((l) => !listed.includes(l.path));
+    const put = (next) => setOption({ loras: [...kept, ...next] });
+    const toggle = (path) => put(picked.has(path)
+      ? picks.filter((l) => l.path !== path)
+      : [...picks, { path, weight: byPath.get(path)?.weight ?? 1 }]);
+    const full = picks.length >= MAX_LORAS;
+    // A LoRA the user says doesn't work with this model isn't offered (one picked stays).
+    const choices = items.filter((i) => !i.hidden || picked.has(i.path)).map((i) => h('button.pick.lora-pick', {
+      type: 'button', class: picked.has(i.path) ? 'on' : '', 'aria-pressed': String(picked.has(i.path)),
+      title: [i.path, i.words.length && `adds ${i.words.join(', ')}`, i.why].filter(Boolean).join(' · '),
+      disabled: full && !picked.has(i.path), 'data-name': `${i.label} ${i.path}`.toLowerCase(),
+      onclick: () => toggle(i.path),
+    }, i.pinned && icon('pin', 12), i.label, i.mark && h('span.lora-mark', i.mark)));
+    const labelOf = (path) => byPath.get(path)?.label ?? loraName(path);
+    const filter = listed.length >= LORA_FILTER_FROM && h('input.seed-input.text', {
+      type: 'search', placeholder: `Filter ${listed.length} LoRAs`, 'aria-label': 'Filter LoRAs', spellcheck: false,
+      oninput: () => {
+        const q = filter.value.trim().toLowerCase();
+        for (const b of choices) b.hidden = !!q && !b.dataset.name.includes(q) && !b.classList.contains('on');
+      },
+    });
+    const rows = picks.map((l) => h('div.lora-row',
+      h('span.lora-name', { title: l.path }, labelOf(l.path),
+        byPath.get(l.path)?.words.length > 0 && h('span.mono-meta.accent', ` + ${byPath.get(l.path).words.join(', ')}`)),
+      h('label.seed-field.lora-weight', h('span.mono-meta', '×'), numberInput({
+        value: l.weight, label: `${labelOf(l.path)} weight`, step: 0.1, min: -10, max: 10,
+        onchange: (value, field) => {
+          if (value == null || !Number.isFinite(value)) { field.value = String(l.weight); return; }
+          put(picks.map((x) => (x.path === l.path ? { ...x, weight: Math.min(10, Math.max(-10, value)) } : x)));
+        },
+      })),
+      h('button.att-x', {
+        type: 'button', title: `Remove ${labelOf(l.path)}`, 'aria-label': `Remove ${labelOf(l.path)}`,
+        onclick: () => toggle(l.path),
+      }, icon('x', 12))));
+    const under = preset?.loras ?? engine.image_defaults?.loras ?? []; // what these go on top of
+    const hint = [
+      under.length ? `on top of ${preset?.loras ? `${preset.name}'s` : 'the default'} ${lorasWord(under)}` : 'applied to every image this turn',
+      'one already applied gets the weight here; 0 turns it off',
+      'kept for later messages: type @ in the prompt for one message only',
+      full && `at most ${MAX_LORAS}`,
+    ].filter(Boolean).join(' · ');
+    return h('div.tray-cell.span-all',
+      h('div.cell-head', h('span.eyebrow', 'LoRAs'), h('span.spacer'),
+        picks.length > 0 && h('button.mini', { type: 'button', onclick: () => put([]) }, 'Clear')),
+      !choices.length && h('span.tray-hint', 'None of its LoRAs works with this model: see the LoRA library.'),
+      filter && h('label.seed-field', icon('search', 13), filter),
+      h('div.tray-seg.wrap.lora-picks', choices),
+      rows.length > 0 && h('div.lora-rows', rows),
+      h('span.tray-hint.wrap', hint));
+  }
+
+  /** What a preset sets, for its hint: its description, LoRAs, steps and CFG. */
+  function presetSummary(p) {
+    const loras = p.loras == null ? null
+      : p.loras.length ? p.loras.map((l) => `${l.path.split(/[\\/]/).pop()}${l.weight === 1 ? '' : ` ×${l.weight}`}`).join(', ')
+        : 'no LoRAs';
+    return [p.description, loras, p.steps && `${p.steps} steps`, p.cfg_scale != null && `cfg ${p.cfg_scale}`]
+      .filter(Boolean).join(' · ');
   }
 
   function renderActions() {
@@ -409,6 +502,11 @@ export function promptBar({
         onclick: () => { if (error) error = null; else offlineDismissed = true; renderError(); },
       }, icon('x', 13)),
     );
+  }
+
+  /** The engine's LoRAs as the pickers show them, with what the library knows of each. */
+  function engineLoras(engine) {
+    return engine ? loraItems(engine.available_loras ?? [], (path) => libraryLora(engine.name, path)) : [];
   }
 
   function render() {
@@ -490,9 +588,34 @@ export function promptBar({
     }
   }
 
-  const unsubscribe = [on('options', render), on('backends', render), on('conn', () => { renderActions(); renderError(); })];
+  const unsubscribe = [
+    on('options', render), on('backends', render), on('loras', render),
+    on('conn', () => { renderActions(); renderError(); }),
+  ];
   setText(d.text);
+  if (!compact) {
+    if (!loraLibrary()) loadLoras();
+    useQueuedLoras();
+  }
   render();
+
+  /** LoRAs the library asked to use in the next prompt ({path, weight}, as the image
+   * engine lists them): their mentions go at the end of the text. */
+  function useQueuedLoras() {
+    const queued = takeQueuedLoras();
+    if (!queued.length) return;
+    const engine = imageEngine();
+    const items = engineLoras(engine);
+    const found = queued.map((q) => [q, items.find((i) => i.path === q.path)]);
+    const mentions = found.filter(([, i]) => i).map(([q, i]) => loraText(i.name, q.weight ?? i.weight));
+    const missing = found.length - mentions.length;
+    if (missing) {
+      toast(`${engine?.name ?? 'The image engine'} doesn't list ${missing === 1 ? 'one of them' : `${missing} of them`}`, { error: true });
+    }
+    if (!mentions.length) return;
+    const text = d.text.replace(/\s+$/, '');
+    setText(`${text}${text ? ' ' : ''}${mentions.join(' ')} `);
+  }
 
   return {
     el,

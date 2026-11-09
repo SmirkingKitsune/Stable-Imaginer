@@ -5,6 +5,7 @@ from pydantic import ValidationError
 
 from imaginer.core.config import (
     ConfigError,
+    DiffusersBackendConfig,
     LlamaCppBackendConfig,
     RoutingConfig,
     SdCppBackendConfig,
@@ -142,3 +143,34 @@ def test_networked_profiles_need_a_token(monkeypatch: pytest.MonkeyPatch) -> Non
     with pytest.raises(ValidationError, match="needs a server token"):
         load_settings("nas", config_dir=REPO_CONFIG)
     assert not load_settings("standalone", config_dir=REPO_CONFIG).links.enabled
+
+
+def test_presets_and_loras() -> None:
+    config = SdCppBackendConfig.model_validate(
+        {
+            "type": "sdcpp",
+            "base_url": "http://127.0.0.1:1234",
+            "defaults": {"loras": [{"path": "style.safetensors", "weight": 0.5}]},
+            "presets": {"fast-8": {"loras": [], "steps": 8}},
+        }
+    )
+    assert config.defaults.loras[0].weight == 0.5
+    assert config.presets["fast-8"].loras == []
+    assert config.presets["fast-8"].cfg_scale is None
+    with pytest.raises(ValidationError, match="should match pattern"):
+        SdCppBackendConfig.model_validate(
+            {"type": "sdcpp", "base_url": "http://x:1", "presets": {"Fast Mode": {}}}
+        )
+
+
+def test_diffusers_loras() -> None:
+    config = DiffusersBackendConfig.model_validate(
+        {
+            "type": "diffusers",
+            "lora_dir": "~/loras",
+            "defaults": {"loras": [{"path": "style.safetensors", "weight": 0.5}]},
+            "presets": {"t": {"loras": [{"path": "x"}], "steps": 8}},
+        }
+    )
+    assert config.lora_dir is not None and config.lora_dir.name == "loras"
+    assert config.presets["t"].loras is not None and config.presets["t"].loras[0].weight == 1.0

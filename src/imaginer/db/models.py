@@ -231,3 +231,44 @@ class PairingCode(Base):
     created_at: Mapped[datetime] = mapped_column(UTCDateTime)
     expires_at: Mapped[datetime] = mapped_column(UTCDateTime)
     failed_attempts: Mapped[int] = mapped_column(sa.Integer, default=0, server_default=sa.text("0"))
+
+
+# --- the LoRA library -----------------------------------------------------------------
+
+
+class LoraRecord(Base):
+    """What the user added to one LoRA. ``id`` is its file's SHA-256, so it follows the file
+    through renames and moves; a LoRA an engine only lists by name (a remote sd-server, an
+    engine a linked instance shares) has an id made from the engine and that name."""
+
+    __tablename__ = "lora"
+
+    id: Mapped[str] = mapped_column(sa.String(64), primary_key=True)
+    name: Mapped[str | None] = mapped_column(sa.Text)  # display name
+    notes: Mapped[str | None] = mapped_column(sa.Text)
+    default_weight: Mapped[float | None] = mapped_column(sa.Float)
+    tags: Mapped[list[str] | None] = mapped_column(JSONType)
+    # [{"text", "on"}]; None: the words the file (or its Hub card) names.
+    triggers: Mapped[list[dict[str, Any]] | None] = mapped_column(JSONType)
+    pinned: Mapped[bool] = mapped_column(sa.Boolean, default=False, server_default=sa.false())
+    cover: Mapped[dict[str, Any] | None] = mapped_column(JSONType)
+    # {model key: {"call": "works" | "no", "name": shown name}}
+    compat: Mapped[dict[str, Any] | None] = mapped_column(JSONType)
+    lineage: Mapped[str | None] = mapped_column(sa.Text)
+    created_at: Mapped[datetime] = mapped_column(UTCDateTime)
+    updated_at: Mapped[datetime] = mapped_column(UTCDateTime)
+
+
+class LoraFile(Base):
+    """A LoRA file on this machine, by its absolute path: its SHA-256 (hashed once per
+    size and modification time), and where it came from when the Hub installed it."""
+
+    __tablename__ = "lora_file"
+
+    path: Mapped[str] = mapped_column(sa.String(1024), primary_key=True)
+    size_bytes: Mapped[int | None] = mapped_column(sa.BigInteger)
+    mtime_ns: Mapped[int | None] = mapped_column(sa.BigInteger)
+    sha256: Mapped[str | None] = mapped_column(sa.String(64), index=True)
+    # {"repo", "revision", "words", "images", "base_models"} from the Hub's model card.
+    source: Mapped[dict[str, Any] | None] = mapped_column(JSONType)
+    hashed_at: Mapped[datetime | None] = mapped_column(UTCDateTime)

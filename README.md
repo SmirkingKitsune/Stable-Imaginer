@@ -100,6 +100,62 @@ More image settings:
   sd-server runs out of VRAM decoding it, add `--vae-tiling` to `launch.extra_args`.
 - **Sigmas:** `defaults.sigmas` accepts a list of numbers or the preset
   `qwen-image-2.1-turbo`, for the Turbo checkpoint: 8 steps, CFG 1.0.
+- **Presets** are named settings a message can pick (the prompt bar's Preset row, or
+  `image_options.preset`): LoRAs plus the steps, CFG, sampler or sigmas that go with them.
+  What a preset leaves unset keeps the backend's defaults (but steps without sigmas drop the
+  default sigmas, which would set the step count), and steps or CFG the user sets still win.
+  The quality check never changes the steps or CFG a preset sets, because a step-distill LoRA
+  only works with the settings it was made for.
+- **LoRAs:** give the engine a LoRA folder: sd-server's `launch.lora_model_dir` (its
+  `--lora-model-dir`), or a Diffusers backend's `lora_dir` (see Diffusers below). Set it on the
+  Engines screen's **LoRAs** cell, or let the first LoRA installed from Hugging Face set it.
+  Then name LoRAs in `defaults.loras` (every image) or a preset's `loras`, pick them in the
+  prompt bar's LoRAs row (kept for later messages), or mention one in a message's text for
+  that message only: `@lora:ink-wash`, or `@lora:ink-wash:0.6` with a weight (see LoRA
+  mentions below).
+  A message's LoRAs go on top of its preset's (or the default ones); one already applied gets
+  the message's weight, and weight 0 turns it off. A LoRA's `path` is as `GET /v1/backends`
+  lists it under `available_loras` (relative to that folder); its file name, or its name
+  without the extension, works too when it is unique. Keep only LoRAs in that folder:
+  sd-server lists every weights file in it as one, and the Engines screen warns about a file
+  too big to be one. sd-server finds a new LoRA there without a restart, but a new folder
+  needs one (Diffusers takes a new folder at once). A backend with `declared_capabilities` needs `lora` in that list. Each image's
+  job records the LoRAs it used, with each file's SHA-256 when the engine runs on this
+  machine. An engine a linked instance shares brings its presets and LoRAs along: pick them
+  as for a local one, and that instance applies them (docs/linked-instances.md).
+- **Trigger words:** a LoRA's trigger words are added to the end of the prompt when the
+  prompt doesn't have them yet, however the LoRA was picked: the ones set in the LoRA library,
+  else the ones its safetensors metadata names (`modelspec.trigger_phrase`, `trigger_phrase`,
+  `trigger_word` or `trigger_words`), else its Hub card's `instance_prompt`. The job records
+  the ones added as the LoRA's `trigger`. Only an engine whose LoRA files are on this machine
+  can read them (one launched here, or Diffusers); over a link, the instance that shares the
+  engine does.
+- **LoRA library:** `GET /v1/loras` (the web UI's `#/loras`) lists every LoRA the image
+  engines can apply, one per file by its SHA-256 however many LoRA folders it is in, with what
+  you add to it: a display name (prompts and presets keep the path), trigger words (each on or
+  off), notes, tags, a pin, a cover, a default weight, and your call on which models it works
+  with. Those are kept in the database by SHA-256, so they follow the file through renames and
+  moves. Compatibility is guessed for every model the image engines run, from the headers
+  alone: the share of the LoRA's modules the model has at the same width, and the model the
+  LoRA (or its Hub card) says it was made for; a model whose weights can't be read here (an
+  engine a linked instance shares) is untested when its name is in the LoRA's lineage. The
+  prompt bar's pickers leave out a LoRA that doesn't work with the image backend's model and
+  mark an untested one "?". Usage comes from the LoRAs each job records. Moving a LoRA to
+  another folder, or deleting it, also rewrites the presets and `defaults.loras` that name
+  it, in `config/<profile>.local.yaml`.
+
+  ```yaml
+  sdcpp:
+    declared_capabilities: [t2i, edit, multi_ref, rgba, lora]
+    launch:
+      lora_model_dir: D:/models/loras
+    presets:
+      fast:
+        description: 8-step draft
+        loras: [{path: p_q_image_2.1_8_steps_v0.1_comfyui_bf16.safetensors}]
+        steps: 8
+        cfg_scale: 1.0
+  ```
 - **Progress:** an sdcpp backend's `preview` (default `proj`) is how sd-server reports step
   progress. With `none` there is no step progress, only the job status.
 
@@ -176,6 +232,7 @@ See [docs/linked-instances.md](docs/linked-instances.md) for the protocol and se
   imaginer.sqlite3                       # SQLite in WAL mode
   conversations/<conversation_id>/
     artifacts/<artifact_id>.<ext>
+  loras/covers/<lora id>.webp            # the LoRA library's covers
 ```
 
 `data_root` defaults to `%LOCALAPPDATA%\imaginer` on Windows and `~/.local/share/imaginer`
@@ -212,6 +269,10 @@ conversation stays hidden and a background sweep finishes the delete later.
 | `POST` | `/v1/engines/{name}/start`, `/stop` | start or stop a local engine that has `launch` settings |
 | `GET` | `/v1/engines/{name}/log`, `/log/file`, `/events` | the last run's output; `/events` streams `line`, `state` and `install` as SSE |
 | `POST` | `/v1/engines/{name}/install/plan`, `/install`, `/install/cancel` | install the engine's runtime in the background, as `imaginer sdcpp provision` would |
+| `GET` | `/v1/loras`, `/v1/loras/{id}` | the LoRA library: every LoRA by its file's SHA-256, with its engines, compatibility per model, usage and what you added; the models the engines run |
+| `PATCH`, `DELETE` | `/v1/loras/{id}` | display name, default weight, trigger words, notes, tags, pin, lineage, your call per model; `DELETE` deletes its file and takes it out of presets |
+| `POST` | `/v1/loras/{id}/move`, `/v1/loras/{id}/presets` | move its file to another folder (presets follow); put it in, or take it out of, an engine's preset, or make one |
+| `GET`, `PUT`, `DELETE` | `/v1/loras/{id}/cover` | its cover: from a conversation's image (`artifact_id`) or its Hub card (`hub`), kept as a 768 px WebP |
 | `GET` | `/v1/gallery?limit=&cursor=&include_archived=` | this instance's conversations and every linked instance's, newest activity first; each item has an `origin` (`base_path` reaches a remote one), each page `sources` with their status |
 | `GET`, `POST` | `/v1/links`, `/v1/links/discovered` | the Links screen: this instance, its links and what each shares (with VRAM fit); `POST {url, code, name?}` pairs |
 | `POST` | `/v1/links/pairing-code` | a code another instance can pair with (10 minutes, single use) |
@@ -337,6 +398,23 @@ two tools. Both also take `negative_prompt`, `aspect_ratio`, `width`, `height`, 
   to `edit_image` calls. The result tells the model which values came from the user,
   and the user message stores them as `metadata.image_options`. An unknown or non-image
   `backend` is refused with 422 before the turn starts.
+- **LoRA mentions:** `@lora:<name>` in a message's text, or `@lora:<name>:<weight>` (weight
+  -10 to 10, default 1), applies that LoRA to every image of the turn, on top of
+  `image_options.loras`; for a LoRA in both, the mention's weight wins. The name is as the
+  image backend lists it (`available_loras`), or its file name, or its name without the
+  extension; quote one with other characters than letters, digits, `_`, `-`, `/` and inner
+  dots: `@lora:"my style"`. The message keeps the text as written. A raw prompt goes out
+  without the mentions, and a mention in a prompt the chat model writes is dropped: only
+  the user picks LoRAs. A retry applies its message's mentions again. A weight out of range,
+  or more than 8 LoRAs in all, is refused with 422 before the turn starts.
+- **What the chat model is told about LoRAs:** it reads each mention as the LoRA's display
+  name from the LoRA library, and a note after a message that picks LoRAs (by mention or
+  `image_options.loras`) lists each with its weight, the trigger words the image engine will
+  add, its tags and its notes. The system prompt then says what the note means: the image
+  tools apply those LoRAs by themselves, so the model writes a prompt that suits them and
+  leaves their names and words out of it (should it copy the note into a prompt anyway, the
+  image engine doesn't get it). The quality check is told which LoRAs the image model got and
+  the words they added, so it doesn't take their look for a mistake.
 
 ### Prompt modes and the quality check
 
@@ -389,7 +467,9 @@ It follows the "Imaginer Main Interface" design, which is built on the Industry 
   exact size, steps, CFG, a negative prompt and transparency, each showing the backend's own
   default. These are sent as `mode`, `qa` and `image_options`, "auto" leaves the choice to
   the model, and they persist in the browser. Beyond mode, QA and the basics, only settings
-  that differ from the default get a chip.
+  that differ from the default get a chip. Typing `@` in the text picks an attached image or,
+  for that message only, one of the image backend's LoRAs (`@lora:` lists only LoRAs); a LoRA
+  shows as a chip with its weight, and clicking the chip sets the weight.
 - **Search:** the server searches every conversation (archived ones too, if asked), page by page,
   with a bar tracking progress. Results show where they matched, highlighted. Esc clears, Enter
   opens the first result.
@@ -403,7 +483,10 @@ It follows the "Imaginer Main Interface" design, which is built on the Industry 
   E eraser, `[ ]` size, X invert, Ctrl+Z undo). The mask is uploaded at the image's size and
   goes into the bar beside it; the message sends it as `image_options.mask`.
 - **Conversation:** streaming replies and collapsible reasoning. Each tool call shows as a row
-  with its job state. A running job shows step progress, engine settings and a Cancel button.
+  with its job state, which opens to the whole call: every argument in full (the prompt with
+  a Copy button), the LoRAs by their library names with the trigger words they added, and the
+  engine, model, size, steps and CFG the job used. A running job shows step progress, engine
+  settings and a Cancel button.
   Outputs show their seed and size, plus Edit and Reference actions that put the image into the
   bar, and Retry. Edits list their lineage. Under the row, the quality check shows as checking,
   passed, redone (with its issues and changes), flagged or skipped; redone attempts stay
@@ -418,6 +501,15 @@ It follows the "Imaginer Main Interface" design, which is built on the Industry 
   local ones. Engine settings (`#/engines`) shows each backend's runtime, model files, endpoint,
   capabilities and startup log, installs runtimes, and finds and downloads models from Hugging
   Face. See [Engines screen](#engines-screen).
+- **LoRA library** (`#/loras`, from the status line's menu or the Engines LoRAs cell): every
+  LoRA as a tile with its cover, trigger words and use count, or as a table grouped by folder
+  with a bar for the ones checked (tag, move, add to a preset, use in the next prompt,
+  delete). Tags filter both, pins come first, and the view is remembered in the browser. A
+  LoRA's page (`#/loras/<id>`) edits its display name, default weight, trigger words, notes,
+  tags, folder and presets, saved as you leave each field; shows its compatibility per model
+  with your call (Auto, Works, Doesn't) and lineage; picks a cover from the images made with
+  it, any conversation's or its Hub card's; and lists the conversations that used it. "Use in
+  next prompt" goes back to where you were and puts the LoRA in the prompt as a mention.
 - **Connection:** when the server can't be reached, a strip under the header counts down
   retries (1, 2, 4, 8, 16 s), running jobs dim to their last known step, and drafts are kept.
   Once back, running turns pick up from their last event.
@@ -671,7 +763,8 @@ Face cache), a lot of VRAM (`cpu_offload: true` trades speed for memory), and th
 uv sync --extra diffusers
 ```
 
-- **Where torch comes from:** on Windows and Linux, this installs torch `2.14.1+cu130` from the
+- **Where torch comes from:** on Windows and Linux, this installs torch `2.14.1+cu130` (and the
+  torchvision built for it, which Qwen-Image-2.1's text encoder processor needs) from the
   PyTorch CUDA 13.0 index set in `pyproject.toml`. That build supports the RTX 5090 (`sm_120`),
   the NAS's Ada card, and Linux arm64. It needs an NVIDIA driver R580 or newer. For an older
   driver, point the `pytorch-cu130` index URL at `.../whl/cu128` and run `uv lock`.
@@ -686,6 +779,23 @@ uv sync --extra diffusers
   loading. Health probes alone do not retry a failed load.
 - **Loading:** the model loads on first use, or at startup with `preload: true`. Requests made
   during the load wait for it.
+- **LoRAs:** set `lora_dir` to a folder of LoRAs, or set it on the Engines screen (the first
+  LoRA installed from Hugging Face sets it to `<models_dir>/_loras`, which sd-server can share).
+  Diffusers lists the `.safetensors` files in it, subfolders too, and never loads pickled
+  weights. It needs `peft`, which the extra installs. A LoRA is loaded into the pipeline the
+  first time an image uses it, which takes a few seconds, and the last four stay loaded, so
+  the next image with the same LoRAs starts at once. Diffusers converts ComfyUI and kohya
+  files itself; a LoRA made for another model fails the request with its reason. A new
+  `lora_dir` doesn't reload the model.
+
+  ```yaml
+  diffusers:
+    lora_dir: D:/models/loras
+    presets:
+      clay:
+        description: clay sculpture style
+        loras: [{path: Qwen-Image-2.1-Clay-Sculpture-Style-3000, weight: 0.8}]
+  ```
 - **Its defaults** (`steps: 40`, `cfg_scale: 1.0`) differ from sd.cpp's on purpose.
   Diffusers samples Qwen-Image-2.1 without guidance. `sampler`, `scheduler` and `flow_shift` don't
   apply and are ignored.
@@ -704,6 +814,12 @@ uv sync --extra diffusers
   - Step progress only exists while previews are on.
   - A generating job stops at the next checkpoint when cancelled.
   - A full queue answers `429`.
+- **LoRAs (2026-11-05, RTX 5090):** sd-server `master-1028-37bc88b` lists the LoRAs in
+  `--lora-model-dir` under `loras` (`name`, `path`, `display_path`) and applies a request's
+  `lora` list. Diffusers 0.42.1 (`QwenImage21Pipeline`, PEFT 0.21) loads the same file as an
+  adapter. Both applied prithivMLmods' Qwen-Image-2.1 clay-sculpture LoRA (PEFT keys,
+  `lora_A.default`) to Qwen-Image-2.1-Turbo edits, and with the LoRA off again Diffusers
+  reproduced the plain edit pixel for pixel.
 - **Windows build for the RTX 5090:** the official `sd-master-*-bin-win-cuda12-x64.zip` is built
   with CUDA 12.8.1 for `sm_120`. Unzip `cudart-sd-bin-win-cu12-x64.zip` next to it. No source build needed.
 - **llama-server tool calling:** `--jinja` is on by default. The adapter reads

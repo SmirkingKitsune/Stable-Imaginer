@@ -244,8 +244,9 @@ class FakeLlama:
             return FakeLlama.text(f"That didn't work: {result['error']['detail']}")
         if body.get("tools") and body.get("tool_choice") != "none" and final["role"] == "user":
             text = final["content"] if isinstance(final["content"], str) else ""
-            if text.lower().startswith("draw "):
-                return FakeLlama.tool_call("generate_image", {"prompt": text[5:].strip()})
+            if text.lower().startswith("draw "):  # its first paragraph: not the notes after it
+                prompt = text[5:].split("\n\n")[0].strip()
+                return FakeLlama.tool_call("generate_image", {"prompt": prompt})
             edit = re.match(r"edit (img-\d+)[:,]?\s+(.+)", text.strip(), re.IGNORECASE)
             if edit:
                 arguments = {"images": [edit.group(1).lower()], "prompt": edit.group(2)}

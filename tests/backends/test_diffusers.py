@@ -1,23 +1,38 @@
 import asyncio
+import hashlib
+import os
 import subprocess
 import sys
 import threading
+from pathlib import Path
 from typing import Any
 
+import httpx
 import pytest
 from PIL import Image
 
+from imaginer.backends import diffusers_inproc
 from imaginer.backends import registry as registry_module
 from imaginer.backends.base import EditRequest, GenProgress, GenRequest, ImageInput
 from imaginer.backends.diffusers_inproc import DiffusersBackend, missing_dependencies
 from imaginer.backends.registry import BackendRegistry
-from imaginer.core.config import DiffusersBackendConfig, ImageDefaults
+from imaginer.core.config import (
+    BackendConfig,
+    DiffusersBackendConfig,
+    ImageDefaults,
+    ImagePreset,
+    LoraRef,
+    OrchestrationConfig,
+    QAConfig,
+    RoutingConfig,
+)
 from imaginer.domain.enums import BackendStatus, Capability
-from imaginer.domain.errors import EngineError, EngineUnavailableError
+from imaginer.domain.errors import EngineError, EngineUnavailableError, InvalidRequestError
+from imaginer.main import create_app
 from tests.conftest import SettingsFactory
-from tests.fakes.fake_diffusers import FakeLoader
+from tests.fakes.fake_diffusers import NOT_A_LORA, FakeLoader
 from tests.fakes.fake_sdcpp import RGBA_MARKER
-from tests.helpers import image_bytes
+from tests.helpers import image_bytes, safetensors_file
 
 ALL = {Capability.T2I, Capability.EDIT, Capability.MULTI_REF, Capability.RGBA}
 
@@ -46,7 +61,7 @@ def test_every_backend_module_imports_without_torch() -> None:
     """The [diffusers] extra is optional: nothing may import torch at module level."""
     code = (
         "import sys\n"
-        "for name in ('torch', 'diffusers', 'transformers', 'accelerate'):\n"
+        "for name in ('torch', 'torchvision', 'diffusers', 'transformers', 'accelerate'):\n"
         "    sys.modules[name] = None  # any import of them now raises ImportError\n"
         "import imaginer.backends.diffusers_inproc, imaginer.backends.registry\n"
         "import imaginer.backends.llamacpp, imaginer.backends.sdcpp, imaginer.main\n"
@@ -71,7 +86,13 @@ async def test_missing_extra_is_reported_not_fatal(
 
 
 def test_missing_dependencies_checks_without_importing() -> None:
-    assert set(missing_dependencies()) <= {"torch", "diffusers", "transformers", "accelerate"}
+    assert set(missing_dependencies()) <= {
+        "torch",
+        "torchvision",
+        "diffusers",
+        "transformers",
+        "accelerate",
+    }
 
 
 # --- health and loading -----------------------------------------------------------
@@ -295,3 +316,192 @@ async def test_pipeline_errors_are_engine_errors() -> None:
     loader.pipeline.fail = "shape mismatch"
     with pytest.raises(EngineError, match="shape mismatch"):
         await backend.generate(GenRequest(prompt="x", seed=1))
+
+
+# --- LoRAs ------------------------------------------------------------------------
+
+
+def _lora_folder(tmp_path: Path) -> Path:
+    folder = tmp_path / "loras"
+    (folder / "styles").mkdir(parents=True)
+    for path, data in {
+        "draft.safetensors": b"draft",
+        "styles/ink.safetensors": b"ink",
+        "styles/film.safetensors": b"film",
+        "pickled.ckpt": b"never loaded",  # pickled weights: not listed
+        "big.safetensors.part": b"a download",  # not finished: not listed
+    }.items():
+        (folder / path).write_bytes(data)
+    return folder
+
+
+def _sha(data: bytes) -> str:
+    return hashlib.sha256(data).hexdigest()
+
+
+async def test_loras_are_listed_from_the_lora_folder(tmp_path: Path) -> None:
+    folder = _lora_folder(tmp_path)
+    backend, _ = _backend(lora_dir=folder)
+    assert (await backend.health()).status is BackendStatus.OK
+    assert backend.available_loras == [
+        "draft.safetensors",
+        "styles/film.safetensors",
+        "styles/ink.safetensors",
+    ]
+    assert backend.capabilities() == ALL | {Capability.LORA}
+
+    plain, _ = _backend()
+    await plain.health()
+    assert (plain.available_loras, plain.capabilities()) == (None, ALL)
+    missing, _ = _backend(lora_dir=tmp_path / "nowhere")
+    health = await missing.health()
+    assert health.status is BackendStatus.OK and "LoRA folder" in (health.detail or "")
+    assert Capability.LORA not in missing.capabilities()
+    loader = FakeLoader()
+    loader.no_loras = "LoRAs need peft: uv sync --extra diffusers"
+    no_peft, _ = _backend(loader, lora_dir=folder)
+    assert "need peft" in ((await no_peft.health()).detail or "")
+    assert (no_peft.available_loras, Capability.LORA in no_peft.capabilities()) == (None, False)
+
+
+async def test_loras_are_weighted_recorded_and_stay_loaded(tmp_path: Path) -> None:
+    folder = _lora_folder(tmp_path)
+    draft = ImagePreset(loras=[LoraRef(path="draft")], steps=2)
+    backend, loader = _backend(lora_dir=folder, presets={"draft": draft})
+    pipe = loader.pipeline
+    await backend.health()
+    picked = (LoraRef(path="ink", weight=0.5), LoraRef(path="draft.safetensors", weight=0.8))
+    (result,) = await backend.generate(
+        GenRequest(prompt="a fox", seed=1, preset="draft", loras=picked)
+    )
+    # The preset's LoRA keeps its place and takes the weight picked for it.
+    assert pipe.lora_calls[-1] == [("draft.safetensors", 0.8), ("ink.safetensors", 0.5)]
+    assert result.params["loras"] == [
+        {"path": "draft.safetensors", "weight": 0.8, "sha256": _sha(b"draft")},
+        {"path": "styles/ink.safetensors", "weight": 0.5, "sha256": _sha(b"ink")},
+    ]
+    assert pipe.calls[-1]["num_inference_steps"] == 2
+
+    await backend.generate(GenRequest(prompt="again", seed=2, preset="draft", loras=picked))
+    assert pipe.loaded == ["draft.safetensors", "ink.safetensors"]  # nothing loaded twice
+    (plain,) = await backend.generate(GenRequest(prompt="plain", seed=3))
+    assert pipe.lora_calls[-1] == [] and "loras" not in plain.params
+    off = (LoraRef(path="draft", weight=0),)  # weight 0 turns off the preset's LoRA
+    (none,) = await backend.generate(GenRequest(prompt="x", seed=4, preset="draft", loras=off))
+    assert pipe.lora_calls[-1] == [] and "loras" not in none.params
+
+    changed = folder / "draft.safetensors"
+    changed.write_bytes(b"draft, retrained")
+    os.utime(changed, ns=(changed.stat().st_atime_ns, changed.stat().st_mtime_ns + 10**9))
+    await backend.generate(GenRequest(prompt="new", seed=5, preset="draft"))
+    assert pipe.loaded[-1] == "draft.safetensors" and len(pipe.loaded) == 3
+    assert sorted(pipe.adapters.values()) == ["draft.safetensors", "ink.safetensors"]
+    assert loader.loads == 1
+
+
+async def test_only_a_few_loras_stay_loaded(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(diffusers_inproc, "LORAS_KEPT", 2)
+    folder = tmp_path / "loras"
+    folder.mkdir()
+    for name in "abc":
+        (folder / f"{name}.safetensors").write_bytes(name.encode())
+    backend, loader = _backend(lora_dir=folder)
+    await backend.health()
+    for name in "abc":
+        await backend.generate(GenRequest(prompt=name, seed=1, loras=(LoraRef(path=name),)))
+    assert sorted(loader.pipeline.adapters.values()) == ["b.safetensors", "c.safetensors"]
+    every = tuple(LoraRef(path=name) for name in "abc")  # more than are kept: all, for this one
+    await backend.generate(GenRequest(prompt="all", seed=1, loras=every))
+    assert len(loader.pipeline.adapters) == 3
+    assert loader.pipeline.lora_calls[-1] == [(f"{n}.safetensors", 1.0) for n in "abc"]
+
+
+async def test_a_lora_that_isnt_there_or_doesnt_load_fails_the_request(tmp_path: Path) -> None:
+    folder = _lora_folder(tmp_path)
+    (folder / "for-another-model.safetensors").write_bytes(NOT_A_LORA)
+    backend, loader = _backend(lora_dir=folder)
+    await backend.health()
+    with pytest.raises(InvalidRequestError, match=r"no LoRA 'nope' \(it has: draft"):
+        await backend.generate(GenRequest(prompt="x", seed=1, loras=(LoraRef(path="nope"),)))
+    assert loader.loads == 0  # failed before the model loaded
+    bad = (LoraRef(path="for-another-model"),)
+    with pytest.raises(
+        InvalidRequestError, match=r"can't load LoRA 'for-another-model\.safetensors'"
+    ):
+        await backend.generate(GenRequest(prompt="x", seed=1, loras=bad))
+    assert loader.pipeline.adapters == {}  # nothing half loaded is left
+    (folder / "new.safetensors").write_bytes(b"new")  # added since the last listing
+    await backend.generate(GenRequest(prompt="x", seed=1, loras=(LoraRef(path="new"),)))
+    assert loader.pipeline.lora_calls[-1] == [("new.safetensors", 1.0)]
+
+
+async def test_a_new_lora_folder_keeps_the_loaded_model(
+    make_settings: SettingsFactory, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    loader = FakeLoader()
+
+    def factory(name: str, config: BackendConfig) -> DiffusersBackend:
+        assert isinstance(config, DiffusersBackendConfig)
+        return DiffusersBackend(name, config, loader=loader)
+
+    monkeypatch.setitem(registry_module.FACTORIES, "diffusers", factory)
+    settings = make_settings(
+        backends={"diff": diffusers_config()},
+        routing=RoutingConfig(t2i="diff", edit="diff"),
+        orchestration=OrchestrationConfig(probe_ttl_s=0, qa=QAConfig(enabled=False)),
+    )
+    app = create_app(settings)
+    async with app.router.lifespan_context(app):
+        registry: BackendRegistry = app.state.container.registry
+        transport = httpx.ASGITransport(app=app, raise_app_exceptions=False)
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+            engine = (await client.get("/v1/engines/diff")).json()
+            assert engine["loras"]["path"] is None and "lora" not in engine["capabilities"]
+            lease = await registry.image_backend("t2i")
+            backend = lease.backend
+            await backend.generate(GenRequest(prompt="x", seed=1))
+            lease.release()
+
+            folder = tmp_path / "loras"
+            resp = await client.patch("/v1/engines/diff", json={"lora_dir": str(folder)})
+            assert resp.status_code == 200, resp.text
+            assert folder.is_dir()  # made, for Hugging Face to install into
+            loras = resp.json()["loras"]
+            assert (loras["path"], loras["count"], loras["apply_mode"]) == (str(folder), 0, None)
+            assert "lora" in resp.json()["capabilities"]
+            (folder / "ink.safetensors").write_bytes(b"ink")
+            (folder / "notes.gguf").write_bytes(b"sd-server would list this one, Diffusers not")
+            assert (await client.get("/v1/engines/diff")).json()["loras"]["count"] == 1
+            listed = {b["name"]: b for b in (await client.get("/v1/backends")).json()}
+            assert listed["diff"]["available_loras"] == ["ink.safetensors"]
+
+            lease = await registry.image_backend("t2i")
+            assert lease.backend is backend  # the same adapter: the model stayed loaded
+            await lease.backend.generate(
+                GenRequest(prompt="y", seed=2, loras=(LoraRef(path="ink"),))
+            )
+            lease.release()
+            assert loader.loads == 1
+            assert loader.pipeline.lora_calls[-1] == [("ink.safetensors", 1.0)]
+
+            sd_style = {"launch": {"lora_model_dir": str(folder)}}
+            assert (await client.patch("/v1/engines/diff", json=sd_style)).status_code == 422
+            cleared = await client.patch("/v1/engines/diff", json={"lora_dir": ""})
+            assert cleared.json()["loras"]["path"] is None
+            assert "lora" not in cleared.json()["capabilities"]
+
+
+async def test_a_loras_trigger_phrase_is_added_to_the_prompt(tmp_path: Path) -> None:
+    folder = tmp_path / "loras"
+    folder.mkdir()
+    words = '["ohwx", "clay sculpture"]'  # some trainers store a list
+    safetensors_file(folder / "clay.safetensors", {"modelspec.trigger_phrase": words})
+    backend, loader = _backend(lora_dir=folder)
+    await backend.health()
+    (result,) = await backend.generate(
+        GenRequest(prompt="a fox", seed=1, loras=(LoraRef(path="clay"),))
+    )
+    assert loader.pipeline.calls[-1]["prompt"] == "a fox, ohwx, clay sculpture"
+    assert result.params["loras"][0]["trigger"] == "ohwx, clay sculpture"

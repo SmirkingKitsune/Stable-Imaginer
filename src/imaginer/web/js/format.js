@@ -2,6 +2,13 @@
 
 export const plural = (n, word, many = `${word}s`) => `${n} ${n === 1 ? word : many}`;
 
+/** A LoRA's name, as sd-server gives it: its file name without the extension. */
+/** A LoRA's file name without a weight file's extension ("Style-2.1-3000" keeps its dots). */
+export const loraName = (path) => path.split(/[\\/]/).pop().replace(/\.(safetensors|gguf|pt|pth|ckpt|sft)$/i, '');
+
+/** A few LoRAs in a line: one by name, more by count. */
+export const lorasWord = (loras) => (loras.length === 1 ? loraName(loras[0].path) : plural(loras.length, 'LoRA'));
+
 export function ago(iso) {
   const s = Math.max(0, (Date.now() - new Date(iso).getTime()) / 1000);
   if (s < 60) return 'now';

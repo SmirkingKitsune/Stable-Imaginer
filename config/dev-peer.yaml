@@ -27,7 +27,7 @@ backends:
   sdcpp:
     type: sdcpp
     base_url: http://127.0.0.1:11234
-    declared_capabilities: [t2i, edit, multi_ref, rgba]
+    declared_capabilities: [t2i, edit, multi_ref, rgba, lora]
     poll_interval_s: 0.1
     defaults:
       width: 2048

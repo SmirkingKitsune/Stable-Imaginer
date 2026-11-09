@@ -22,9 +22,13 @@ from imaginer.tools.base import Tool, ToolContext, ToolOutcome
 from imaginer.tools.images import (
     ImageOptions,
     apply_user_options,
+    image_prompt,
+    loras_requested,
     run_image_job,
     sampler_params,
+    user_loras,
     user_options_note,
+    user_preset,
 )
 
 AVAILABLE_LIMIT = 30
@@ -97,6 +101,8 @@ class EditImageTool(Tool):
             # The user painted this mask for the edit; the model doesn't have to name it.
             args = args.model_copy(update={"mask": options.mask})
         params = sampler_params(ctx)
+        preset = user_preset(options)
+        loras = user_loras(options)
         labels = [*args.images, *([args.mask] if args.mask else [])]
         resolved = await self._resolve(ctx.conversation_id, labels, mask=args.mask)
 
@@ -105,8 +111,10 @@ class EditImageTool(Tool):
             require.add(Capability.MULTI_REF)
         if args.transparent:
             require.add(Capability.RGBA)
+        if loras:
+            require.add(Capability.LORA)
         lease = await self._registry.image_backend(
-            "edit", options.backend if options else None, require=require
+            "edit", options.backend if options else None, require=require, **preset
         )
         backend = lease.backend
         try:
@@ -133,7 +141,7 @@ class EditImageTool(Tool):
             task=JobTask.EDIT,
             backend=backend,
             lease=lease,
-            prompt=args.prompt,
+            prompt=image_prompt(args.prompt),
             negative_prompt=args.negative_prompt,
             seed=args.seed if args.seed is not None else random_seed(),
             n=args.n,
@@ -145,7 +153,14 @@ class EditImageTool(Tool):
             images=tuple(inputs[label] for label in args.images),
             mask=inputs[args.mask] if args.mask else None,
             parents=tuple(parents),
-            requested={**args.model_dump(exclude_none=True), **params},
+            requested={
+                **args.model_dump(exclude_none=True),
+                **params,
+                **preset,
+                **loras_requested(loras),
+            },
+            **preset,
+            loras=loras,
             request_message_id=ctx.message_id,
             tool_call_id=ctx.tool_call_id,
         )

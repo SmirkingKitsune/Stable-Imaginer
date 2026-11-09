@@ -12,18 +12,23 @@
   was never stored (crash, cancellation) is dropped, so chat templates stay valid.
 * With ``orchestration.feed_outputs_to_vision``, images a tool produced are shown to a vision
   model right after the tool result, so it can check its own work.
+* A user message that picks LoRAs (mentions, or ``image_options.loras``) reads with each
+  mention as the LoRA's display name, and a note after it lists them with their trigger
+  words, tags and notes from the LoRA library (``domain/mentions.py``).
 """
 
 import asyncio
 from collections import OrderedDict
-from collections.abc import Sequence
+from collections.abc import Iterable, Mapping, Sequence
 from typing import Any
 
 from imaginer.core.config import ContextConfig
+from imaginer.core.logging import get_logger
 from imaginer.db import models as orm
 from imaginer.db.engine import Database
 from imaginer.db.repositories import artifacts as art_repo
 from imaginer.db.repositories import messages as msg_repo
+from imaginer.domain import mentions
 from imaginer.domain.enums import ArtifactKind, ArtifactSource, MessageStatus, Role
 from imaginer.services.media import encode_for_llm
 from imaginer.storage.base import ArtifactStore
@@ -41,6 +46,9 @@ _SOURCE_WORDS = {
     ArtifactSource.DERIVED: "derived",
 }
 _IMAGE_CACHE_SIZE = 64
+_NO_BRIEFS: dict[str, mentions.LoraBrief] = {}
+
+log = get_logger(__name__)
 
 
 class ContextBuilder:
@@ -57,6 +65,11 @@ class ContextBuilder:
         self._config = config
         self._feed_outputs = feed_outputs_to_vision
         self._image_cache: OrderedDict[tuple[str, int], str] = OrderedDict()
+        self._lora_lookup: mentions.LoraLookup | None = None
+
+    def set_lora_lookup(self, lookup: mentions.LoraLookup) -> None:
+        """Where the LoRAs a message picks get their display names and trigger words."""
+        self._lora_lookup = lookup
 
     async def build(
         self,
@@ -87,19 +100,45 @@ class ContextBuilder:
         )
         answered = _answered_calls(history)
         pixels = self._images_to_show(history, attachments, known) if vision else set()
+        picks = {
+            m.id: (loras, _options(m).get("backend"))
+            for m in history
+            if m.role is Role.USER and (loras := mentions.picked(m.content_text or "", _options(m)))
+        }
+        briefs = await self._briefs(picks.values())
+        guidance = [*tool_guidance, mentions.LLM_GUIDANCE] if picks else tool_guidance
         messages: list[dict[str, Any]] = [
-            {"role": "system", "content": self._system_prompt(manifest, tool_guidance)}
+            {"role": "system", "content": self._system_prompt(manifest, guidance)}
         ]
         for message in history:
             if message.role is Role.TOOL and message.tool_call_id not in answered:
                 continue
             attached = attachments.get(message.id, [])
-            messages.append(await self._render(message, attached, known, pixels, answered))
+            loras, backend = picks.get(message.id, ([], None))
+            known_loras = {n: briefs[(n, backend)] for n, _ in loras if (n, backend) in briefs}
+            rendered = await self._render(
+                message, attached, known, pixels, answered, (loras, known_loras)
+            )
+            messages.append(rendered)
             if message.role is Role.TOOL and self._feed_outputs:
                 shown = [known[a] for a in attached if a in known and a in pixels]
                 if shown:
                     messages.append(await self._tool_images(shown))
         return messages
+
+    async def _briefs(
+        self, picks: Iterable[tuple[list[tuple[str, float]], str | None]]
+    ) -> Mapping[mentions.LoraKey, mentions.LoraBrief]:
+        """What the library knows of the LoRAs the messages pick (nothing, if it fails: the
+        note then names them by their files)."""
+        wanted = {(name, backend) for loras, backend in picks for name, _ in loras}
+        if not wanted or self._lora_lookup is None:
+            return {}
+        try:
+            return await self._lora_lookup(wanted)
+        except Exception:
+            log.exception("context.lora_lookup_failed")
+            return {}
 
     def _system_prompt(self, manifest: list[orm.Artifact], tool_guidance: Sequence[str]) -> str:
         prompt = self._config.system_prompt or DEFAULT_SYSTEM_PROMPT
@@ -137,6 +176,7 @@ class ContextBuilder:
         known: dict[str, orm.Artifact],
         pixels: set[str],
         answered: set[str],
+        loras: tuple[list[tuple[str, float]], Mapping[str, mentions.LoraBrief]] = ([], _NO_BRIEFS),
     ) -> dict[str, Any]:
         text = message.content_text or ""
         if message.role is Role.TOOL:
@@ -148,6 +188,12 @@ class ContextBuilder:
                 rendered["tool_calls"] = calls
             return rendered
 
+        if message.role is Role.USER:
+            picked, briefs = loras
+            # The user's LoRAs: named, not left as "@lora:", and listed after the words.
+            text = mentions.for_llm(text, {n: b.name for n, b in briefs.items()})
+            if picked:
+                text = f"{text}\n\n{mentions.llm_note(picked, briefs)}".strip()
         artifacts = [known[a] for a in attached if a in known]
         if not artifacts:
             return {"role": message.role.value, "content": text}
@@ -184,6 +230,12 @@ class ContextBuilder:
         if len(self._image_cache) > _IMAGE_CACHE_SIZE:
             self._image_cache.popitem(last=False)
         return url
+
+
+def _options(message: orm.Message) -> dict[str, Any]:
+    """The image options a user message was sent with (stored in its metadata)."""
+    options = (message.metadata_json or {}).get("image_options")
+    return options if isinstance(options, dict) else {}
 
 
 def _describe(artifact: orm.Artifact) -> str:

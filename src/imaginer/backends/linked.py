@@ -3,7 +3,9 @@
 The whole model runs on that instance: requests go to ``/v1/peer/engines/{name}/chat`` or
 ``/images`` and come back as server-sent events. Health and capabilities come from the
 peer's status, which the link service polls; the adapter only narrows them by
-``declared_capabilities``.
+``declared_capabilities``. So do the engine's presets and LoRAs: an image request names
+them, and the peer resolves them as it would its own (the image's record then has the
+LoRAs' hashes from there).
 
 A stream is never replayed once it has started: retries happen only until response
 headers arrive (``HttpTransport.stream``), so a reply can't be duplicated. Cancelling the
@@ -30,7 +32,7 @@ from imaginer.backends.base import (
 from imaginer.backends.openai_http.chat import iter_sse_events
 from imaginer.backends.openai_http.transport import HttpTransport
 from imaginer.core.clock import utcnow
-from imaginer.core.config import LinkedBackendConfig
+from imaginer.core.config import ImagePreset, LinkedBackendConfig, LoraRef
 from imaginer.domain import models as dto
 from imaginer.domain.enums import BackendKind, BackendStatus, Capability
 from imaginer.domain.errors import (
@@ -72,6 +74,8 @@ class _LinkedBackend:
         if engine is None:
             return set()
         offered = set(engine.capabilities)
+        if engine.available_loras is None:  # it lists none, or the instance can't take them
+            offered.discard(Capability.LORA)
         declared = self._config.declared_capabilities
         return offered & declared if declared is not None else offered
 
@@ -139,6 +143,31 @@ class LinkedImageBackend(_LinkedBackend):
         engine = self._engine()
         return engine.image_defaults if engine is not None else None
 
+    @property
+    def image_presets(self) -> dict[str, ImagePreset]:
+        """The engine's presets, as the instance that shares it reports them. A request
+        names one, and that instance applies all of it."""
+        engine = self._engine()
+        if engine is None:
+            return {}
+        return {
+            p.name: ImagePreset(
+                description=p.description,
+                loras=[LoraRef(path=x.path, weight=x.weight) for x in p.loras]
+                if p.loras is not None
+                else None,
+                steps=p.steps,
+                cfg_scale=p.cfg_scale,
+                sampler=p.sampler,
+            )
+            for p in engine.image_presets
+        }
+
+    @property
+    def available_loras(self) -> list[str] | None:
+        engine = self._engine()
+        return engine.available_loras if engine is not None else None
+
     async def generate(self, req: GenRequest) -> list[ImageResult]:
         return await self._run("generate", req, (), None)
 
@@ -166,6 +195,10 @@ class LinkedImageBackend(_LinkedBackend):
             "images": [_image(i) for i in images],
             "mask": _image(mask) if mask is not None else None,
         }
+        if req.preset is not None:
+            body["preset"] = req.preset
+        if req.loras:
+            body["loras"] = [{"path": x.path, "weight": x.weight} for x in req.loras]
         results: list[ImageResult] = []
         async with transport.stream("POST", self._path("images"), json=body) as response:
             async for event, data in iter_sse_events(response.aiter_lines()):

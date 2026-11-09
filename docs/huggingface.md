@@ -19,9 +19,19 @@ Hub repos come in a few standard shapes. The server reads the repo's file list (
 | **ComfyUI repackage** | single files under `diffusion_models/`, `vae/`, `text_encoders/` (sometimes inside `split_files/`) | sd-server |
 | **transformers checkpoint** | `config.json`, `model-0000N-of-0000M.safetensors`, `model.safetensors.index.json` | sd-server's `--llm`, through its index, for the text encoders it supports; llama.cpp needs a GGUF conversion, which **Quantized versions of this model** finds |
 | **Loose safetensors** | anything else | sorted by folder and name (`vae`, `text_encoder`, `lora`…) |
+| **LoRA adapter** | a repo the Hub tags `lora` or `base_model:adapter:…`; its weights are LoRAs, whatever they are called, unless a folder (`vae/`…) names another part | the engine's LoRA folder: sd-server's `--lora-model-dir`, Diffusers' `lora_dir` (`.safetensors` only) |
 
-`imatrix` files, LoRAs, ControlNets and pickled weights (`.bin`, `.ckpt`) are listed as files
-that no engine setting loads. When a pipeline's weights are only published as a Diffusers
+**LoRAs** (single files under `loras/`, named `*lora*`, or in an adapter repo) get their own
+**LoRAs** section for an sd-server launched here and for a Diffusers backend (which loads only
+`.safetensors` LoRAs). **Install** puts one in the engine's LoRA folder (`--lora-model-dir`,
+`lora_dir`) as `<folder>/<owner>/<name>/<path in the repo>`, where the engine finds it without
+a restart. An engine with no LoRA folder yet gets `<models_dir>/_loras` with its first LoRA
+(no Hub namespace starts with `_`); an sd-server then needs a restart to load it. A LoRA
+already on this machine, in the models folder or the HF cache, is copied in rather than
+downloaded again (the dialog says so). Apply LoRAs with a preset or from the prompt bar.
+
+`imatrix` files, ControlNets, pickled weights (`.bin`, `.ckpt`), and LoRAs for any other
+engine are listed as files that no engine setting loads. When a pipeline's weights are only published as a Diffusers
 variant (`*.fp16.safetensors`), the dialog says so, because the diffusers backend doesn't
 request a variant by name.
 
@@ -79,6 +89,9 @@ copy a setting already points at, including through a mapped drive or a cache sy
   its `.part` with a range request. Network errors are retried three times this way.
 - LFS files are checked against the SHA-256 the Hub lists. A file that doesn't match is
   deleted and downloaded again.
+- A LoRA install copies a complete copy found on this machine instead of downloading it,
+  checked against the Hub's SHA-256 the same way. A copy that doesn't match, or can't be read,
+  is downloaded instead, and the download says why.
 - All the files of one download (shards, pipeline parts) come from the same commit.
 - Disk space is checked before starting.
 - When a download finishes, it sets the engine setting it was started for. This is the same

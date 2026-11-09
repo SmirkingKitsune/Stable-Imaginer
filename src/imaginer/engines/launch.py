@@ -15,8 +15,10 @@ from pathlib import Path
 from typing import Literal
 from urllib.parse import urlsplit
 
+from imaginer.backends.common import LORA_SCAN_LIMIT, expand_path
 from imaginer.core.config import (
     BackendConfig,
+    DiffusersBackendConfig,
     LlamaCppBackendConfig,
     LlamaCppLaunch,
     SdCppBackendConfig,
@@ -39,6 +41,12 @@ LLAMA_FILES: tuple[tuple[str, str, str], ...] = (
 )
 # Engine type -> the folder its provisioner installs into, under <data_root>/engines.
 RUNTIME_FOLDERS = {"sdcpp": "stable_diffusion_cpp", "llamacpp": "llama_cpp"}
+# Where Hugging Face installs an engine's LoRAs while it has no LoRA folder, in the models
+# folder. No Hub namespace starts with "_", so no repo downloads into it.
+DEFAULT_LORA_FOLDER = "_loras"
+# What sd-server lists as a LoRA: every file with one of these extensions, in subfolders too.
+LORA_EXTENSIONS = frozenset({".safetensors", ".gguf", ".pt", ".pth", ".ckpt", ".sft"})
+TOO_BIG_FOR_A_LORA = 4 * 1024**3
 
 
 class LaunchError(ValueError):
@@ -88,6 +96,76 @@ def check_files(config: BackendConfig) -> list[FileCheck]:
         raw = getattr(launch, key, None) if launch is not None else None
         checks.append(check_file(key, flag, what, Path(raw) if raw else None, engine=config.type))
     return checks
+
+
+@dataclass(frozen=True, slots=True)
+class LoraFolderCheck:
+    path: str | None
+    exists: bool = False
+    count: int | None = None
+    problem: str | None = None
+    warning: str | None = None
+
+
+def default_lora_dir(settings: Settings) -> Path:
+    return settings.models_dir / DEFAULT_LORA_FOLDER
+
+
+def configured_lora_dir(config: SdCppBackendConfig | DiffusersBackendConfig) -> Path | None:
+    """The engine's LoRA folder as set: an sd-server's --lora-model-dir, a Diffusers
+    backend's lora_dir."""
+    if isinstance(config, DiffusersBackendConfig):
+        return config.lora_dir
+    return config.launch.lora_model_dir if config.launch is not None else None
+
+
+def lora_dir(config: SdCppBackendConfig | DiffusersBackendConfig, settings: Settings) -> Path:
+    """Where the engine's LoRAs are: its LoRA folder, else where they would go."""
+    configured = configured_lora_dir(config)
+    return expand(configured) if configured is not None else default_lora_dir(settings)
+
+
+expand = expand_path
+
+
+def check_lora_folder(
+    path: Path | None, extensions: frozenset[str] = LORA_EXTENSIONS
+) -> LoraFolderCheck:
+    """An engine's LoRA folder: how many LoRAs it lists from it (files with one of
+    ``extensions``), and anything in it that isn't one (a whole diffusion model in it
+    would be listed as a LoRA too)."""
+    if path is None:
+        return LoraFolderCheck(None)
+    folder = expand(path)
+    shown = str(path)
+    if not folder.exists():
+        return LoraFolderCheck(shown, problem="folder not found")
+    if not folder.is_dir():
+        return LoraFolderCheck(shown, exists=True, problem="a file, not a folder")
+    count = seen = 0
+    biggest: tuple[int, str] = (0, "")
+    for root, dirs, names in os.walk(folder, onerror=lambda _: None):
+        dirs.sort()
+        seen += len(dirs) + len(names)
+        if seen > LORA_SCAN_LIMIT:
+            crowded = f"more than {LORA_SCAN_LIMIT} files: keep only LoRAs in this folder"
+            return LoraFolderCheck(shown, exists=True, warning=crowded)
+        for name in names:
+            if Path(name).suffix.lower() not in extensions:
+                continue
+            count += 1
+            try:
+                size = (Path(root) / name).stat().st_size
+            except OSError:
+                continue
+            biggest = max(biggest, (size, name))
+    warning: str | None = None
+    if biggest[0] >= TOO_BIG_FOR_A_LORA:
+        warning = (
+            f"{biggest[1]} ({biggest[0] / 1e9:.1f} GB) is too big for a LoRA, but every "
+            "weights file here is listed as one: keep only LoRAs in this folder"
+        )
+    return LoraFolderCheck(shown, exists=True, count=count, warning=warning)
 
 
 def check_file(
@@ -235,8 +313,22 @@ def command(config: BackendConfig, exe: Path) -> list[str]:
     for check in checks:
         if check.path is not None:
             argv += [check.flag, str(Path(os.path.expandvars(check.path)).expanduser())]
+    if isinstance(launch, SdCppLaunch):
+        argv += _lora_args(launch)
     if isinstance(config, SdCppBackendConfig):
         argv += ["--listen-ip", host, "--listen-port", str(port)]
     else:
         argv += ["--host", host, "--port", str(port)]
     return argv + list(launch.extra_args)
+
+
+def _lora_args(launch: SdCppLaunch) -> list[str]:
+    args = []
+    if launch.lora_model_dir is not None:
+        folder = expand(launch.lora_model_dir)
+        if not folder.is_dir():
+            raise LaunchError(f"--lora-model-dir {launch.lora_model_dir}: folder not found")
+        args += ["--lora-model-dir", str(folder)]
+    if launch.lora_apply_mode is not None:
+        args += ["--lora-apply-mode", launch.lora_apply_mode]
+    return args

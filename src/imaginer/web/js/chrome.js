@@ -136,6 +136,9 @@ export function connectionStrip({ onReload = null, turnRunning = () => false } =
 /** "C:\…\Qwen3VL-8B-Instruct-UD-Q4_K_XL.gguf" → "qwen3vl-8b-instruct" */
 export function modelName(model) {
   if (!model) return '';
+  // A Hugging Face cache snapshot (.../models--Owner--Name/snapshots/<commit>) by its repo.
+  const cached = model.match(/[\\/]models--[^\\/]+--([^\\/]+)[\\/]snapshots[\\/][0-9a-f]{40}[\\/]?$/i);
+  if (cached) return cached[1].toLowerCase();
   return model.split(/[\\/]/).pop()
     .replace(/\.(gguf|safetensors)$/i, '')
     .replace(/-\d{5}-of-\d{5}$/i, '')

@@ -21,6 +21,7 @@ from imaginer.domain.enums import (
 
 SEED_MAX = 2**31 - 1  # portable across engines (sd.cpp int64, torch generators)
 AspectRatio = Literal["1:1", "4:3", "3:4", "3:2", "2:3", "16:9", "9:16"]
+PRESET_PATTERN = r"^[a-z0-9][a-z0-9_-]{0,31}$"  # an image backend's preset name
 
 
 class _Input(BaseModel):
@@ -95,6 +96,22 @@ class MessagePage(BaseModel):
     has_more: bool
 
 
+MAX_LORA_PICKS = 8
+
+
+class LoraPick(_Input):
+    """A LoRA the user adds to one message's images."""
+
+    path: str = Field(
+        min_length=1,
+        max_length=1024,
+        description="As the image backend lists it (available_loras), or its file name or name.",
+    )
+    weight: float = Field(
+        default=1.0, ge=-10, le=10, description="Its strength; 0 turns off a preset's LoRA."
+    )
+
+
 class ImageRequestOptions(_Input):
     """Image settings the user picked for one message. Each one that is set overrides what
     the model asks for in every image tool call of that turn."""
@@ -127,6 +144,17 @@ class ImageRequestOptions(_Input):
     )
     backend: str | None = Field(
         default=None, description="Image backend to use instead of the configured default."
+    )
+    preset: str | None = Field(
+        default=None,
+        pattern=PRESET_PATTERN,
+        description="One of the image backend's presets (its LoRAs and sampler settings).",
+    )
+    loras: list[LoraPick] | None = Field(
+        default=None,
+        max_length=MAX_LORA_PICKS,
+        description="LoRAs to apply on top of the preset's (or the backend's default ones). "
+        "One the preset already applies gets this weight instead.",
     )
 
     @model_validator(mode="after")
@@ -337,6 +365,11 @@ class Job(BaseModel):
 # --- backends / health --------------------------------------------------------
 
 
+class LoraInfo(BaseModel):
+    path: str
+    weight: float
+
+
 class ImageDefaultsInfo(BaseModel):
     """What an image backend uses when a request leaves a setting open."""
 
@@ -346,6 +379,19 @@ class ImageDefaultsInfo(BaseModel):
     cfg_scale: float | None
     sampler: str | None
     size_multiple: int
+    loras: list[LoraInfo] = Field(default_factory=list)
+
+
+class ImagePresetInfo(BaseModel):
+    """Settings a message can pick with ``image_options.preset``. Null fields keep the
+    backend's defaults; ``loras`` null keeps the default LoRAs."""
+
+    name: str
+    description: str
+    loras: list[LoraInfo] | None
+    steps: int | None
+    cfg_scale: float | None
+    sampler: str | None
 
 
 class BackendInfo(BaseModel):
@@ -364,6 +410,13 @@ class BackendInfo(BaseModel):
     probed_at: datetime | None = None
     image_defaults: ImageDefaultsInfo | None = Field(
         default=None, description="Image backends: the settings used when a request omits them."
+    )
+    image_presets: list[ImagePresetInfo] = Field(
+        default_factory=list, description="Image backends: presets a message can pick."
+    )
+    available_loras: list[str] | None = Field(
+        default=None,
+        description="LoRAs the engine can apply, as paths for presets; null if it doesn't say.",
     )
 
 
@@ -386,6 +439,28 @@ class EngineFile(BaseModel):
     size_bytes: int | None = None
     format: Literal["gguf", "safetensors", "unknown"] | None = None
     problem: str | None = Field(default=None, description="Why it can't be used, if it can't.")
+
+
+LoraApplyMode = Literal["auto", "immediately", "at_runtime"]
+
+
+class EngineLoraFolder(BaseModel):
+    """An image engine's LoRA folder, checked on disk: an sd-server's ``--lora-model-dir``,
+    a Diffusers backend's ``lora_dir``."""
+
+    path: str | None = Field(description="Null: not set, so the engine applies no LoRAs.")
+    exists: bool = False
+    count: int | None = Field(
+        default=None, description="LoRA files in it, subfolders included (what the engine lists)."
+    )
+    problem: str | None = Field(default=None, description="Why it can't be used, if it can't.")
+    warning: str | None = Field(
+        default=None, description="Something in it the engine would wrongly list as a LoRA."
+    )
+    apply_mode: LoraApplyMode | None = Field(
+        default=None, description="sd-server only; null: its auto."
+    )
+    default_path: str = Field(description="Where Hugging Face installs LoRAs while it isn't set.")
 
 
 class EngineLogLine(BaseModel):
@@ -455,6 +530,9 @@ class EngineInfo(BaseModel):
     loopback: bool = False
     launchable: bool = Field(description="It has launch settings, so it can be started here.")
     files: list[EngineFile] = Field(default_factory=list)
+    loras: EngineLoraFolder | None = Field(
+        default=None, description="sd-server engines launched here: the folder of LoRAs."
+    )
     model_id: str | None = Field(
         default=None, description="Diffusers backends: a Hub repo id or a local folder."
     )
@@ -476,6 +554,12 @@ class EngineLaunchUpdate(_Input):
     extra_args: list[str] | None = None
     autostart: bool | None = None
     executable: str | None = None
+    lora_model_dir: str | None = Field(
+        default=None, max_length=1024, description="sd-server's LoRA folder; empty clears it."
+    )
+    lora_apply_mode: LoraApplyMode | Literal[""] | None = Field(
+        default=None, description="sd-server's --lora-apply-mode; empty: its default (auto)."
+    )
 
 
 class EngineUpdate(_Input):
@@ -490,6 +574,20 @@ class EngineUpdate(_Input):
         min_length=1,
         max_length=1024,
         description="Diffusers backends: a Hub repo id or a local folder.",
+    )
+    lora_dir: str | None = Field(
+        default=None,
+        max_length=1024,
+        description="Diffusers backends: the LoRA folder, made if it isn't there; empty: none. "
+        "(An sd-server's is launch.lora_model_dir.)",
+    )
+    presets: dict[str, dict[str, Any]] | None = Field(
+        default=None,
+        description="Image backends: presets to add or change, by name, each merged over the "
+        "one it replaces (a preset's loras list is replaced whole).",
+    )
+    default_loras: list[LoraPick] | None = Field(
+        default=None, description="Image backends: defaults.loras, applied to every image."
     )
 
 
@@ -535,7 +633,9 @@ class HubRepoSummary(BaseModel):
 class HubLocal(BaseModel):
     """A copy already on this machine."""
 
-    source: Literal["models_dir", "hf_cache"]
+    source: Literal["models_dir", "hf_cache", "lora_dir"] = Field(
+        description="lora_dir: a LoRA, installed in the engine's LoRA folder."
+    )
     path: str = Field(description="The first file, or the folder for a Diffusers pipeline.")
     in_use: list[str] = Field(
         default_factory=list, description="'<engine>.<setting>' already pointed at it."
@@ -560,6 +660,11 @@ class HubVariant(BaseModel):
     files: list[HubFile] = Field(description="Everything to download, the entry first.")
     local: HubLocal | None = None
     partial_bytes: int = Field(default=0, description="Already in the models folder.")
+    copy_from: HubLocal | None = Field(
+        default=None,
+        description="A LoRA not in the LoRA folder yet: a copy elsewhere on this machine, "
+        "which installing copies instead of downloading.",
+    )
 
 
 class HubPipeline(BaseModel):
@@ -584,6 +689,11 @@ class HubRole(BaseModel):
     current: str | None = Field(default=None, description="What it is set to now.")
     candidates: list[str] = Field(default_factory=list, description="Variant ids.")
     suggested: str | None = None
+    folder: str | None = Field(
+        default=None,
+        description="The lora role: the folder a LoRA is installed into (the engine's LoRA "
+        "folder, or the one it gets on the first install).",
+    )
 
 
 class HubRepo(BaseModel):
@@ -667,6 +777,14 @@ class SharedEngine(BaseModel):
     capabilities: list[Capability]
     max_ref_images: int | None = None
     image_defaults: ImageDefaultsInfo | None = None
+    image_presets: list[ImagePresetInfo] = Field(
+        default_factory=list, description="Presets a request can name."
+    )
+    available_loras: list[str] | None = Field(
+        default=None,
+        description="LoRAs a request can name (empty for a stopped engine: listed once it "
+        "is up). Null: it takes none, or the instance is too old to take them.",
+    )
     queue_depth: int = Field(default=0, description="Image requests waiting for or using it.")
     availability: EngineAvailability
 
@@ -852,3 +970,194 @@ class PeerImageRequest(_Input):
     params: dict[str, Any] = Field(default_factory=dict)
     images: list[PeerImage] = Field(default_factory=list, max_length=32)
     mask: PeerImage | None = None
+    # Sent only when set, so an instance that predates them still takes every other request.
+    preset: str | None = Field(default=None, pattern=PRESET_PATTERN)
+    loras: list[LoraPick] = Field(
+        default_factory=list,
+        max_length=MAX_LORA_PICKS,
+        description="On top of the preset's (or default) LoRAs, as image_options.loras.",
+    )
+
+
+# --- the LoRA library -------------------------------------------------------------------
+
+CompatState = Literal["ok", "maybe", "no", "unknown"]
+CompatCall = Literal["auto", "works", "no"]
+
+
+class LoraTrigger(BaseModel):
+    text: str = Field(min_length=1, max_length=200)
+    on: bool = True
+
+
+class LoraEngineUse(BaseModel):
+    """How one engine names a LoRA, and whether it works with that engine's model."""
+
+    engine: str
+    path: str = Field(description="As the engine lists it: what presets and requests name.")
+    model: str | None = Field(default=None, description="The model's key (LoraModel.key).")
+    compat: CompatState
+
+
+class LoraCompat(BaseModel):
+    """The LoRA's standing across the engines that list it."""
+
+    state: CompatState = Field(description="The best of its engines': ok, maybe, unknown, no.")
+    text: str = Field(description='"sdcpp, diffusers", "applied on nas", "SDXL".')
+    bad: str | None = Field(default=None, description="Why it works with none of them.")
+
+
+class LoraCover(BaseModel):
+    url: str
+    source: str = Field(description='"img-12 · Clay foxes in a garden", "Hugging Face".')
+    width: int | None = None
+    height: int | None = None
+    conversation_id: str | None = None
+    artifact_id: str | None = None
+
+
+class LoraSourceInfo(BaseModel):
+    repo: str
+    revision: str | None = None
+    url: str
+    has_images: bool = False
+
+
+class LoraItem(BaseModel):
+    id: str = Field(description="The file's SHA-256, or an id for one only listed by name.")
+    name: str = Field(description="The display name: the user's, else the file's name.")
+    custom_name: bool = False
+    file_name: str
+    path: str = Field(description="Relative to its LoRA folder, or as its engine lists it.")
+    folder: str = Field(description='Its folder in the LoRA folder, "" at the top.')
+    root: str | None = Field(default=None, description="The LoRA folder it is in, if here.")
+    local: bool = Field(description="Its file is on this machine.")
+    origin: str | None = Field(default=None, description="The linked instance it lives on.")
+    size_bytes: int | None = None
+    sha256: str | None = None
+    modified_at: datetime | None = None
+    engines: list[LoraEngineUse]
+    triggers: list[LoraTrigger]
+    default_weight: float = 1.0
+    tags: list[str] = Field(default_factory=list)
+    pinned: bool = False
+    notes: str = ""
+    cover: LoraCover | None = None
+    source: LoraSourceInfo | None = None
+    compat: LoraCompat
+    uses: int = Field(default=0, description="Images made with it.")
+    conversations: int = 0
+    last_used_at: datetime | None = None
+
+
+class LoraModel(BaseModel):
+    """A model one of the image engines runs (or one the user made a call on)."""
+
+    key: str
+    name: str
+    quant: str | None = None
+    engines: list[str] = Field(default_factory=list)
+    where: str
+    loaded: bool = False
+    checkable: bool = Field(default=False, description="Its weights' names can be read here.")
+
+
+class LoraLibrary(BaseModel):
+    items: list[LoraItem]
+    models: list[LoraModel]
+    tags: list[str] = Field(description="Every tag in use, most used first.")
+    folders: list[str]
+    roots: list[str] = Field(description="The LoRA folders on this machine.")
+    total_bytes: int = 0
+    local_count: int = 0
+    origins: dict[str, int] = Field(default_factory=dict, description="Linked instance: count.")
+
+
+class LoraModelCompat(BaseModel):
+    key: str
+    name: str
+    where: str
+    loaded: bool = False
+    detected: CompatState
+    detected_text: str
+    call: CompatCall = "auto"
+    state: CompatState = Field(description="The user's call, else what was detected.")
+
+
+class LoraPresetUse(BaseModel):
+    engine: str
+    name: str
+    description: str = ""
+    included: bool
+    weight: float | None = None
+    meta: str = Field(default="", description="Its other LoRAs, steps and CFG.")
+
+
+class LoraUseImage(BaseModel):
+    conversation_id: str
+    title: str | None
+    images: int
+    weight: float | None = None
+    last_used_at: datetime
+    artifact: Artifact | None = Field(default=None, description="The latest image made with it.")
+
+
+class LoraFileInfo(BaseModel):
+    path: str
+    root: str
+    engines: list[str]
+    size_bytes: int
+    hashed_at: datetime | None = None
+
+
+class LoraDetail(LoraItem):
+    compat_models: list[LoraModelCompat]
+    lineage: str = ""
+    lineage_default: str = ""
+    presets: list[LoraPresetUse]
+    used_in: list[LoraUseImage] = Field(description="Conversations, newest use first.")
+    recent_images: list[Artifact] = Field(description="Images made with it, newest first.")
+    files: list[LoraFileInfo]
+    format: str | None = None
+    rank: int | None = None
+    base: str | None = Field(default=None, description="The model it says it was made for.")
+    triggers_from: str | None = Field(
+        default=None, description="Where its trigger words came from, until edited."
+    )
+    file_triggers: list[str] = Field(default_factory=list)
+
+
+class LoraUpdate(_Input):
+    """Only fields present are changed. An empty name goes back to the file's;
+    reset_triggers goes back to the words the file names."""
+
+    name: str | None = Field(default=None, max_length=120)
+    default_weight: float | None = Field(default=None, ge=-10, le=10)
+    triggers: list[LoraTrigger] | None = Field(default=None, max_length=24)
+    reset_triggers: bool = False
+    notes: str | None = Field(default=None, max_length=4000)
+    tags: list[str] | None = Field(default=None, max_length=24)
+    pinned: bool | None = None
+    compat: dict[str, CompatCall] | None = Field(
+        default=None, description="Model key: auto (detected), works or no."
+    )
+    lineage: str | None = Field(default=None, max_length=120)
+
+
+class LoraMove(_Input):
+    folder: str = Field(max_length=512, description='Relative to its LoRA folder; "" for the top.')
+
+
+class LoraCoverSet(_Input):
+    artifact_id: str | None = Field(default=None, max_length=36)
+    hub: bool = Field(default=False, description="The first image on its Hub card.")
+
+
+class LoraPresetSet(_Input):
+    engine: str = Field(min_length=1, max_length=64)
+    preset: str = Field(pattern=PRESET_PATTERN)
+    weight: float | None = Field(
+        default=None, ge=-10, le=10, description="Null takes the LoRA out of the preset."
+    )
+    create: bool = Field(default=False, description="Make the preset (with the defaults' LoRAs).")
+    description: str = Field(default="", max_length=200)

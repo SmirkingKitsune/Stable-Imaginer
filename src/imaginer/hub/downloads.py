@@ -10,12 +10,17 @@
 * Two jobs run at once and the rest wait. Asking again for something that is already being
   downloaded joins that job, and only adds where its result goes.
 * Files are written from worker threads: a multi-gigabyte download never blocks the loop.
+* A job can name a copy already on this machine (a LoRA in the HF cache): its files are
+  copied from there, checked against the Hub's SHA-256 like a download, and any that is
+  missing, different or unreadable is downloaded instead.
 """
 
 import asyncio
+import contextlib
 import hashlib
 import os
 import shutil
+import threading
 import time
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
@@ -54,6 +59,7 @@ class DownloadJob:
     root: Path  # <models_dir>/<owner>/<name>
     target: Path  # what an engine is pointed at: the first file, or root for a pipeline
     assign: list[tuple[str, str]] = field(default_factory=list)  # (engine, launch setting)
+    source: Path | None = None  # a local copy's root, copied from instead of downloading
     state: DownloadState = "queued"
     total_bytes: int = 0
     done_bytes: int = 0
@@ -76,6 +82,10 @@ Finished = Callable[[DownloadJob], Awaitable[None]]
 
 class _Transient(Exception):
     """Worth another try, resuming where the last one stopped."""
+
+
+class _Stopped(Exception):
+    """A copy was stopped because its job was cancelled."""
 
 
 class DownloadManager:
@@ -124,6 +134,7 @@ class DownloadManager:
         root: Path,
         target: Path,
         assign: tuple[str, str] | None = None,
+        source: Path | None = None,
     ) -> DownloadJob:
         for job in self._jobs.values():
             if job.active and job.target == target:
@@ -140,13 +151,20 @@ class DownloadManager:
             root=root,
             target=target,
             assign=[assign] if assign is not None else [],
+            source=source,
             total_bytes=sum(f.size or 0 for f in files),
         )
         self._jobs[job.id] = job
         self._prune()
         self._tasks[job.id] = asyncio.create_task(self._run(job), name=f"download-{job.id}")
         self._publish(job)
-        log.info("hub.download_started", repo=repo_id, label=label, files=len(files))
+        log.info(
+            "hub.download_started",
+            repo=repo_id,
+            label=label,
+            files=len(files),
+            copy_from=str(source) if source else None,
+        )
         return job
 
     def cancel(self, job_id: str) -> DownloadJob:
@@ -236,6 +254,10 @@ class DownloadManager:
                 return have
             part = dest.with_name(dest.name + PART_SUFFIX)
             await asyncio.to_thread(dest.parent.mkdir, parents=True, exist_ok=True)
+            if job.source is not None:
+                copied = await self._copy(job, f, done, dest, part)
+                if copied is not None:
+                    return copied
             offset = await asyncio.to_thread(_size, part) or 0
             if f.size is not None and offset > f.size:
                 offset = 0
@@ -258,6 +280,56 @@ class DownloadManager:
             await asyncio.to_thread(os.replace, part, dest)
             job.done_bytes = done + got
             return got
+
+    async def _copy(
+        self, job: DownloadJob, f: RepoFile, done: int, dest: Path, part: Path
+    ) -> int | None:
+        """Copy one file from the job's local copy; returns its size, or None to download
+        it instead (it isn't there at the Hub's size, can't be read, or doesn't match)."""
+        assert job.source is not None
+        src = job.source / safe_relpath(f.path)
+        size = await asyncio.to_thread(_size, src)
+        if size is None or (f.size is not None and size != f.size):
+            return None
+        hasher = hashlib.sha256() if f.sha256 else None
+        stop = threading.Event()
+
+        def run() -> None:
+            with src.open("rb") as fh, part.open("wb") as sink:
+                copied = 0
+                while block := fh.read(CHUNK_BYTES * 8):
+                    if stop.is_set():
+                        raise _Stopped
+                    _write(sink, hasher, block)
+                    copied += len(block)
+                    job.done_bytes = done + copied  # read by the loop as it publishes
+
+        work = asyncio.ensure_future(asyncio.to_thread(run))
+        last_at, last_bytes = time.monotonic(), job.done_bytes
+        try:
+            while not work.done():
+                await asyncio.wait([work], timeout=PUBLISH_EVERY_S)
+                now, got = time.monotonic(), job.done_bytes
+                job.speed_bps = (got - last_bytes) / max(now - last_at, 1e-6)
+                last_at, last_bytes = now, got
+                self._publish(job)
+            work.result()
+        except asyncio.CancelledError:
+            stop.set()
+            with contextlib.suppress(BaseException):
+                await work  # the file is closed before the job counts as cancelled
+            raise
+        except OSError as exc:
+            job.warning = f"couldn't copy {f.path} ({exc}); downloading it"
+            await asyncio.to_thread(_remove, part)
+            return None
+        if hasher is not None and hasher.hexdigest() != f.sha256:
+            job.warning = f"the copy of {f.path} here doesn't match the Hub's; downloading it"
+            await asyncio.to_thread(_remove, part)
+            return None
+        await asyncio.to_thread(os.replace, part, dest)
+        job.done_bytes = done + size
+        return size
 
     async def _stream(
         self,
@@ -314,6 +386,11 @@ def _size(path: Path) -> int | None:
         return path.stat().st_size
     except OSError:
         return None
+
+
+def _remove(path: Path) -> None:
+    with contextlib.suppress(OSError):
+        path.unlink()
 
 
 def _open(path: Path, append: bool) -> BinaryIO:

@@ -25,12 +25,14 @@ from urllib.parse import urlsplit, urlunsplit
 import yaml
 from pydantic import TypeAdapter, ValidationError
 
+from imaginer.backends import diffusers_inproc
 from imaginer.backends.registry import BackendRegistry
 from imaginer.core.config import (
     BackendConfig,
     ConfigError,
     DiffusersBackendConfig,
     LinkedBackendConfig,
+    SdCppBackendConfig,
     Settings,
     local_overrides_path,
     merge_mappings,
@@ -109,6 +111,7 @@ class EngineService:
             files=[dto.EngineFile(**vars_of(c)) for c in launch.check_files(config)]
             if launch.file_specs(config)
             else [],
+            loras=await asyncio.to_thread(self._loras, config),
             model_id=config.model_id if isinstance(config, DiffusersBackendConfig) else None,
             extra_args=list(launch_cfg.extra_args) if launch_cfg is not None else [],
             autostart=bool(launch_cfg and launch_cfg.autostart),
@@ -117,6 +120,27 @@ class EngineService:
             runtime=self._runtime(config.type) if _local(config) else None,
             install=_install(self.installer.job(config.type)) if _local(config) else None,
             settings_file=str(self._overrides_path()) if self._overrides_path() else None,
+        )
+
+    def _loras(self, config: BackendConfig) -> dto.EngineLoraFolder | None:
+        """The LoRA folder of an engine that has one here: an sd-server launched here, or a
+        Diffusers backend (which lists only .safetensors files)."""
+        if isinstance(config, DiffusersBackendConfig):
+            check = launch.check_lora_folder(config.lora_dir, diffusers_inproc.LORA_EXTENSIONS)
+            mode = None
+        elif isinstance(config, SdCppBackendConfig) and config.launch is not None:
+            check = launch.check_lora_folder(config.launch.lora_model_dir)
+            mode = config.launch.lora_apply_mode
+        else:
+            return None
+        return dto.EngineLoraFolder(
+            path=check.path,
+            exists=check.exists,
+            count=check.count,
+            problem=check.problem,
+            warning=check.warning,
+            apply_mode=mode,
+            default_path=str(launch.default_lora_dir(self._settings)),
         )
 
     def executable(self, config: BackendConfig) -> Path | None:
@@ -286,11 +310,30 @@ class EngineService:
                 block["autostart"] = body.launch.autostart
             if body.launch.executable is not None:
                 block["executable"] = body.launch.executable.strip() or None
+            block |= await _lora_settings(config, body.launch)
             patch["launch"] = block
         if body.model_id is not None:
             if not isinstance(config, DiffusersBackendConfig):
                 raise InvalidRequestError(f"{name} is not a Diffusers backend; it has no model_id")
             patch["model_id"] = body.model_id.strip()
+        if body.lora_dir is not None:
+            if not isinstance(config, DiffusersBackendConfig):
+                raise InvalidRequestError(
+                    f"{name} is not a Diffusers backend: an sd-server's LoRA folder is "
+                    "launch.lora_model_dir"
+                )
+            text = body.lora_dir.strip()
+            if text:
+                await asyncio.to_thread(_make_lora_folder, text)
+            patch["lora_dir"] = text or None
+        if body.presets is not None or body.default_loras is not None:
+            if not isinstance(config, SdCppBackendConfig | DiffusersBackendConfig):
+                raise InvalidRequestError(f"{name} has no presets or default LoRAs")
+            if body.presets is not None:
+                patch["presets"] = body.presets
+            if body.default_loras is not None:
+                loras = [lora.model_dump() for lora in body.default_loras]
+                patch["defaults"] = {"loras": loras}
         if not patch:
             return
 
@@ -399,6 +442,36 @@ class EngineService:
         # and finishes or undoes the runtime swap, and the process must not exit before.
         await self.installer.aclose()
         await self.supervisor.aclose()
+
+
+async def _lora_settings(config: BackendConfig, body: dto.EngineLaunchUpdate) -> dict[str, Any]:
+    """An sd-server's LoRA folder and apply mode from the screen. A folder that isn't
+    there yet is made, so Hugging Face can install LoRAs into it."""
+    if body.lora_model_dir is None and body.lora_apply_mode is None:
+        return {}
+    if not isinstance(config, SdCppBackendConfig):
+        raise InvalidRequestError(f"{config.type} engines take no LoRAs")
+    block: dict[str, Any] = {}
+    if body.lora_apply_mode is not None:
+        block["lora_apply_mode"] = body.lora_apply_mode or None
+    if body.lora_model_dir is not None:
+        text = body.lora_model_dir.strip()
+        if text:
+            await asyncio.to_thread(_make_lora_folder, text)
+        block["lora_model_dir"] = text or None
+    return block
+
+
+def _make_lora_folder(text: str) -> None:
+    folder = launch.expand(text)
+    if not folder.is_absolute():
+        raise InvalidRequestError("the LoRA folder must be an absolute path")
+    if folder.exists() and not folder.is_dir():
+        raise InvalidRequestError(f"{folder} is a file, not a folder")
+    try:
+        folder.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        raise InvalidRequestError(f"can't make the LoRA folder {folder}: {exc}") from exc
 
 
 def _local(config: BackendConfig) -> bool:

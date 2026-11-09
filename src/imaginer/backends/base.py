@@ -9,6 +9,7 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any, Protocol
 
+from imaginer.core.config import LoraRef
 from imaginer.domain.enums import BackendStatus, Capability
 
 __all__ = [
@@ -71,6 +72,8 @@ class GenRequest:
     height: int | None = None
     aspect_ratio: str | None = None  # one of sizing.ASPECT_RATIOS
     alpha: bool = False  # transparent (RGBA) output; requires Capability.RGBA
+    preset: str | None = None  # one of the backend's configured presets; params win over it
+    loras: tuple[LoraRef, ...] = ()  # added to the preset's (or default) LoRAs; these win
     params: dict[str, Any] = field(default_factory=dict)  # per-request sampler overrides
     on_progress: ProgressCallback | None = None
     on_submitted: SubmittedCallback | None = None

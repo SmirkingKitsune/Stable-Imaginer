@@ -24,6 +24,7 @@ from pydantic_settings import (
 )
 
 from imaginer.domain.enums import BackendKind, Capability
+from imaginer.domain.models import PRESET_PATTERN
 
 PROFILE_ENV = "IMAGINER_PROFILE"
 CONFIG_DIR_ENV = "IMAGINER_CONFIG_DIR"
@@ -95,6 +96,21 @@ class RetryConfig(_Strict):
     backoff_max_s: float = Field(default=8.0, ge=0)
 
 
+class LoraRef(_Strict):
+    """One LoRA to apply. ``path`` names it as the engine lists it (``available_loras``):
+    for sd-server, a path from the ``loras`` of ``GET /sdcpp/v1/capabilities`` (relative to
+    ``--lora-model-dir``); for Diffusers, its path in ``lora_dir``. Its file name, or its
+    name without the extension, also works when only one LoRA has it."""
+
+    path: str = Field(min_length=1, max_length=1024)
+    weight: float = Field(
+        default=1.0,
+        ge=-10,
+        le=10,
+        description="Its strength: sd.cpp's multiplier, the adapter weight in Diffusers.",
+    )
+
+
 class ImageDefaults(_Strict):
     """Per-backend sampler defaults. Engines disagree on good values for the same model."""
 
@@ -108,11 +124,35 @@ class ImageDefaults(_Strict):
     sigmas: list[float] | str | None = Field(
         default=None, description="Explicit sigma list, or an engine preset name."
     )
+    loras: list[LoraRef] = Field(
+        default_factory=list, description="Applied to every image unless a preset says otherwise."
+    )
     negative_prompt: str = ""
     output_format: Literal["png", "webp", "jpeg"] = "png"
     extra: dict[str, Any] = Field(
         default_factory=dict, description="Engine-specific fields passed through verbatim."
     )
+
+
+class ImagePreset(_Strict):
+    """Named settings the user can pick for a message, e.g. a step-distill LoRA together with
+    the steps and CFG it was made for. Unset fields keep the backend's defaults, except that
+    steps without sigmas drop the default sigmas (a schedule sets the step count). Steps or
+    CFG the user sets still win. The quality check leaves the steps and CFG a preset sets."""
+
+    description: str = Field(default="", max_length=200, description="Shown where it's picked.")
+    loras: list[LoraRef] | None = Field(
+        default=None, description="Instead of defaults.loras ([] for none). Unset: keep them."
+    )
+    steps: int | None = Field(default=None, ge=1)
+    cfg_scale: float | None = None
+    sampler: str | None = None
+    scheduler: str | None = None
+    flow_shift: float | None = None
+    sigmas: list[float] | str | None = None
+
+
+ImagePresets = dict[Annotated[str, Field(pattern=PRESET_PATTERN)], ImagePreset]
 
 
 class _HttpBackend(_Strict):
@@ -162,6 +202,16 @@ class SdCppLaunch(_Launch):
     llm_vision: Path | None = Field(
         default=None, description="--llm_vision: needed for edit and multi_ref"
     )
+    lora_model_dir: Path | None = Field(
+        default=None,
+        description="--lora-model-dir: the folder whose LoRAs (searched recursively) requests "
+        "may apply. Keep only LoRAs in it: sd-server lists every weights file there as one.",
+    )
+    lora_apply_mode: Literal["auto", "immediately", "at_runtime"] | None = Field(
+        default=None,
+        description="--lora-apply-mode. auto (sd-server's default) applies at runtime when the "
+        "model is quantized, else merges the LoRA into the weights.",
+    )
 
 
 class LlamaCppBackendConfig(_HttpBackend):
@@ -184,6 +234,9 @@ class SdCppBackendConfig(_HttpBackend):
         default=32, ge=8, description="Qwen-Image-2.1 needs multiples of 32."
     )
     defaults: ImageDefaults = Field(default_factory=ImageDefaults)
+    presets: ImagePresets = Field(
+        default_factory=dict, description="Named settings a message can pick (image_options)."
+    )
     rgba_prompt_template: str = DEFAULT_RGBA_PROMPT_TEMPLATE
     mask_instruction: str = DEFAULT_MASK_INSTRUCTION
     max_ref_pixels: int | None = Field(
@@ -217,6 +270,14 @@ class DiffusersBackendConfig(_Strict):
     size_multiple: int = Field(default=32, ge=8)
     declared_capabilities: set[Capability] | None = None
     defaults: ImageDefaults = Field(default_factory=lambda: ImageDefaults(steps=40, cfg_scale=1.0))
+    presets: ImagePresets = Field(
+        default_factory=dict, description="Named settings a message can pick."
+    )
+    lora_dir: Path | None = Field(
+        default=None,
+        description="The folder whose LoRAs (.safetensors, subfolders too) requests may "
+        "apply, by their path in it. Changing it doesn't reload the model. Needs peft.",
+    )
     rgba_prompt_template: str = DEFAULT_RGBA_PROMPT_TEMPLATE
     mask_instruction: str = DEFAULT_MASK_INSTRUCTION
     max_ref_pixels: int | None = Field(default=None, gt=0)

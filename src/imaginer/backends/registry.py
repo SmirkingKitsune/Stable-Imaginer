@@ -20,6 +20,7 @@ from dataclasses import dataclass, field
 from typing import Any, Literal, cast
 
 from imaginer.backends.base import BackendHealth, ImageBackend, LLMBackend
+from imaginer.backends.common import WordsSource, find_preset, preset_loras
 from imaginer.backends.diffusers_inproc import DiffusersBackend, missing_dependencies
 from imaginer.backends.llamacpp import LlamaCppBackend
 from imaginer.backends.sdcpp import SdCppBackend
@@ -27,15 +28,22 @@ from imaginer.core.clock import utcnow
 from imaginer.core.config import (
     BackendConfig,
     DiffusersBackendConfig,
+    ImagePreset,
     LlamaCppBackendConfig,
+    LoraRef,
     SdCppBackendConfig,
     Settings,
     backend_kind,
 )
 from imaginer.core.logging import get_logger
 from imaginer.domain.enums import BackendKind, BackendStatus, Capability
-from imaginer.domain.errors import CapabilityUnavailableError, EngineUnavailableError
-from imaginer.domain.models import BackendInfo, ImageDefaultsInfo
+from imaginer.domain.errors import (
+    CapabilityUnavailableError,
+    EngineUnavailableError,
+    ImaginerError,
+    InvalidRequestError,
+)
+from imaginer.domain.models import BackendInfo, ImageDefaultsInfo, ImagePresetInfo, LoraInfo
 
 log = get_logger(__name__)
 
@@ -43,8 +51,10 @@ HEALTH_TIMEOUT_S = 5.0
 
 Backend = LLMBackend | ImageBackend
 BackendFactory = Callable[[str, BackendConfig], Backend]
-# Config fields the adapter doesn't read: changing only these keeps the adapter.
+# Config fields the adapter doesn't read: changing only these keeps the adapter. Of the launch
+# settings, sd-server's adapter reads one: the LoRA folder, to hash the LoRAs it applies.
 _NOT_ADAPTER_FIELDS = frozenset({"launch"})
+_ADAPTER_LAUNCH_FIELDS = frozenset({"lora_model_dir"})
 DESCRIBE_MAX_AGE_S = 5.0
 Task = Literal["chat", "t2i", "edit"]
 _TASKS: tuple[Task, ...] = ("chat", "t2i", "edit")
@@ -118,6 +128,19 @@ class BackendRegistry:
         self._leases: dict[int, int] = {}  # id(adapter) -> leases held on it
         self._retired: dict[int, Backend] = {}  # replaced adapters that are still leased
         self._closing: set[asyncio.Task[None]] = set()
+        self._lora_words: WordsSource | None = None
+
+    def set_lora_words(self, words: WordsSource | None) -> None:
+        """Where image adapters get a LoRA's trigger words (the LoRA library), for every
+        adapter there is and every one built later."""
+        self._lora_words = words
+        for entry in self._entries.values():
+            self._attach(entry)
+
+    def _attach(self, entry: _Entry) -> _Entry:
+        if entry.backend is not None and hasattr(entry.backend, "lora_words"):
+            entry.backend.lora_words = self._lora_words
+        return entry
 
     @classmethod
     def from_settings(
@@ -130,17 +153,22 @@ class BackendRegistry:
     def reconfigure(self, name: str, config: BackendConfig) -> bool:
         """Use ``config`` for backend ``name`` from now on (e.g. a new endpoint).
 
-        A change the adapter doesn't read (launch settings) keeps the adapter and its health.
-        Otherwise a new adapter is built and the old one retired: turns and jobs holding a
-        lease on it keep using it, and it is closed once the last of them is done. Returns
-        whether the adapter was replaced.
+        A change the adapter doesn't read (launch settings) keeps the adapter and its health,
+        and so does one it takes as it runs (a Diffusers backend's LoRA folder), which only
+        needs a new probe. Otherwise a new adapter is built and the old one retired: turns
+        and jobs holding a lease on it keep using it, and it is closed once the last of them
+        is done. Returns whether the adapter was replaced.
         """
         old = self._entries[name]
         self._settings.backends[name] = config
         if _adapter_fields(old.config) == _adapter_fields(config):
             old.config = config
             return False
-        self._entries[name] = _build(name, config, self._factories)
+        update = getattr(old.backend, "update_config", None)
+        if callable(update) and update(config):
+            old.config, old.probed_at = config, None  # its last probe no longer counts
+            return False
+        self._entries[name] = self._attach(_build(name, config, self._factories))
         if old.backend is not None:
             self._retire(old.backend)
         return True
@@ -152,13 +180,13 @@ class BackendRegistry:
             self.reconfigure(name, config)
             return
         self._settings.backends[name] = config
-        self._entries[name] = _build(name, config, self._factories)
+        self._entries[name] = self._attach(_build(name, config, self._factories))
 
     def rebuild(self, name: str) -> None:
         """Build a new adapter from the same config, because something it was built from
         changed outside the config (a linked instance's address). Leases keep the old one."""
         old = self._entries[name]
-        self._entries[name] = _build(name, old.config, self._factories)
+        self._entries[name] = self._attach(_build(name, old.config, self._factories))
         if old.backend is not None:
             self._retire(old.backend)
 
@@ -260,20 +288,32 @@ class BackendRegistry:
         name: str | None = None,
         *,
         require: Iterable[Capability] = (),
+        preset: str | None = None,
     ) -> Lease[ImageBackend]:
-        """A lease on the ready image backend; release it when the job is over."""
+        """A lease on the ready image backend; release it when the job is over. ``preset``
+        must be one of its presets; with LoRAs to apply it must also offer ``lora``."""
         base = Capability.T2I if task == "t2i" else Capability.EDIT
-        entry = await self._ready(task, name, BackendKind.IMAGE, {base, *require})
+        entry = await self._ready(task, name, BackendKind.IMAGE, {base, *require}, preset)
         return Lease(self, cast(ImageBackend, entry.backend))
 
     async def _ready(
-        self, task: Task, name: str | None, kind: BackendKind, required: set[Capability]
+        self,
+        task: Task,
+        name: str | None,
+        kind: BackendKind,
+        required: set[Capability],
+        preset: str | None = None,
     ) -> _Entry:
         """The selected backend once it is healthy and capable. If it is reconfigured while
         being probed, the new one is checked instead: no lease starts on a retired adapter."""
         while True:
             entry = self._select(task, name, kind)
-            await self._ensure_ready(entry, required)
+            needs = set(required)
+            if kind is BackendKind.IMAGE:
+                chosen = find_preset(entry.name, _presets(entry), preset)
+                if _loras(entry, chosen):
+                    needs.add(Capability.LORA)
+            await self._ensure_ready(entry, needs)
             if self._entries.get(entry.name) is entry:
                 return entry
 
@@ -281,6 +321,36 @@ class BackendRegistry:
         """Fail now, not mid-turn, if ``name`` is not a usable image backend. Health and
         capabilities are still checked when a tool actually needs it."""
         self._select("t2i", name, BackendKind.IMAGE)
+
+    def validate_image_preset(self, preset: str, name: str | None = None) -> None:
+        """Fail now, not mid-turn, if no image backend the message could use has ``preset``:
+        ``name``, or else the default backends for t2i and edit."""
+        if name is not None:
+            find_preset(name, _presets(self._select("t2i", name, BackendKind.IMAGE)), preset)
+            return
+        candidates = {
+            chosen: entry
+            for task in ("t2i", "edit")
+            if (chosen := self._settings.default_backend(task)) is not None
+            and (entry := self._entries.get(chosen)) is not None
+            and entry.kind is BackendKind.IMAGE
+        }
+        if not any(preset in _presets(entry) for entry in candidates.values()):
+            known = sorted({p for entry in candidates.values() for p in _presets(entry)})
+            where = ", ".join(sorted(candidates)) or "no image backend"
+            raise InvalidRequestError(
+                f"no image preset '{preset}' on {where} (presets: {', '.join(known) or 'none'})",
+                preset=preset,
+            )
+
+    def image_preset(
+        self, task: Literal["t2i", "edit"], name: str | None, preset: str
+    ) -> ImagePreset | None:
+        """The preset as the backend a ``task`` call would use has it; None if it doesn't."""
+        try:
+            return find_preset("", _presets(self._select(task, name, BackendKind.IMAGE)), preset)
+        except ImaginerError:
+            return None
 
     def offers(self, task: Task) -> bool:
         """Whether a request for ``task`` could be routed at all (a built backend exists).
@@ -350,6 +420,17 @@ class BackendRegistry:
             ],
             detail=entry.reason,
             image_defaults=_image_defaults(entry.config, entry.backend),
+            image_presets=[
+                ImagePresetInfo(
+                    name=key,
+                    description=p.description,
+                    loras=_lora_infos(p.loras) if p.loras is not None else None,
+                    steps=p.steps,
+                    cfg_scale=p.cfg_scale,
+                    sampler=p.sampler,
+                )
+                for key, p in _presets(entry).items()
+            ],
         )
         if entry.backend is None:
             return info
@@ -367,6 +448,7 @@ class BackendRegistry:
                 "latency_ms": health.latency_ms,
                 "probed_at": health.probed_at,
                 "capabilities": sorted(entry.backend.capabilities()),
+                "available_loras": getattr(entry.backend, "available_loras", None),
             }
         )
 
@@ -386,7 +468,38 @@ async def _close(backend: Backend) -> None:
 
 
 def _adapter_fields(config: BackendConfig) -> dict[str, Any]:
-    return config.model_dump(exclude=set(_NOT_ADAPTER_FIELDS))
+    fields = config.model_dump(exclude=set(_NOT_ADAPTER_FIELDS))
+    launch = getattr(config, "launch", None)
+    read = set(_ADAPTER_LAUNCH_FIELDS)
+    fields["launch"] = launch.model_dump(include=read, exclude_none=True) if launch else {}
+    return fields
+
+
+def _presets(entry: _Entry) -> dict[str, ImagePreset]:
+    """Its configured presets, or for an engine a linked instance shares, the presets that
+    instance reports."""
+    presets = getattr(entry.config, "presets", None)
+    if isinstance(presets, dict):
+        return presets
+    reported = getattr(entry.backend, "image_presets", None)
+    return reported if isinstance(reported, dict) else {}
+
+
+def _loras(entry: _Entry, preset: ImagePreset | None) -> list[LoraRef]:
+    """The LoRAs a request with ``preset`` applies on this backend."""
+    defaults = getattr(entry.config, "defaults", None)
+    if defaults is not None:
+        return preset_loras(defaults, preset)
+    if preset is not None and preset.loras is not None:
+        return list(preset.loras)
+    reported = getattr(entry.backend, "image_defaults", None)  # a linked instance's engine
+    if not isinstance(reported, ImageDefaultsInfo):
+        return []
+    return [LoraRef(path=x.path, weight=x.weight) for x in reported.loras]
+
+
+def _lora_infos(loras: Iterable[LoraRef]) -> list[LoraInfo]:
+    return [LoraInfo(path=x.path, weight=x.weight) for x in loras]
 
 
 def _image_defaults(config: BackendConfig, backend: Backend | None) -> ImageDefaultsInfo | None:
@@ -402,6 +515,7 @@ def _image_defaults(config: BackendConfig, backend: Backend | None) -> ImageDefa
         cfg_scale=defaults.cfg_scale,
         sampler=defaults.sampler,
         size_multiple=config.size_multiple,  # type: ignore[union-attr]
+        loras=_lora_infos(defaults.loras),
     )
 
 

@@ -31,6 +31,7 @@ from imaginer.backends.base import (
 )
 from imaginer.backends.registry import Lease
 from imaginer.core.clock import utcnow
+from imaginer.core.config import LoraRef
 from imaginer.core.ids import new_id
 from imaginer.core.logging import get_logger
 from imaginer.db import models as orm
@@ -78,6 +79,8 @@ class JobSpec:
     height: int | None = None
     aspect_ratio: str | None = None
     alpha: bool = False
+    preset: str | None = None  # one of the backend's presets
+    loras: tuple[LoraRef, ...] = ()  # the user's, on top of the preset's
     params: dict[str, Any] = field(default_factory=dict)
     images: tuple[ImageInput, ...] = ()  # edit inputs, in order
     mask: ImageInput | None = None
@@ -325,6 +328,8 @@ class JobManager:
             "height": spec.height,
             "aspect_ratio": spec.aspect_ratio,
             "alpha": spec.alpha,
+            "preset": spec.preset,
+            "loras": spec.loras,
             "params": spec.params,
             "on_progress": on_progress,
             "on_submitted": on_submitted,

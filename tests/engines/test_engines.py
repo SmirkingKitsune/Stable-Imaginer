@@ -501,3 +501,79 @@ async def test_settings_without_a_profile_are_not_saved(
             resp = await client.patch("/v1/engines/sd", json={"port": 2000})
             assert resp.json()["settings_file"] is None
             assert resp.json()["base_url"] == "http://127.0.0.1:2000"
+
+
+async def test_the_lora_folder_is_checked_made_and_saved(
+    engines_client: httpx.AsyncClient,
+    profile: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    sd = (await engines_client.get("/v1/engines/sd")).json()
+    assert sd["loras"]["path"] is None
+    assert Path(sd["loras"]["default_path"]).parts[-2:] == ("models", "_loras")
+    assert (await engines_client.get("/v1/engines/remote")).json()["loras"] is None
+
+    folder = tmp_path / "loras"
+    resp = await engines_client.patch(
+        "/v1/engines/sd",
+        json={"launch": {"lora_model_dir": str(folder), "lora_apply_mode": "at_runtime"}},
+    )
+    assert resp.status_code == 200, resp.text
+    loras = resp.json()["loras"]
+    assert folder.is_dir()  # made, ready for LoRAs
+    assert (loras["path"], loras["count"], loras["apply_mode"], loras["problem"]) == (
+        str(folder),
+        0,
+        "at_runtime",
+        None,
+    )
+    saved = yaml.safe_load(local_overrides_path(profile).read_text(encoding="utf-8"))
+    assert saved["backends"]["sd"]["launch"]["lora_model_dir"] == str(folder)
+    assert saved["backends"]["sd"]["launch"]["lora_apply_mode"] == "at_runtime"
+
+    (folder / "style").mkdir()
+    (folder / "style" / "ink.safetensors").write_bytes(b"ink")
+    (folder / "notes.txt").write_text("not a LoRA", encoding="utf-8")
+    (folder / "qwen_image.safetensors").write_bytes(b"x" * 2000)
+    monkeypatch.setattr(launch, "TOO_BIG_FOR_A_LORA", 1000)
+    loras = (await engines_client.get("/v1/engines/sd")).json()["loras"]
+    assert loras["count"] == 2
+    assert "qwen_image.safetensors" in loras["warning"]  # sd-server would list it as a LoRA
+
+    cleared = await engines_client.patch(
+        "/v1/engines/sd", json={"launch": {"lora_model_dir": "", "lora_apply_mode": ""}}
+    )
+    assert (cleared.json()["loras"]["path"], cleared.json()["loras"]["apply_mode"]) == (None, None)
+    relative = await engines_client.patch(
+        "/v1/engines/sd", json={"launch": {"lora_model_dir": "loras"}}
+    )
+    assert relative.status_code == 422 and "absolute" in relative.text
+    llama = await engines_client.patch(
+        "/v1/engines/remote", json={"launch": {"lora_model_dir": str(folder)}}
+    )
+    assert llama.status_code == 422 and "take no LoRAs" in llama.text
+
+
+def test_sd_server_command_with_loras(tmp_path: Path) -> None:
+    (tmp_path / "loras").mkdir()
+    config = sd_config(
+        "http://127.0.0.1:1234",
+        launch=SdCppLaunch(
+            diffusion_model=_gguf(tmp_path / "diff.gguf"),
+            lora_model_dir=tmp_path / "loras",
+            lora_apply_mode="at_runtime",
+        ),
+    )
+    argv = launch.command(config, Path("sd-server"))
+    assert argv[3:7] == [
+        "--lora-model-dir", str(tmp_path / "loras"), "--lora-apply-mode", "at_runtime",
+    ]  # fmt: skip
+    missing = sd_config(
+        "http://127.0.0.1:1234",
+        launch=SdCppLaunch(
+            diffusion_model=_gguf(tmp_path / "diff.gguf"), lora_model_dir=tmp_path / "nope"
+        ),
+    )
+    with pytest.raises(launch.LaunchError, match=r"--lora-model-dir .*: folder not found"):
+        launch.command(missing, Path("sd-server"))

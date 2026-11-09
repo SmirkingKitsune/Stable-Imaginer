@@ -204,6 +204,18 @@ export const api = {
   /** Live `download` events; read them with readEvents. */
   hubEvents: (signal) => request('GET', 'v1/hub/events', { signal, headers: { Accept: 'text/event-stream' } }),
 
+  // --- the LoRA library ---
+  loras: () => getJson('v1/loras'),
+  lora: (id) => getJson(`v1/loras/${id}`),
+  updateLora: (id, patch) => sendJson('PATCH', `v1/loras/${id}`, patch),
+  moveLora: (id, folder) => sendJson('POST', `v1/loras/${id}/move`, { folder }),
+  deleteLora: (id) => sendJson('DELETE', `v1/loras/${id}`),
+  /** {engine, preset, weight (null: out of it), create, description} */
+  loraPreset: (id, body) => sendJson('POST', `v1/loras/${id}/presets`, body),
+  /** {artifact_id} or {hub: true} */
+  setLoraCover: (id, body) => sendJson('PUT', `v1/loras/${id}/cover`, body),
+  clearLoraCover: (id) => sendJson('DELETE', `v1/loras/${id}/cover`),
+
   // --- linked instances ---
   links: () => getJson('v1/links'),
   discovered: () => getJson('v1/links/discovered'),
@@ -266,6 +278,22 @@ const contentOf = (artifact) => at(artifact.conversation_id, rel(artifact.conten
 
 export function setImage(img, artifact) {
   const src = contentOf(artifact);
+  if (!token) {
+    img.src = src;
+    return;
+  }
+  let pending = blobs.get(src);
+  if (!pending) {
+    pending = request('GET', src).then((r) => r.blob()).then((b) => URL.createObjectURL(b));
+    pending.catch(() => blobs.delete(src));
+    blobs.set(src, pending);
+  }
+  pending.then((u) => { img.src = u; }, () => {});
+}
+
+/** An image from this server's own API (a LoRA's cover), with the token when there is one. */
+export function setImageUrl(img, url) {
+  const src = rel(url);
   if (!token) {
     img.src = src;
     return;

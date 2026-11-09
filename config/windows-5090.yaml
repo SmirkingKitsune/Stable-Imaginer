@@ -36,7 +36,7 @@ backends:
     type: sdcpp
     base_url: http://127.0.0.1:1234
     concurrency: 1
-    declared_capabilities: [t2i, edit, multi_ref, rgba]
+    declared_capabilities: [t2i, edit, multi_ref, rgba, lora]
     max_ref_images: 10
     timeouts:
       read: 120
@@ -47,6 +47,14 @@ backends:
       cfg_scale: 6.0
       sampler: euler
       output_format: png
+    # LoRAs: start sd-server with launch.lora_model_dir (a folder of LoRAs only), then pick a
+    # preset in the prompt bar. Each preset's steps and CFG are the ones its LoRA was made for.
+    # presets:
+    #   fast:
+    #     description: 8-step draft
+    #     loras: [{path: p_q_image_2.1_8_steps_v0.1_comfyui_bf16.safetensors}]
+    #     steps: 8
+    #     cfg_scale: 1.0
 
   # Optional in-process reference backend: `uv sync --extra diffusers`, then enable it and point
   # routing.t2i / routing.edit here. Diffusers samples Qwen-Image-2.1 without guidance
@@ -57,6 +65,7 @@ backends:
     model_id: Qwen/Qwen-Image-2.1
     device: cuda:0
     dtype: bfloat16
+    # lora_dir: D:/models/loras  # .safetensors LoRAs; sd-server's folder can be the same one
     defaults:
       width: 2048
       height: 2048

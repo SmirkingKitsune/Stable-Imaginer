@@ -23,6 +23,10 @@ const COMPONENT = {
   text_encoder: 'text encoder', lora: 'LoRA (not loaded here)', other: 'not loaded here',
 };
 const SHOWN = 6; // candidates per setting before "show all"
+const WHERE = { hf_cache: 'in the HF cache', models_dir: 'downloaded', lora_dir: 'in the LoRA folder' };
+/** A LoRA not in the LoRA folder yet, but on this machine: installing copies it. */
+const COPY_FROM = { hf_cache: 'copies from the HF cache', models_dir: 'copies from the models folder' };
+const EXE_WORD = 'sd-server';
 
 const size = (bytes) => (bytes == null ? '' : bytes >= 1e9 ? `${(bytes / 1e9).toFixed(1)} GB`
   : bytes >= 1e6 ? `${Math.round(bytes / 1e6)} MB` : `${Math.max(1, Math.round(bytes / 1e3))} KB`);
@@ -171,8 +175,12 @@ export function hubDialog(e, { ref = null, onChange = () => {} } = {}) {
         ? 'Gated: accept its terms on the Hub with the account whose token this server uses.'
         : 'Gated: accept its terms on the Hub, then set HF_TOKEN (or run `hf auth login`) on this server.')),
       r.notes.map((n) => h('span.tray-hint.wrap', n)));
-    if (e.type === 'diffusers') body.append(pipelineCell(r));
-    else body.append(...r.roles.map((role) => roleCell(r, role)));
+    // A repo of LoRAs fills no model setting: show only its LoRAs, not every empty setting.
+    const loras = r.roles.some((role) => role.key === 'lora' && role.candidates.length);
+    const models = r.roles.some((role) => role.key !== 'lora' && role.candidates.length);
+    if (e.type === 'diffusers' && (r.pipeline || !loras)) body.append(pipelineCell(r));
+    body.append(...r.roles.map((role) => (role.key === 'lora' ? (role.candidates.length ? loraCell(r, role) : null)
+      : e.type === 'diffusers' || (loras && !models) ? null : roleCell(r, role))).filter(Boolean));
     const quantizable = ['transformers', 'diffusers', 'safetensors'].includes(r.kind) || !r.roles.some((x) => x.candidates.length);
     if (quantizable) {
       body.append(h('div', h('button.mini', { type: 'button', onclick: () => quantized(r.id) }, icon('layers', 13), 'Quantized versions of this model')));
@@ -212,7 +220,11 @@ export function hubDialog(e, { ref = null, onChange = () => {} } = {}) {
   function variantRow(r, role, v) {
     const target = `${e.name}.${role.key}`;
     const local = v.local;
-    const where = local ? (local.source === 'hf_cache' ? 'in the HF cache' : 'downloaded') : v.partial_bytes ? `${Math.floor((100 * v.partial_bytes) / v.size_bytes)}% downloaded` : '';
+    const lora = role.key === 'lora';
+    const where = local ? WHERE[local.source] : v.partial_bytes ? `${Math.floor((100 * v.partial_bytes) / v.size_bytes)}% downloaded`
+      : v.copy_from ? h('span', { title: `Install copies it from ${v.copy_from.path}: nothing to download` }, COPY_FROM[v.copy_from.source]) : '';
+    // A LoRA is used by being in the folder: installed is all there is to it.
+    const installed = lora && local && !activeJob(r, v.id);
     return h('div.hub-variant', { class: v.id === role.suggested ? 'suggested' : '' },
       h('span.hub-name', { title: v.files.map((f) => f.path).join('\n') }, v.name,
         v.id === role.suggested && h('span.hub-tag', 'suggested'),
@@ -220,7 +232,23 @@ export function hubDialog(e, { ref = null, onChange = () => {} } = {}) {
       h('span.mono-meta', v.quant ?? v.format),
       h('span.mono-meta', size(v.size_bytes)),
       h('span.mono-meta', where),
-      action(r, v.id, local, target, () => ({ variant: v.id, key: role.key }), v.partial_bytes ? 'Resume' : 'Download'));
+      installed
+        ? h('span.mono-meta.hub-installed', { title: local.path }, icon('check', 12), 'Installed')
+        : action(r, v.id, local, target, () => ({ variant: v.id, key: role.key }),
+          v.partial_bytes ? 'Resume' : lora ? 'Install' : 'Download'));
+  }
+
+  /** The repo's LoRAs, installed into the engine's LoRA folder (none: no cell). */
+  function loraCell(r, role) {
+    const cell = roleCell(r, role);
+    const folder = role.folder.split(/[\\/]/).slice(-2).join('/');
+    cell.querySelector('.cell-head .mono-meta').replaceWith(h('span.mono-meta', { title: role.folder }, `into …/${folder}`));
+    const apply = 'Apply it with a preset or from the prompt bar.';
+    cell.append(h('span.tray-hint.wrap', e.type === 'diffusers'
+      ? `${role.current ? '' : `Installing one sets lora_dir to ${role.folder}. `}Diffusers lists a LoRA installed here at once. ${apply}`
+      : role.current ? `sd-server finds a LoRA installed here without a restart. ${apply}`
+        : `Installing one sets --lora-model-dir to ${role.folder}; ${EXE_WORD} needs a restart to load it.`));
+    return cell;
   }
 
   function pipelineCell(r) {
@@ -415,7 +443,10 @@ export function hubDialog(e, { ref = null, onChange = () => {} } = {}) {
         }
         if (job.state === 'succeeded') {
           announce(`Downloaded ${job.label}`);
-          toast(job.warning ? `${job.label}: ${job.warning}` : `Downloaded ${job.label}${job.assign.length ? ` · set ${job.assign.join(', ')}` : ''}`, { error: !!job.warning });
+          // A first LoRA sets the engine's LoRA folder, which sd-server reads when it starts.
+          const folderSet = job.assign.some((a) => a.endsWith('.lora_model_dir'));
+          const load = folderSet ? ` · ${e.process?.state === 'running' ? 'restart' : 'start'} ${EXE_WORD} to load it` : '';
+          toast(job.warning ? `${job.label}: ${job.warning}` : `Downloaded ${job.label}${job.assign.length ? ` · set ${job.assign.join(', ')}` : ''}${load}`, { error: !!job.warning });
           onChange();
           reloadRepo();
         } else if (job.state === 'failed') {

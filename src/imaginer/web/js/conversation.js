@@ -1,7 +1,8 @@
 // The conversation (designs 1h, 1m, 2c, 2d): the thread, bottom-anchored over a docked bar.
-// Tool calls show as one-line rows with their job's state; a running job gets a progress
-// panel (step bar, engine settings, cancel) with lineage for edits; results are figures with
-// Edit / Retry / Reference actions.
+// Tool calls show as one-line rows with their job's state, which open to the whole call
+// (every argument in full, the LoRAs and the words they added, the engine's settings); a
+// running job gets a progress panel (step bar, engine settings, cancel) with lineage for
+// edits; results are figures with Edit / Retry / Reference actions.
 //
 // Branches: the thread shows one path through the conversation's tree. "‹ 1 / 2 ›"
 // switchers sit at each fork (an edited message, or a retried call's attempts), the rail
@@ -11,16 +12,27 @@
 import { setImage } from './api.js';
 import { announce, connectionStrip, dialog, menu, modelName, statusLine, toast } from './chrome.js';
 import { corners, h, icon, iconButton, clear } from './dom.js';
-import { argsLine, clock, imagesSummary, parseArgs, plural, ratioOf, specOf, truncate } from './format.js';
-import { caretToEnd, mentionChip, mentionEditor, previewMentions, splitMentions } from './mentions.js';
+import {
+  argsLine, clock, imagesSummary, loraName, lorasWord, parseArgs, plural, ratioOf, specOf, truncate,
+} from './format.js';
+import {
+  caretToEnd, findLora, loraChip, loraItems, mentionChip, mentionEditor, previewMentions, splitMentions,
+} from './mentions.js';
 import { convHash } from './origin.js';
 import { promptBar } from './promptbar.js';
 import {
-  byLabel, cancelJob, connection, currentBranch, ensureLoaded, images, on, pathOf, remove, rename, retry,
-  reloadConversation, running, select, send, setArchivedFlag, siblingsOf, stale, stop,
+  byLabel, cancelJob, connection, currentBranch, ensureLoaded, imageEngine, images, libraryLora, loraLibrary, on, pathOf, remove,
+  rename, retry, reloadConversation, running, select, send, setArchivedFlag, siblingsOf, stale, stop,
 } from './store.js';
 
+/** The image engine's LoRAs, with what the library knows of each (display names). */
+function engineLoras() {
+  const engine = imageEngine();
+  return engine ? loraItems(engine.available_loras ?? [], (path) => libraryLora(engine.name, path)) : [];
+}
+
 const openReasoning = new Set(); // message ids, kept across visits
+const openCalls = new Set(); // "<message id>:<tool call id>" of calls shown in full
 const PLACEHOLDER = 'Reply, or name an image like img-2…';
 
 export function conversationScreen({ id, navigate, focusBar = false }) {
@@ -198,8 +210,8 @@ export function conversationScreen({ id, navigate, focusBar = false }) {
         const result = ctx.results.get(key);
         const job = jobFor(ctx, key, result);
         return [
-          call.function.arguments,
-          job && [job.id, job.status, job.progress, job.seed, job.outputs.map((o) => art(o.artifact_id))],
+          call.function.arguments, openCalls.has(key),
+          job && [job.id, job.status, job.progress, job.seed, job.params, job.outputs.map((o) => art(o.artifact_id))],
           result && [result.id, result.status, result.content_text, result.attachments.map(art)],
           result && siblingsOf(c, result).map((s) => s.id),
           (parseArgs(call.function.arguments)?.images ?? []).map((l) => byLabel(c, l)?.id),
@@ -232,14 +244,17 @@ export function conversationScreen({ id, navigate, focusBar = false }) {
     }));
   }
 
-  /** The text with each "@label" of an image here as a chip that opens it. */
+  /** The text with each "@label" of an image here as a chip that opens it, and each LoRA
+   * mention as a chip with its weight. */
   function withMentions(text) {
     const image = (label) => {
       const a = byLabel(c, label);
       return a?.mime?.startsWith('image/') ? a : null;
     };
-    return splitMentions(text, image).map((p) => {
+    const loras = engineLoras();
+    return splitMentions(text, image, () => true).map((p) => {
       if (typeof p === 'string') return p;
+      if (p.lora !== undefined) return loraChip(p.lora, p.weight, { label: findLora(loras, p.lora)?.label });
       const a = image(p.ref);
       return mentionChip(a.label, (img) => setImage(img, a), {
         tag: 'a.mention', href: convHash(id, a.label), 'aria-label': `Open ${a.label}`, source: sourceWord(a),
@@ -256,7 +271,8 @@ export function conversationScreen({ id, navigate, focusBar = false }) {
     const sent = [
       m.metadata?.mode && `${m.metadata.mode} mode`, m.metadata?.qa === false && 'QA off',
       opts.width ? `${opts.width}×${opts.height}` : opts.aspect_ratio, opts.n && `×${opts.n}`,
-      opts.seed != null && `seed ${opts.seed}`, opts.steps && `${opts.steps} steps`,
+      opts.seed != null && `seed ${opts.seed}`, opts.preset && `preset ${opts.preset}`,
+      opts.loras?.length && `+ ${lorasWord(opts.loras)}`, opts.steps && `${opts.steps} steps`,
       opts.cfg_scale != null && `cfg ${opts.cfg_scale}`, opts.negative_prompt && 'negative',
       opts.transparent && 'transparent', opts.mask, opts.backend,
     ].filter(Boolean);
@@ -277,10 +293,11 @@ export function conversationScreen({ id, navigate, focusBar = false }) {
 
   /** Design 2d: the message as an editor. Sending forks; everything below stays put. */
   function editorBlock(m) {
-    // "@" picks one of the message's own images: the edit keeps its attachments.
+    // "@" picks one of the message's own images (the edit keeps its attachments) or a LoRA.
     const attached = m.attachments.map((aid) => c.artifacts.get(aid)).filter((a) => a?.mime?.startsWith('image/'));
     const input = mentionEditor({
       images: () => attached.map((a) => ({ ref: a.label, source: sourceWord(a), fill: (img) => setImage(img, a) })),
+      loras: engineLoras,
       className: 'edit-text', label: 'Edit your message',
       onInput: (text) => { editText = text; },
       onKey: (e) => {
@@ -380,11 +397,22 @@ export function conversationScreen({ id, navigate, focusBar = false }) {
     const outIds = result?.attachments?.length ? result.attachments : (job?.outputs ?? []).map((o) => o.artifact_id);
     const outs = outIds.map((aid) => c.artifacts.get(aid)).filter(Boolean);
 
+    const open = openCalls.has(key);
     const parts = [h('div.tool-row',
+      h('button.tool-toggle', {
+        type: 'button', 'aria-expanded': String(open), title: open ? 'Hide the call' : 'Show the whole call',
+        onclick: () => {
+          if (open) openCalls.delete(key);
+          else openCalls.add(key);
+          render();
+        },
+      },
+      h('span.chev', { class: open ? 'open' : '' }, icon('chevronRight', 12)),
       h('span.tool-name', name),
-      h('span.tool-args', { title: argsLine(shown, call.function.arguments) }, argsLine(shown, call.function.arguments)),
+      h('span.tool-args', argsLine(shown, call.function.arguments))),
       !outs.length && attemptSwitch,
       state)];
+    if (open) parts.push(callDetail(shown ?? {}, job, call.function.arguments));
     const qa = qaLine(result?.metadata?.qa);
     if (qa) parts.push(qa);
     if (outcome?.status === 'error') {
@@ -404,6 +432,51 @@ export function conversationScreen({ id, navigate, focusBar = false }) {
       parts.push(inputs.length ? h('div.fig-with-lineage', figs, lineage(inputs, args?.mask, outs)) : figs);
     }
     return h('div.tool', parts);
+  }
+
+  /** The whole call, which its row cuts to one line: each argument in full, the LoRAs
+   * with the trigger words they added, and the engine's settings once the job has them. */
+  function callDetail(args, job, raw) {
+    const resolved = job?.params?.resolved ?? {};
+    const rows = [];
+    const row = (key, value, cls = '') => rows.push(h('dt', key), h('dd', { class: cls }, value));
+    if (!Object.keys(args).length && raw) row('arguments', raw);
+    const order = ['images', 'prompt', 'negative_prompt', 'aspect_ratio', 'width', 'height', 'n', 'seed', 'mask', 'transparent'];
+    const later = new Set(['loras', 'preset', 'steps', 'cfg_scale', 'sampler']);
+    const keys = [...order.filter((k) => k in args), ...Object.keys(args).filter((k) => !order.includes(k) && !later.has(k))];
+    for (const k of keys) {
+      const v = args[k];
+      if (v == null || v === false || v === '') continue;
+      if (k === 'prompt' || k === 'negative_prompt') {
+        row(k, [h('span.call-text', v), h('button.mini', {
+          type: 'button', title: `Copy the ${k.replace('_', ' ')}`, onclick: () => copyText(v),
+        }, 'Copy')], 'call-prompt');
+      } else row(k, Array.isArray(v) ? v.join(', ') : v === true ? 'yes' : typeof v === 'object' ? JSON.stringify(v) : String(v));
+    }
+    const loras = resolved.loras ?? args.loras ?? [];
+    if (loras.length) {
+      row('loras', loras.map((l) => {
+        const named = job && libraryLora(job.backend, l.path)?.item?.name;
+        const label = named || loraName(l.path);
+        return h('div', { title: l.path }, `${label} ×${l.weight ?? 1}`,
+          l.trigger && h('span.muted', ` · added "${l.trigger}"`));
+      }));
+    }
+    if (args.preset) row('preset', args.preset);
+    const size = resolved.width && resolved.height ? `${resolved.width}×${resolved.height}` : null;
+    const steps = resolved.steps ?? args.steps;
+    const cfg = resolved.cfg_scale ?? args.cfg_scale;
+    const engine = [
+      job?.backend, job?.model && modelName(job.model), size, steps != null && plural(steps, 'step'),
+      cfg != null && `cfg ${cfg}`, resolved.sampler ?? args.sampler,
+    ].filter(Boolean);
+    if (engine.length) row('engine', engine.join(' · '));
+    return h('dl.call-detail', rows);
+  }
+
+  function copyText(text) {
+    if (!navigator.clipboard) return toast('Select the text to copy it: this page can\'t use the clipboard');
+    navigator.clipboard.writeText(text).then(() => toast('Copied'), () => toast('Could not copy'));
   }
 
   /** The quality check on one attempt (metadata.qa): checking, passed, redone, flagged, skipped. */
@@ -630,7 +703,20 @@ export function conversationScreen({ id, navigate, focusBar = false }) {
     scroller.style.scrollPaddingBottom = `${dock.offsetHeight + 32}px`;
   });
   dockSize.observe(dock);
-  const unsubscribe = [on(`conv:${id}`, render), on('turns', render)];
+  // The library names LoRAs (chips, calls) by the image engine's listing: when either
+  // arrives or changes, everything is drawn again.
+  let named = null;
+  const relabel = () => {
+    const engine = imageEngine();
+    const now = [loraLibrary(), engine?.name, JSON.stringify(engine?.available_loras ?? null)];
+    if (named && now.every((x, i) => x === named[i])) return;
+    named = now;
+    blocks.clear();
+    render();
+  };
+  const unsubscribe = [
+    on(`conv:${id}`, render), on('turns', render), on('loras', relabel), on('backends', relabel),
+  ];
 
   ensureLoaded(id).then((loaded) => {
     c = loaded;

@@ -33,7 +33,9 @@ dependencies = [
 diffusers = [
     "accelerate>=1.0",
     "diffusers>=0.42.1",
+    "peft>=0.17",  # LoRAs
     "torch>=2.7",
+    "torchvision>=0.22",  # Qwen3VLProcessor, the pipeline's text encoder processor, needs it
     "transformers>=5.17",
 ]
 postgres = ["asyncpg>=0.30"]
@@ -52,6 +54,9 @@ dev = [
 
 [tool.uv.sources]
 torch = [
+    { index = "pytorch-cu130", marker = "sys_platform == 'win32' or sys_platform == 'linux'" },
+]
+torchvision = [
     { index = "pytorch-cu130", marker = "sys_platform == 'win32' or sys_platform == 'linux'" },
 ]
 

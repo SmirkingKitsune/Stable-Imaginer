@@ -199,8 +199,233 @@ async def test_image_backends_report_their_defaults(studio: httpx.AsyncClient) -
     backends = {b["name"]: b for b in (await studio.get("/v1/backends")).json()}
     assert backends["llama"]["image_defaults"] is None
     defaults = backends["sd"]["image_defaults"]
-    assert set(defaults) == {"width", "height", "steps", "cfg_scale", "sampler", "size_multiple"}
+    assert set(defaults) == {
+        "width", "height", "steps", "cfg_scale", "sampler", "size_multiple", "loras",
+    }  # fmt: skip
     assert defaults["size_multiple"] == 32
+    assert defaults["loras"] == []
+    assert backends["sd"]["image_presets"] == []
+    assert backends["sd"]["available_loras"] is None  # the fake lists no LoRAs by default
+
+
+# --- presets and LoRAs -----------------------------------------------------------
+
+DISTILL = "p_q_image_2.1_8_steps_v0.1_comfyui_bf16.safetensors"
+
+
+@pytest.fixture
+async def preset_studio(
+    make_settings: SettingsFactory, fake_llama: FakeLlama, fake_sd: FakeSdCpp
+) -> AsyncIterator[httpx.AsyncClient]:
+    presets = {
+        "fast": {"description": "8-step draft", "loras": [{"path": DISTILL}], "steps": 2},
+        "crisp": {"cfg_scale": 3.0},
+    }
+    settings = make_settings(
+        backends={
+            "llama": llama_config(fake_llama.url),
+            "sd": sd_config(fake_sd.url, presets=presets),
+        },
+        routing=RoutingConfig(chat="llama", t2i="sd", edit="sd"),
+        orchestration=OrchestrationConfig(probe_ttl_s=0, qa=QAConfig(enabled=False)),
+    )
+    async for client in _client_for(settings):
+        yield client
+
+
+async def test_a_preset_applies_its_loras_and_settings(
+    preset_studio: httpx.AsyncClient, fake_llama: FakeLlama, fake_sd: FakeSdCpp
+) -> None:
+    fake_sd.loras = [DISTILL]
+    fake_llama.queue(
+        FakeLlama.tool_call("generate_image", {"prompt": "a fox"}), FakeLlama.text("Done.")
+    )
+    cid = (await preset_studio.post("/v1/conversations", json={})).json()["id"]
+    resp = await preset_studio.post(
+        f"/v1/conversations/{cid}/messages",
+        json={"content": "draw a fox", "image_options": {"preset": "fast"}},
+    )
+    assert parse_sse(resp.text)[-1][0] == "done"
+    (body,) = fake_sd.requests
+    assert body["lora"] == [{"path": DISTILL, "multiplier": 1.0}]
+    assert body["sample_params"]["sample_steps"] == 2
+    assert body["sample_params"]["guidance"] == {"txt_cfg": 6.0}  # unset: the default
+    (job,) = (await preset_studio.get(f"/v1/conversations/{cid}/jobs")).json()["items"]
+    assert job["params"]["requested"]["preset"] == "fast"
+    resolved = job["params"]["resolved"]
+    assert (resolved["preset"], resolved["steps"]) == ("fast", 2)
+    assert resolved["loras"] == [{"path": DISTILL, "weight": 1.0}]
+
+    sd = next(b for b in (await preset_studio.get("/v1/backends")).json() if b["name"] == "sd")
+    assert sd["available_loras"] == [DISTILL]
+    assert "lora" in sd["capabilities"]
+    assert [p["name"] for p in sd["image_presets"]] == ["fast", "crisp"]
+    fast = sd["image_presets"][0]
+    assert fast["loras"] == [{"path": DISTILL, "weight": 1.0}]
+    assert (fast["description"], fast["steps"], fast["cfg_scale"]) == ("8-step draft", 2, None)
+    assert sd["image_presets"][1]["loras"] is None  # keeps the default LoRAs
+
+
+async def test_an_unknown_preset_is_rejected_before_the_turn(
+    preset_studio: httpx.AsyncClient, fake_llama: FakeLlama
+) -> None:
+    cid = (await preset_studio.post("/v1/conversations", json={})).json()["id"]
+    cases = [
+        ({"preset": "slow"}, "no image preset 'slow' on sd (presets: crisp, fast)"),
+        ({"preset": "fast", "backend": "llama"}, "llm backend and cannot serve t2i"),
+    ]
+    for options, fragment in cases:
+        resp = await preset_studio.post(
+            f"/v1/conversations/{cid}/messages",
+            json={"content": "draw", "image_options": options},
+        )
+        assert resp.status_code == 422, resp.text
+        assert fragment in resp.json()["detail"]
+    assert fake_llama.requests == []
+
+
+async def test_a_messages_loras_go_on_top_of_its_preset(
+    preset_studio: httpx.AsyncClient, fake_llama: FakeLlama, fake_sd: FakeSdCpp
+) -> None:
+    fake_sd.loras = [DISTILL, "style/ink.safetensors"]
+    fake_llama.queue(
+        FakeLlama.tool_call("generate_image", {"prompt": "a fox"}), FakeLlama.text("Done.")
+    )
+    cid = (await preset_studio.post("/v1/conversations", json={})).json()["id"]
+    options = {"preset": "fast", "loras": [{"path": "style/ink.safetensors", "weight": 0.5}]}
+    resp = await preset_studio.post(
+        f"/v1/conversations/{cid}/messages",
+        json={"content": "draw a fox", "image_options": options},
+    )
+    assert parse_sse(resp.text)[-1][0] == "done"
+    (body,) = fake_sd.requests
+    assert body["lora"] == [
+        {"path": DISTILL, "multiplier": 1.0},
+        {"path": "style/ink.safetensors", "multiplier": 0.5},
+    ]
+    (job,) = (await preset_studio.get(f"/v1/conversations/{cid}/jobs")).json()["items"]
+    assert job["params"]["requested"]["loras"] == options["loras"]
+    assert [x["path"] for x in job["params"]["resolved"]["loras"]] == [
+        DISTILL,
+        "style/ink.safetensors",
+    ]
+    user = (await preset_studio.get(f"/v1/conversations/{cid}/messages")).json()["items"][0]
+    assert user["metadata"]["image_options"]["loras"] == options["loras"]
+
+
+async def test_too_many_loras_are_rejected(preset_studio: httpx.AsyncClient) -> None:
+    cid = (await preset_studio.post("/v1/conversations", json={})).json()["id"]
+    loras = [{"path": f"style/{n}.safetensors"} for n in range(9)]
+    resp = await preset_studio.post(
+        f"/v1/conversations/{cid}/messages",
+        json={"content": "draw", "image_options": {"loras": loras}},
+    )
+    assert resp.status_code == 422, resp.text
+
+
+@pytest.mark.parametrize(
+    "options", [{"preset": "fast"}, {"loras": [{"path": "ink"}]}], ids=["preset", "picked"]
+)
+async def test_loras_need_an_engine_that_takes_them(
+    preset_studio: httpx.AsyncClient,
+    fake_llama: FakeLlama,
+    fake_sd: FakeSdCpp,
+    options: dict[str, Any],
+) -> None:
+    fake_sd.loras = None  # an sd-server too old to take LoRAs
+    fake_llama.queue(
+        FakeLlama.tool_call("generate_image", {"prompt": "a fox"}),
+        FakeLlama.text("The engine can't apply LoRAs."),
+    )
+    cid = (await preset_studio.post("/v1/conversations", json={})).json()["id"]
+    resp = await preset_studio.post(
+        f"/v1/conversations/{cid}/messages",
+        json={"content": "draw a fox", "image_options": options},
+    )
+    assert parse_sse(resp.text)[-1][0] == "done"
+    assert fake_sd.requests == []
+    tool = next(
+        m
+        for m in (await preset_studio.get(f"/v1/conversations/{cid}/messages")).json()["items"]
+        if m["role"] == "tool"
+    )
+    error = json.loads(tool["content_text"])["error"]
+    assert error["code"] == "capability_unavailable"
+    assert "lacks lora" in error["detail"]
+
+
+async def _messages(client: httpx.AsyncClient, cid: str) -> list[dict[str, Any]]:
+    items: list[dict[str, Any]] = (await client.get(f"/v1/conversations/{cid}/messages")).json()[
+        "items"
+    ]
+    return items
+
+
+async def test_a_mentioned_lora_applies_to_the_turns_images(
+    preset_studio: httpx.AsyncClient, fake_llama: FakeLlama, fake_sd: FakeSdCpp
+) -> None:
+    fake_sd.loras = [DISTILL, "style/ink.safetensors"]
+    fake_llama.queue(
+        # The LLM copied the mention into its prompt: dropped there, never applied from it.
+        FakeLlama.tool_call("generate_image", {"prompt": "a fox in ink, @lora:ink:2"}),
+        FakeLlama.text("Done."),
+    )
+    cid = (await preset_studio.post("/v1/conversations", json={})).json()["id"]
+    picked = {"loras": [{"path": "style/ink.safetensors", "weight": 1.0}]}
+    resp = await preset_studio.post(
+        f"/v1/conversations/{cid}/messages",
+        json={"content": "draw a fox @lora:ink:0.5", "image_options": picked},
+    )
+    assert parse_sse(resp.text)[-1][0] == "done"
+    (body,) = fake_sd.requests
+    assert body["prompt"] == "a fox in ink,"
+    # Picked in the prompt bar at 1.0, mentioned at 0.5: the mention's weight wins.
+    assert body["lora"] == [{"path": "style/ink.safetensors", "multiplier": 0.5}]
+    user = next(m for m in fake_llama.requests[0]["messages"] if m["role"] == "user")
+    # The LoRA's name, not its mention; the note lists it once, as the engine applies it.
+    assert user["content"] == (
+        "draw a fox ink\n\n[LoRAs the user picked for this message's images:\n- ink, weight 0.5]"
+    )
+    (job,) = (await preset_studio.get(f"/v1/conversations/{cid}/jobs")).json()["items"]
+    assert job["params"]["requested"]["loras"] == [
+        {"path": "style/ink.safetensors", "weight": 1.0},
+        {"path": "ink", "weight": 0.5},
+    ]
+    stored = (await _messages(preset_studio, cid))[0]
+    assert stored["content_text"] == "draw a fox @lora:ink:0.5"  # kept as written
+    assert stored["metadata"]["image_options"] == picked
+
+
+async def test_a_raw_prompt_is_sent_without_its_mentions(
+    preset_studio: httpx.AsyncClient, fake_sd: FakeSdCpp
+) -> None:
+    fake_sd.loras = ["style/ink.safetensors"]
+    cid = (await preset_studio.post("/v1/conversations", json={})).json()["id"]
+    url = f"/v1/conversations/{cid}/messages"
+    raw = {"mode": "raw", "qa": False}
+    resp = await preset_studio.post(url, json={"content": "a heron @lora:ink:0.6 at dawn", **raw})
+    assert parse_sse(resp.text)[-1][0] == "done"
+    (body,) = fake_sd.requests
+    assert body["prompt"] == "a heron at dawn"
+    assert body["lora"] == [{"path": "style/ink.safetensors", "multiplier": 0.6}]
+
+    # Retrying the call applies the message's LoRAs again.
+    tool = next(m for m in await _messages(preset_studio, cid) if m["role"] == "tool")
+    resp = await preset_studio.post(f"{url}/{tool['id']}/retry")
+    assert parse_sse(resp.text)[-1][0] == "done"
+    assert fake_sd.requests[-1]["lora"] == [{"path": "style/ink.safetensors", "multiplier": 0.6}]
+
+    alone = await preset_studio.post(url, json={"content": "@lora:ink", **raw})
+    assert alone.status_code == 422 and "add text" in alone.json()["detail"]
+    heavy = await preset_studio.post(url, json={"content": "a heron @lora:ink:11", **raw})
+    assert heavy.status_code == 422 and "between -10 and 10" in heavy.json()["detail"]
+    resp = await preset_studio.post(url, json={"content": "a heron @lora:nope", **raw})
+    error = json.loads(
+        next(m for m in reversed(await _messages(preset_studio, cid)) if m["role"] == "tool")[
+            "content_text"
+        ]
+    )["error"]
+    assert "has no LoRA 'nope'" in error["detail"]
 
 
 async def test_unusable_image_backend_is_rejected_before_the_turn(

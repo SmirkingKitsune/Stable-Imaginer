@@ -16,9 +16,16 @@ from fastapi import FastAPI
 from imaginer.core.config import load_settings, local_overrides_path
 from imaginer.hub import downloads
 from imaginer.main import create_app
-from tests.fakes.fake_hub import TOKEN, FakeHub, gguf
+from tests.fakes.fake_hub import SHA, TOKEN, FakeHub, gguf
 from tests.fakes.live import LiveServer
-from tests.hub.conftest import GATED_REPO, IMAGE_REPO, LLM_REPO, PIPELINE_REPO
+from tests.hub.conftest import (
+    GATED_REPO,
+    IMAGE_REPO,
+    LLM_REPO,
+    LORA_FILE,
+    LORA_REPO,
+    PIPELINE_REPO,
+)
 
 _FAST = {"retry": {"attempts": 1}, "timeouts": {"connect": 0.2, "read": 0.5}}
 
@@ -111,7 +118,7 @@ async def test_search_filters_by_format_task_and_base_model(client: httpx.AsyncC
         return [r["id"] for r in (await client.get("/v1/hub/search", params=params)).json()]
 
     assert set(await ids(format="gguf")) == {LLM_REPO, IMAGE_REPO, GATED_REPO}
-    assert set(await ids(task="text-to-image")) == {IMAGE_REPO, PIPELINE_REPO}
+    assert set(await ids(task="text-to-image")) == {IMAGE_REPO, PIPELINE_REPO, LORA_REPO}
     assert await ids(base_model="acme/Chat-8B", relation="quantized") == [LLM_REPO]
     assert await ids(q="image-2", format="diffusers") == [PIPELINE_REPO]
     found = (await client.get("/v1/hub/search", params={"q": "gated"})).json()
@@ -161,6 +168,100 @@ async def test_a_download_sets_the_engine_setting_and_saves_it(
     assert q4["local"] == {"source": "models_dir", "path": str(target), "in_use": ["llama.model"]}
 
 
+async def test_a_lora_installs_into_sd_servers_lora_folder(
+    client: httpx.AsyncClient, profile: Path, models: Path
+) -> None:
+    params = {"ref": LORA_REPO, "engine": "sd"}
+    repo = (await client.get("/v1/hub/repo", params=params)).json()
+    roles = {r["key"]: r for r in repo["roles"]}
+    folder = models / "_loras"  # sd has no LoRA folder yet: the first LoRA gives it this one
+    assert (roles["lora"]["flag"], roles["lora"]["current"]) == ("--lora-model-dir", None)
+    assert (roles["lora"]["candidates"], roles["lora"]["folder"]) == ([LORA_FILE], str(folder))
+    assert roles["diffusion_model"]["candidates"] == []  # tagged as a LoRA, so not a model
+    assert repo["notes"] == []
+
+    job = await _download(client, repo=LORA_REPO, variant=LORA_FILE, engine="sd", key="lora")
+    target = folder / "acme" / "Image-2-Lightning" / LORA_FILE
+    assert (job["state"], job["target"], job["assign"]) == (
+        "succeeded",
+        str(target),
+        ["sd.lora_model_dir"],
+    )
+    sd = (await client.get("/v1/engines/sd")).json()
+    assert (sd["loras"]["path"], sd["loras"]["count"]) == (str(folder), 1)
+    saved = yaml.safe_load(local_overrides_path(profile).read_text(encoding="utf-8"))
+    assert saved["backends"]["sd"]["launch"]["lora_model_dir"] == str(folder)
+    repo = (await client.get("/v1/hub/repo", params=params)).json()
+    (lora,) = (v for v in repo["variants"] if v["id"] == LORA_FILE)
+    assert lora["local"] == {"source": "lora_dir", "path": str(target), "in_use": ["sd.lora"]}
+
+    # Once the engine has a LoRA folder, a LoRA just goes into it.
+    again = await _download(client, repo=LORA_REPO, variant=LORA_FILE, engine="sd", key="lora")
+    assert (again["state"], again["assign"]) == ("succeeded", [])
+    model = {"repo": IMAGE_REPO, "variant": "image-2-Q4_K.gguf", "engine": "sd", "key": "lora"}
+    resp = await client.post("/v1/hub/downloads", json=model)
+    assert resp.status_code == 422 and "not a LoRA" in resp.json()["detail"]
+    llama = {"repo": LORA_REPO, "variant": LORA_FILE, "engine": "llama", "key": "lora"}
+    resp = await client.post("/v1/hub/downloads", json=llama)
+    assert resp.status_code == 422 and "only an sd-server" in resp.json()["detail"]
+    other = (await client.get("/v1/hub/repo", params={"ref": LORA_REPO, "engine": "llama"})).json()
+    assert [r["key"] for r in other["roles"]] == ["model", "mmproj"]
+
+
+def _in_hf_cache(hf_home: Path, data: bytes) -> Path:
+    """LORA_REPO's LoRA as `hf download` leaves it in the Hugging Face cache."""
+    snapshot = hf_home / "hub" / "models--acme--Image-2-Lightning" / "snapshots" / SHA
+    snapshot.mkdir(parents=True)
+    (snapshot / LORA_FILE).write_bytes(data)
+    return snapshot / LORA_FILE
+
+
+async def test_a_diffusers_lora_is_copied_in_from_the_hf_cache(
+    client: httpx.AsyncClient, profile: Path, models: Path, hub: FakeHub, isolated_hf: Path
+) -> None:
+    lora = hub.repos[LORA_REPO].files[LORA_FILE]
+    cached = _in_hf_cache(isolated_hf, lora)
+    params = {"ref": LORA_REPO, "engine": "diff"}
+    repo = (await client.get("/v1/hub/repo", params=params)).json()
+    roles = {r["key"]: r for r in repo["roles"]}
+    folder = models / "_loras"
+    assert (roles["lora"]["flag"], roles["lora"]["current"]) == ("lora_dir", None)
+    assert (roles["lora"]["candidates"], roles["lora"]["folder"]) == ([LORA_FILE], str(folder))
+    (variant,) = (v for v in repo["variants"] if v["id"] == LORA_FILE)
+    assert variant["local"] is None  # not in the LoRA folder yet
+    assert variant["copy_from"] == {"source": "hf_cache", "path": str(cached), "in_use": []}
+
+    job = await _download(client, repo=LORA_REPO, variant=LORA_FILE, engine="diff", key="lora")
+    target = folder / "acme" / "Image-2-Lightning" / LORA_FILE
+    assert (job["state"], job["target"], job["assign"], job["warning"]) == (
+        "succeeded",
+        str(target),
+        ["diff.lora_dir"],
+        None,
+    )
+    assert target.read_bytes() == lora
+    assert not [r for r in hub.requests if r["path"].endswith(LORA_FILE)]  # copied, not fetched
+    diff = (await client.get("/v1/engines/diff")).json()
+    assert (diff["loras"]["path"], diff["loras"]["count"]) == (str(folder), 1)
+    saved = yaml.safe_load(local_overrides_path(profile).read_text(encoding="utf-8"))
+    assert saved["backends"]["diff"]["lora_dir"] == str(folder)
+    repo = (await client.get("/v1/hub/repo", params=params)).json()
+    (variant,) = (v for v in repo["variants"] if v["id"] == LORA_FILE)
+    assert variant["local"]["source"] == "lora_dir" and variant["copy_from"] is None
+
+
+async def test_a_copy_that_doesnt_match_the_hub_is_downloaded_instead(
+    client: httpx.AsyncClient, models: Path, hub: FakeHub, isolated_hf: Path
+) -> None:
+    lora = hub.repos[LORA_REPO].files[LORA_FILE]
+    _in_hf_cache(isolated_hf, bytes(len(lora)))  # the size the Hub lists, other bytes
+    job = await _download(client, repo=LORA_REPO, variant=LORA_FILE, engine="sd", key="lora")
+    assert job["state"] == "succeeded" and "doesn't match the Hub's" in job["warning"]
+    target = models / "_loras" / "acme" / "Image-2-Lightning" / LORA_FILE
+    assert target.read_bytes() == lora
+    assert [r for r in hub.requests if r["path"].endswith(LORA_FILE)]
+
+
 async def test_sd_server_takes_a_diffusers_component_through_its_index(
     client: httpx.AsyncClient, models: Path
 ) -> None:
@@ -194,7 +295,10 @@ async def test_a_pipeline_download_becomes_a_diffusers_model_id(
     assert repo["pipeline"]["compatible"] is True
     assert repo["roles"] == [
         {"key": "model_id", "flag": None, "what": "Diffusers pipeline",
-         "current": "Qwen/Qwen-Image-2.1", "candidates": [], "suggested": None}
+         "current": "Qwen/Qwen-Image-2.1", "candidates": [], "suggested": None,
+         "folder": None},
+        {"key": "lora", "flag": "lora_dir", "what": "LoRAs", "current": None, "candidates": [],
+         "suggested": None, "folder": str(models / "_loras")},
     ]  # fmt: skip
     job = await _download(client, repo=PIPELINE_REPO, engine="diff", key="model_id")
     folder = models / "acme" / "Image-2"

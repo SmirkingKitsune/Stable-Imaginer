@@ -6,6 +6,7 @@
 //   #/c/<id>/chat      conversation       #/c/<id>/mask/img-3  mask editor for img-3
 //   #/engines          engine settings    #/engines/sdcpp      on one backend
 //   #/links            linked instances
+//   #/loras            the LoRA library   #/loras/<id>         one LoRA
 //   #/l/<link>/c/...   the same conversation routes, for one that lives on a linked instance
 
 import { setToken, whenUnauthorized } from './api.js';
@@ -15,9 +16,10 @@ import { conversationScreen } from './conversation.js';
 import { enginesScreen } from './engines.js';
 import { galleryScreen } from './gallery.js';
 import { linksScreen } from './links.js';
+import { loraScreen, lorasScreen } from './loras.js';
 import { maskScreen } from './mask.js';
 import { baseOf, place } from './origin.js';
-import { backendsFrom, loadBackends } from './store.js';
+import { backendsFrom, loadBackends, notePlace } from './store.js';
 import { viewerScreen } from './viewer.js';
 
 const BACKENDS_REFRESH_MS = 30_000;
@@ -44,6 +46,7 @@ function parse(hash) {
   if (parts[0] === 'archived') return { name: 'gallery', archived: true };
   if (parts[0] === 'engines') return { name: 'engines', engine: parts[1] ?? null };
   if (parts[0] === 'links') return { name: 'links' };
+  if (parts[0] === 'loras') return parts[1] ? { name: 'lora', id: parts[1] } : { name: 'loras' };
   if (parts[0] === 'c' && parts[1]) {
     if (parts[2] === 'chat') return { name: 'conversation', id: parts[1], link };
     if (parts[2] === 'mask' && parts[3]) return { name: 'mask', id: parts[1], label: parts[3], link };
@@ -67,15 +70,19 @@ function route() {
   pendingFocus = false;
   screen?.destroy();
   root.replaceChildren();
-  if (r.id) place(r.id, r.link);
-  backendsFrom(r.id ? baseOf(r.id) : '');
+  const conv = r.name !== 'lora' && r.id;
+  if (conv) place(r.id, r.link);
+  backendsFrom(conv ? baseOf(r.id) : '');
   if (r.name === 'conversation') screen = conversationScreen({ id: r.id, navigate, focusBar });
   else if (r.name === 'mask') screen = maskScreen({ id: r.id, label: r.label, navigate });
   else if (r.name === 'engines') screen = enginesScreen({ name: r.engine, navigate });
   else if (r.name === 'links') screen = linksScreen({ navigate });
+  else if (r.name === 'loras') screen = lorasScreen({ navigate });
+  else if (r.name === 'lora') screen = loraScreen({ id: r.id, navigate });
   else if (r.name === 'viewer') screen = viewerScreen({ id: r.id, label: r.label, navigate });
   else screen = galleryScreen({ archived: r.archived, navigate });
   mounted = r;
+  if (['gallery', 'conversation', 'viewer'].includes(r.name)) notePlace(location.hash);
   root.append(screen.el);
 }
 

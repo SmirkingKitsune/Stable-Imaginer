@@ -15,6 +15,16 @@ routes_sdcpp.cpp, model_catalog.cpp):
   ``--llm_vision`` with a GGUF text encoder) comes from ``declared_capabilities``. For models
   loaded through a recipe, ``features_by_mode.img_gen.ref_images`` narrows it.
 * Transparency is prompt-driven for Qwen-Image-2.1. Alpha survives only in PNG/WebP.
+* LoRAs go in the request's ``lora`` list (``path``, ``multiplier``); ``<lora:...>`` prompt
+  tags are ignored by the server API. A path must be one the server lists under ``loras`` in
+  its capabilities: it only applies LoRAs it found in ``--lora-model-dir`` (or the model
+  roots' ``loras/`` folders), and it rescans them on every request. A listed ``path`` is
+  relative to that folder, so for an engine launched here the image's record gets each
+  LoRA's SHA-256 too. Checked with ``master-1028-37bc88b``: it lists ``{name, path,
+  display_path}`` per LoRA, and applies a PEFT-format Qwen-Image-2.1 LoRA
+  (``transformer_blocks.N...lora_A.default.weight``). A LoRA whose file names a trigger
+  phrase in its metadata gets it added to the prompt (``common.with_triggers``), here too
+  only for an engine launched here.
 """
 
 import asyncio
@@ -32,19 +42,26 @@ from imaginer.backends.base import (
     ImageResult,
 )
 from imaginer.backends.common import (
+    WordsSource,
+    check_sigmas,
     default_max_ref_pixels,
+    find_preset,
     mask_prompt,
+    match_loras,
+    merge_loras,
     prepare_inputs,
     resolve_params,
     sigmas,
     styled_prompt,
+    with_sha256,
+    with_triggers,
 )
 from imaginer.backends.openai_http.transport import HttpTransport
 from imaginer.core.clock import utcnow
-from imaginer.core.config import SdCppBackendConfig
+from imaginer.core.config import BackendConfig, SdCppBackendConfig
 from imaginer.core.logging import get_logger
 from imaginer.domain.enums import BackendStatus, Capability
-from imaginer.domain.errors import EngineError, ImaginerError
+from imaginer.domain.errors import EngineError, ImaginerError, InvalidRequestError
 from imaginer.services.media import inspect_image_bytes
 
 log = get_logger(__name__)
@@ -52,8 +69,14 @@ log = get_logger(__name__)
 HEALTH_TIMEOUT_S = 5.0
 CANCEL_TIMEOUT_S = 5.0
 SUPPORTED: frozenset[Capability] = frozenset(
-    {Capability.T2I, Capability.EDIT, Capability.MULTI_REF, Capability.RGBA}
+    {Capability.T2I, Capability.EDIT, Capability.MULTI_REF, Capability.RGBA, Capability.LORA}
 )
+UNLISTED = "start sd-server with --lora-model-dir, launch.lora_model_dir here"
+LIVE_FIELDS = frozenset({"presets", "defaults"})  # read per request: no new adapter
+
+
+def _lora_dir_of(config: SdCppBackendConfig) -> object:
+    return config.launch.lora_model_dir if config.launch is not None else None
 
 
 def expected_capabilities(config: SdCppBackendConfig) -> set[Capability]:
@@ -64,6 +87,8 @@ def expected_capabilities(config: SdCppBackendConfig) -> set[Capability]:
 
 
 class SdCppBackend:
+    lora_words: WordsSource | None = None  # the LoRA library's trigger words, if it has any
+
     def __init__(
         self,
         name: str,
@@ -86,7 +111,25 @@ class SdCppBackend:
         self._model = "unknown"
         self._max_side = 4096
         self._preview_modes: set[str] = set()
-        sigmas(config.defaults.sigmas)  # fail fast on an unknown preset name
+        self._loras: dict[str, dict[str, Any]] | None = None  # path -> entry; None: not listed
+        check_sigmas(config.defaults, config.presets)
+
+    def update_config(self, config: BackendConfig) -> bool:
+        """Take new presets or defaults as they are: requests read them. False when
+        anything else changed, which needs a new adapter."""
+        if not isinstance(config, SdCppBackendConfig):
+            return False
+        try:
+            check_sigmas(config.defaults, config.presets)
+        except ValueError:
+            return False
+        live = set(LIVE_FIELDS)
+        if config.model_dump(exclude=live | {"launch"}) != self._config.model_dump(
+            exclude=live | {"launch"}
+        ) or _lora_dir_of(config) != _lora_dir_of(self._config):
+            return False
+        self._config = config
+        return True
 
     @property
     def model(self) -> str:
@@ -95,6 +138,11 @@ class SdCppBackend:
     @property
     def max_ref_images(self) -> int:
         return self._config.max_ref_images
+
+    @property
+    def available_loras(self) -> list[str] | None:
+        """The LoRA paths the engine listed at its last probe; None if it lists none."""
+        return sorted(self._loras) if self._loras is not None else None
 
     def capabilities(self) -> set[Capability]:
         return set(self._declared & self._probed)
@@ -128,6 +176,10 @@ class SdCppBackend:
         features = (caps.get("features_by_mode") or {}).get("img_gen") or caps.get("features") or {}
         if runtime.get("origin") != "command_line" and not features.get("ref_images", True):
             probed -= {Capability.EDIT, Capability.MULTI_REF}
+        # Servers that take a request's LoRAs list the ones they can apply (maybe none).
+        self._loras = _lora_catalog(caps.get("loras"))
+        if self._loras is not None and features.get("lora", True):
+            probed.add(Capability.LORA)
         self._probed = probed
         self._model = (caps.get("model") or {}).get("name") or self._model
         limits = caps.get("limits") or {}
@@ -170,7 +222,20 @@ class SdCppBackend:
             size_multiple=self._config.size_multiple,
             max_side=self._max_side,
             base_size=base_size,
+            preset=find_preset(self.name, self._config.presets, req.preset),
         )
+
+    async def _engine_loras(self, wanted: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        """``wanted`` with each path as the engine lists it; a LoRA named twice (a preset's,
+        then the request's) gets its last weight, and one at weight 0 is left out. One
+        missing from the last listing asks for a new listing first: the server rescans its
+        folder every time."""
+        try:
+            matched = match_loras(self.name, wanted, self._loras, unlisted=UNLISTED)
+        except InvalidRequestError:
+            await self.health()
+            matched = match_loras(self.name, wanted, self._loras, unlisted=UNLISTED)
+        return merge_loras(matched)
 
     def _body(self, req: GenRequest, params: dict[str, Any], refs: list[str]) -> dict[str, Any]:
         prompt = styled_prompt(req, self._config.rgba_prompt_template)
@@ -206,13 +271,41 @@ class SdCppBackend:
             body["sample_params"] = sample
         if refs:
             body["ref_images"] = refs
+        if loras := params.get("loras"):
+            body["lora"] = [{"path": x["path"], "multiplier": x["weight"]} for x in loras]
         return body
 
     async def _run(
         self, req: GenRequest, refs: list[str], base_size: tuple[int, int] | None = None
     ) -> list[ImageResult]:
         params = self.resolved_params(req, base_size)
+        # Only an engine launched here has its LoRA folder on this machine, the folder its
+        # listed paths are relative to: their trigger phrases and hashes come from there.
+        launch = self._config.launch
+        folder = launch.lora_model_dir if launch is not None else None
+        if params.get("loras"):
+            params["loras"] = await self._engine_loras(params["loras"]) or None
+            params = {k: v for k, v in params.items() if v is not None}
+        if params.get("loras"):
+            prompt, params["loras"] = await with_triggers(
+                folder, req.prompt, params["loras"], self.lora_words
+            )
+            req = replace(req, prompt=prompt)
         body = self._body(req, params, refs)
+        # Hashed while the image is made.
+        hashing = asyncio.ensure_future(with_sha256(folder, params.get("loras", [])))
+        try:
+            return await self._follow(req, params, body, hashing)
+        finally:
+            hashing.cancel()
+
+    async def _follow(
+        self,
+        req: GenRequest,
+        params: dict[str, Any],
+        body: dict[str, Any],
+        hashing: asyncio.Future[list[dict[str, Any]]],
+    ) -> list[ImageResult]:
         job_id = await self._submit(body)
         log.info("sdcpp.submitted", backend=self.name, engine_job_id=job_id, seed=req.seed)
         last_step = -1
@@ -230,6 +323,8 @@ class SdCppBackend:
                     total = int(preview.get("total_steps") or 0)
                     await req.on_progress(GenProgress(step=step, total_steps=total))
                 if status == "completed":
+                    if loras := await hashing:
+                        params = {**params, "loras": loras}
                     return await self._results(job, req, params, job_id)
                 if status in ("failed", "cancelled"):
                     error = job.get("error") or {}
@@ -304,3 +399,14 @@ class SdCppBackend:
 
 def _data_url(data: bytes, mime: str) -> str:
     return f"data:{mime};base64,{base64.b64encode(data).decode()}"
+
+
+def _lora_catalog(listed: object) -> dict[str, dict[str, Any]] | None:
+    """The capabilities' ``loras`` by path; None when the server sends no list."""
+    if not isinstance(listed, list):
+        return None
+    return {
+        str(entry["path"]): entry
+        for entry in listed
+        if isinstance(entry, dict) and isinstance(entry.get("path"), str) and entry["path"]
+    }

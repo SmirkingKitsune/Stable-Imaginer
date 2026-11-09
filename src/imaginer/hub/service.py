@@ -5,17 +5,27 @@ each setting with a suggestion (the quant a ``repo:QUANT`` reference asks for, e
 the setting uses now, else a good default), and every variant says whether a copy is on
 this machine already and which settings point at it. A download sets the engine setting it
 was started for once it's done, the same way an edit on the Engines screen does.
+
+An sd-server launched here and a Diffusers backend also get a ``lora`` role: the repo's
+LoRAs (only ``.safetensors`` ones for Diffusers), installed into the engine's LoRA folder as
+``<owner>/<name>/<path in the repo>``, where it lists them for requests without a restart.
+An engine with no LoRA folder yet gets one in the models folder
+(``launch.DEFAULT_LORA_FOLDER``) with its first LoRA; an sd-server then needs a restart to
+load it. A LoRA already on this machine (the models folder, the HF cache) is copied in
+rather than downloaded again.
 """
 
 import asyncio
 import contextlib
 import os
 from collections import defaultdict
+from collections.abc import Awaitable, Callable
 from pathlib import Path, PurePosixPath
-from typing import Literal
+from typing import Any, Literal
 
 import httpx
 
+from imaginer.backends import diffusers_inproc
 from imaginer.backends.diffusers_inproc import PIPELINE_CLASS
 from imaginer.core.config import (
     BackendConfig,
@@ -42,6 +52,8 @@ from imaginer.hub.layout import (
     RepoLayout,
     Variant,
     classify,
+    is_adapter,
+    loras_in,
     quant_of,
     ranked,
     roles_for,
@@ -52,6 +64,9 @@ from imaginer.hub.local import LocalCopy, find_copy, partial_bytes, repo_dir, sa
 from imaginer.hub.refs import HubRef, RefError, parse_ref
 
 MODEL_ID = "model_id"  # the "launch setting" of a Diffusers backend
+LORA = "lora"  # the role of an engine's LoRAs: installed into its LoRA folder
+# The setting a LoRA install sets when the engine has no LoRA folder yet, by engine type.
+LORA_FOLDERS = {"sdcpp": "lora_model_dir", "diffusers": "lora_dir"}
 _LOCAL_TYPES = (LlamaCppBackendConfig, SdCppBackendConfig, DiffusersBackendConfig)
 HubFormat = Literal["gguf", "diffusers", "safetensors"]
 FORMATS: tuple[HubFormat, ...] = ("gguf", "diffusers", "safetensors")
@@ -73,6 +88,8 @@ class HubService:
             resolve_endpoint(settings.hub.endpoint), self._token, transport=transport
         )
         self.downloads = DownloadManager(self.client, on_success=self._assign)
+        # Told where a LoRA from the Hub goes, and what its card says (the LoRA library).
+        self.on_lora_install: Callable[[Path, dict[str, Any]], Awaitable[None]] | None = None
 
     def _token(self) -> str | None:
         return find_token(self._settings.hub.token_env).token
@@ -183,6 +200,7 @@ class HubService:
             repo_id=ref.repo_id,
             pipeline_tag=info.summary.pipeline_tag,
             model_index=model_index,
+            adapter=is_adapter(info.summary.tags),
         )
         return info, layout
 
@@ -195,7 +213,13 @@ class HubService:
         config: BackendConfig | None,
     ) -> dto.HubRepo:
         in_use = self._in_use()
-        variants = [self._variant(ref.repo_id, info.sha, v, in_use) for v in layout.variants]
+        lora_dir = self._lora_dir(config)
+        variants = [
+            self._lora_variant(ref.repo_id, v, lora_dir, f"{engine}.{LORA}")
+            if lora_dir is not None and v.component == "lora"
+            else self._variant(ref.repo_id, info.sha, v, in_use)
+            for v in layout.variants
+        ]
         pipeline = (
             self._pipeline(ref.repo_id, info.sha, layout.pipeline, in_use)
             if layout.pipeline is not None
@@ -250,6 +274,33 @@ class HubService:
             else partial_bytes(repo_id, v.files, models_dir=self.models_dir),
         )
 
+    def _lora_variant(self, repo_id: str, v: Variant, lora_dir: Path, role: str) -> dto.HubVariant:
+        """A LoRA: what counts is its copy in the engine's LoRA folder. A copy anywhere
+        else is what an install copies in."""
+        view = self._variant(repo_id, None, v, {})
+        copy = find_copy(repo_id, v.files, models_dir=lora_dir, cache_dir=None)
+        local = None
+        if copy is not None and copy.source == "models_dir":
+            local = dto.HubLocal(source="lora_dir", path=str(copy.path), in_use=[role])
+        return view.model_copy(
+            update={
+                "local": local,
+                "copy_from": None if local else view.local,
+                "partial_bytes": 0
+                if local
+                else partial_bytes(repo_id, v.files, models_dir=lora_dir),
+            }
+        )
+
+    def _lora_dir(self, config: BackendConfig | None) -> Path | None:
+        """Where an engine that takes LoRAs from a folder here gets them, or would: an
+        sd-server launched here, a Diffusers backend."""
+        if isinstance(config, DiffusersBackendConfig) or (
+            isinstance(config, SdCppBackendConfig) and config.launch is not None
+        ):
+            return launch.lora_dir(config, self._settings)
+        return None
+
     def _pipeline(
         self, repo_id: str, sha: str | None, p: Pipeline, in_use: dict[str, list[str]]
     ) -> dto.HubPipeline:
@@ -272,7 +323,8 @@ class HubService:
 
     def _roles(self, ref: HubRef, layout: RepoLayout, config: BackendConfig) -> list[dto.HubRole]:
         if isinstance(config, DiffusersBackendConfig):
-            return [dto.HubRole(key=MODEL_ID, what="Diffusers pipeline", current=config.model_id)]
+            pipeline = dto.HubRole(key=MODEL_ID, what="Diffusers pipeline", current=config.model_id)
+            return [pipeline, self._lora_role(layout, config)]
         fitting = roles_for(config.type, layout)
         named = PurePosixPath(ref.path) if ref.path else None
         roles = []
@@ -294,7 +346,22 @@ class HubService:
                     suggested=pick.id if pick else None,
                 )
             )
+        if isinstance(config, SdCppBackendConfig) and config.launch is not None:
+            roles.append(self._lora_role(layout, config))
         return roles
+
+    def _lora_role(
+        self, layout: RepoLayout, config: SdCppBackendConfig | DiffusersBackendConfig
+    ) -> dto.HubRole:
+        current = launch.configured_lora_dir(config)
+        return dto.HubRole(
+            key=LORA,
+            flag="--lora-model-dir" if isinstance(config, SdCppBackendConfig) else "lora_dir",
+            what="LoRAs",
+            current=str(current) if current is not None else None,
+            candidates=[v.id for v in _loras_for(config, layout)],
+            folder=str(launch.lora_dir(config, self._settings)),
+        )
 
     def _in_use(self) -> dict[str, list[str]]:
         """Resolved path -> the '<engine>.<setting>'s pointed at it."""
@@ -323,6 +390,7 @@ class HubService:
         if body.revision:
             ref = HubRef(ref.repo_id, body.revision, ref.path, ref.quant)
         assign: tuple[str, str] | None = None
+        source: Path | None = None  # a copy on this machine to copy instead of downloading
         config = None
         if body.engine is not None:
             config = self._engine_config(body.engine)
@@ -336,7 +404,41 @@ class HubService:
             variant = layout.variant(body.variant)
             if variant is None:
                 raise NotFoundError(f"{ref.repo_id} has no model file {body.variant!r}")
-            if config is not None:
+            if config is not None and body.key == LORA:
+                lora_dir = self._lora_dir(config)
+                if lora_dir is None:
+                    raise InvalidRequestError(
+                        "only an sd-server launched here or a Diffusers backend takes LoRAs "
+                        "from the Hub"
+                    )
+                assert isinstance(config, SdCppBackendConfig | DiffusersBackendConfig)
+                assert body.engine is not None
+                if variant not in _loras_for(config, layout):
+                    what = "sd-server" if isinstance(config, SdCppBackendConfig) else "Diffusers"
+                    raise InvalidRequestError(f"{variant.id} is not a LoRA {what} can apply")
+                root = repo_dir(lora_dir, ref.repo_id)
+                has_folder = launch.configured_lora_dir(config) is not None
+                assign = None if has_folder else (body.engine, LORA_FOLDERS[config.type])
+                copy = await asyncio.to_thread(
+                    find_copy,
+                    ref.repo_id,
+                    variant.files,
+                    models_dir=self.models_dir,
+                    cache_dir=self.cache_dir,
+                )
+                if copy is not None and copy.root != root:
+                    source = copy.root
+                if self.on_lora_install is not None:
+                    await self.on_lora_install(
+                        root / safe_relpath(variant.id),
+                        {
+                            "repo": ref.repo_id,
+                            "revision": commit,
+                            "words": info.instance_prompt,
+                            "base_models": list(info.base_models),
+                        },
+                    )
+            elif config is not None:
                 _check_fit(config, body.key, layout, variant)
             files, label, target = variant.files, variant.name, root / safe_relpath(variant.id)
         else:
@@ -361,8 +463,25 @@ class HubService:
             root=root,
             target=target,
             assign=assign,
+            source=source,
         )
         return download_view(job)
+
+    async def card(self, repo_id: str, revision: str = "main") -> RepoInfo:
+        """A repo's card, as the Hub reports it."""
+        self._require_enabled()
+        return await self.client.repo(repo_id, revision)
+
+    async def fetch(self, repo_id: str, revision: str, path: str, max_bytes: int) -> bytes:
+        """A small file from a repo (a card's image), up to ``max_bytes``."""
+        self._require_enabled()
+        body = bytearray()
+        async with self.client.open(repo_id, revision, path) as resp:
+            async for chunk in resp.aiter_bytes():
+                body += chunk
+                if len(body) > max_bytes:
+                    raise InvalidRequestError(f"{path} in {repo_id} is over {max_bytes} bytes")
+        return bytes(body)
 
     def list_downloads(self) -> list[dto.HubDownload]:
         return [download_view(j) for j in self.downloads.jobs()]
@@ -377,6 +496,13 @@ class HubService:
         for engine, key in job.assign:
             if key == MODEL_ID:
                 update = dto.EngineUpdate(model_id=str(job.target))
+            elif key in LORA_FOLDERS.values():
+                # A LoRA's root is <LoRA folder>/<owner>/<name>.
+                folder = str(job.root.parents[1])
+                if key == "lora_dir":
+                    update = dto.EngineUpdate(lora_dir=folder)
+                else:
+                    update = dto.EngineUpdate(launch=dto.EngineLaunchUpdate(lora_model_dir=folder))
             else:
                 update = dto.EngineUpdate(
                     launch=dto.EngineLaunchUpdate(files={key: str(job.target)})
@@ -409,6 +535,16 @@ def download_view(job: DownloadJob) -> dto.HubDownload:
         error=job.error,
         warning=job.warning,
     )
+
+
+def _loras_for(
+    config: SdCppBackendConfig | DiffusersBackendConfig, layout: RepoLayout
+) -> list[Variant]:
+    """The repo's LoRAs the engine can apply: Diffusers loads only safetensors files."""
+    if isinstance(config, DiffusersBackendConfig):
+        allowed = diffusers_inproc.LORA_EXTENSIONS
+        return [v for v in loras_in(layout) if PurePosixPath(v.id).suffix.lower() in allowed]
+    return loras_in(layout)
 
 
 def _pipeline_problem(p: Pipeline) -> str | None:

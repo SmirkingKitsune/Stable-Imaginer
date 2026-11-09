@@ -1,19 +1,23 @@
 import asyncio
 import base64
+import hashlib
 import threading
+from pathlib import Path
 from typing import Any
 
 import pytest
 
 from imaginer.backends.base import EditRequest, GenProgress, GenRequest, ImageInput
+from imaginer.backends.common import lora_matches
 from imaginer.backends.sdcpp import SdCppBackend
+from imaginer.core.config import LoraRef
 from imaginer.domain.enums import BackendStatus, Capability
 from imaginer.domain.errors import EngineError, InvalidRequestError
 from imaginer.services.media import inspect_image_bytes
 from tests.conftest import sd_config
 from tests.fakes.fake_sdcpp import RGBA_MARKER, FakeSdCpp
 from tests.fakes.live import dead_url
-from tests.helpers import image_bytes
+from tests.helpers import image_bytes, safetensors_file
 
 ALL = {Capability.T2I, Capability.EDIT, Capability.MULTI_REF, Capability.RGBA}
 
@@ -250,3 +254,208 @@ async def test_mask_goes_last_with_an_instruction(fake_sd: FakeSdCpp) -> None:
     assert len(body["ref_images"]) == 2
     assert body["prompt"].startswith("make it a lake The last image is a mask")
     await backend.aclose()
+
+
+# --- LoRAs and presets ------------------------------------------------------------
+
+DISTILL = "qwen/p_q_image_2.1_8_steps_v0.1_comfyui_bf16.safetensors"
+FAST = {
+    "fast": {
+        "description": "8-step draft",
+        "loras": [{"path": "p_q_image_2.1_8_steps_v0.1_comfyui_bf16"}],
+        "steps": 2,
+        "cfg_scale": 1.0,
+    },
+    "plain": {"loras": []},
+}
+
+
+def _defaults(**fields: Any) -> dict[str, Any]:
+    return {"width": 256, "height": 256, "steps": 3, "cfg_scale": 6.0, **fields}
+
+
+async def test_lora_capability_comes_with_a_lora_listing(fake_sd: FakeSdCpp) -> None:
+    backend = await _backend(fake_sd.url)  # an older server: no listing, no lora field
+    assert Capability.LORA not in backend.capabilities()
+    listed: list[str] | None = backend.available_loras
+    assert listed is None
+    fake_sd.loras = []  # a newer server with an empty folder can still take LoRAs
+    await backend.health()
+    assert Capability.LORA in backend.capabilities()
+    listed = backend.available_loras
+    assert listed == []
+    fake_sd.loras, fake_sd.origin, fake_sd.lora_feature = [DISTILL], "recipe", False
+    await backend.health()
+    assert Capability.LORA not in backend.capabilities()
+    await backend.aclose()
+
+
+async def test_preset_sends_loras_and_its_settings(fake_sd: FakeSdCpp) -> None:
+    fake_sd.loras = [DISTILL, "style/ink.safetensors"]
+    backend = await _backend(fake_sd.url, presets=FAST)
+    (result,) = await backend.generate(GenRequest(prompt="x", seed=1, preset="fast"))
+    body = fake_sd.requests[-1]
+    # Named by its stem in the config; sent as the path the server listed.
+    assert body["lora"] == [{"path": DISTILL, "multiplier": 1.0}]
+    assert body["sample_params"]["sample_steps"] == 2
+    assert body["sample_params"]["guidance"] == {"txt_cfg": 1.0}
+    assert body["sample_params"]["sample_method"] == "euler"  # unset in the preset: default
+    assert result.params["preset"] == "fast"
+    assert result.params["loras"] == [{"path": DISTILL, "weight": 1.0}]
+    assert result.params["steps"] == 2
+    await backend.aclose()
+
+
+async def test_request_settings_win_over_the_preset(fake_sd: FakeSdCpp) -> None:
+    fake_sd.loras = [DISTILL]
+    backend = await _backend(fake_sd.url, presets=FAST)
+    await backend.generate(GenRequest(prompt="x", seed=1, preset="fast", params={"steps": 5}))
+    assert fake_sd.requests[-1]["sample_params"]["sample_steps"] == 5
+    await backend.aclose()
+
+
+async def test_preset_steps_replace_a_default_sigma_schedule(fake_sd: FakeSdCpp) -> None:
+    presets = {"slow": {"steps": 20}, "turbo": {"sigmas": "qwen-image-2.1-turbo"}}
+    defaults = _defaults(sigmas="qwen-image-2.1-turbo")
+    backend = await _backend(fake_sd.url, defaults=defaults, presets=presets)
+    await backend.generate(GenRequest(prompt="x", seed=1, preset="slow"))
+    sample = fake_sd.requests[-1]["sample_params"]
+    assert sample["sample_steps"] == 20 and "custom_sigmas" not in sample
+    await backend.generate(GenRequest(prompt="x", seed=1, preset="turbo"))
+    assert "custom_sigmas" in fake_sd.requests[-1]["sample_params"]
+    await backend.aclose()
+
+
+async def test_default_loras_apply_unless_a_preset_drops_them(fake_sd: FakeSdCpp) -> None:
+    fake_sd.loras = ["style/ink.safetensors"]
+    defaults = _defaults(loras=[{"path": r"style\ink.safetensors", "weight": 0.6}])
+    backend = await _backend(fake_sd.url, defaults=defaults, presets=FAST)
+    await backend.generate(GenRequest(prompt="x", seed=1))
+    assert fake_sd.requests[-1]["lora"] == [{"path": "style/ink.safetensors", "multiplier": 0.6}]
+    (result,) = await backend.generate(GenRequest(prompt="x", seed=1, preset="plain"))
+    assert "lora" not in fake_sd.requests[-1]
+    assert "loras" not in result.params
+    await backend.aclose()
+
+
+async def test_lora_added_after_the_probe_is_found(fake_sd: FakeSdCpp) -> None:
+    fake_sd.loras = []
+    backend = await _backend(fake_sd.url, presets=FAST)
+    fake_sd.loras = [DISTILL]  # dropped into the folder since: sd-server rescans per request
+    await backend.generate(GenRequest(prompt="x", seed=1, preset="fast"))
+    assert fake_sd.requests[-1]["lora"][0]["path"] == DISTILL
+    await backend.aclose()
+
+
+async def test_a_requests_loras_go_on_top_of_the_presets(fake_sd: FakeSdCpp) -> None:
+    fake_sd.loras = [DISTILL, "style/ink.safetensors"]
+    backend = await _backend(fake_sd.url, presets=FAST)
+    picks = (LoraRef(path="ink", weight=0.7), LoraRef(path=DISTILL, weight=0.5))
+    (result,) = await backend.generate(GenRequest(prompt="x", seed=1, preset="fast", loras=picks))
+    # The preset's LoRA keeps its place at the request's weight; the request's own follows.
+    applied = [{"path": DISTILL, "weight": 0.5}, {"path": "style/ink.safetensors", "weight": 0.7}]
+    assert fake_sd.requests[-1]["lora"] == [
+        {"path": x["path"], "multiplier": x["weight"]} for x in applied
+    ]
+    assert result.params["loras"] == applied
+    # Weight 0 turns one off.
+    off = (LoraRef(path="p_q_image_2.1_8_steps_v0.1_comfyui_bf16.safetensors", weight=0),)
+    (result,) = await backend.generate(GenRequest(prompt="x", seed=1, preset="fast", loras=off))
+    assert "lora" not in fake_sd.requests[-1]
+    assert "loras" not in result.params
+    assert result.params["steps"] == 2  # the rest of the preset still applies
+    await backend.aclose()
+
+
+async def test_the_loras_of_an_engine_launched_here_are_hashed(
+    fake_sd: FakeSdCpp, tmp_path: Path
+) -> None:
+    folder = tmp_path / "loras"
+    (folder / "style").mkdir(parents=True)
+    (folder / "style" / "ink.safetensors").write_bytes(b"ink weights")
+    (tmp_path / "outside.safetensors").write_bytes(b"not in the folder")
+    fake_sd.loras = ["style/ink.safetensors", "gone.safetensors", "../outside.safetensors"]
+    backend = await _backend(fake_sd.url, launch={"lora_model_dir": folder})
+    picks = (LoraRef(path="ink"), LoraRef(path="gone"), LoraRef(path="../outside.safetensors"))
+    (result,) = await backend.generate(GenRequest(prompt="x", seed=1, loras=picks))
+    ink = hashlib.sha256(b"ink weights").hexdigest()
+    assert result.params["loras"] == [
+        {"path": "style/ink.safetensors", "weight": 1.0, "sha256": ink},
+        {"path": "gone.safetensors", "weight": 1.0},  # listed, but no file to read
+        {"path": "../outside.safetensors", "weight": 1.0},  # never read outside the folder
+    ]
+    assert all("sha256" not in x for x in fake_sd.requests[-1]["lora"])
+    await backend.aclose()
+
+
+async def test_a_loras_trigger_phrase_is_added_to_the_prompt(
+    fake_sd: FakeSdCpp, tmp_path: Path
+) -> None:
+    folder = tmp_path / "loras"
+    folder.mkdir()
+    safetensors_file(folder / "clay.safetensors", {"trigger_word": "clay sculpture style"})
+    safetensors_file(folder / "plain.safetensors", {"ss_network_dim": "16"})
+    fake_sd.loras = ["clay.safetensors", "plain.safetensors"]
+    backend = await _backend(fake_sd.url, launch={"lora_model_dir": folder})
+    picks = (LoraRef(path="clay"), LoraRef(path="plain"))
+    (result,) = await backend.generate(GenRequest(prompt="a fox.", seed=1, loras=picks))
+    assert fake_sd.requests[-1]["prompt"] == "a fox. clay sculpture style"
+    assert [x.get("trigger") for x in result.params["loras"]] == ["clay sculpture style", None]
+    (again,) = await backend.generate(
+        GenRequest(prompt="A fox in Clay Sculpture Style", seed=1, loras=picks)
+    )
+    assert fake_sd.requests[-1]["prompt"] == "A fox in Clay Sculpture Style"  # has it already
+    assert "trigger" not in again.params["loras"][0]
+    await backend.aclose()
+
+    remote = await _backend(fake_sd.url)  # its LoRA files aren't on this machine
+    await remote.generate(GenRequest(prompt="a fox", seed=1, loras=picks))
+    assert fake_sd.requests[-1]["prompt"] == "a fox"
+    await remote.aclose()
+
+
+@pytest.mark.parametrize(
+    ("listed", "match"),
+    [
+        ([], "it lists none .*--lora-model-dir"),
+        (["style/ink.safetensors"], r"has no LoRA .* \(it has: style/ink\.safetensors\)"),
+        (
+            ["a/p_q_image_2.1_8_steps_v0.1_comfyui_bf16.safetensors", DISTILL],
+            "could be any of a/p_q.*, qwen/p_q",
+        ),
+    ],
+)
+async def test_lora_the_engine_cannot_name(
+    fake_sd: FakeSdCpp, listed: list[str], match: str
+) -> None:
+    fake_sd.loras = listed
+    backend = await _backend(fake_sd.url, presets=FAST)
+    with pytest.raises(InvalidRequestError, match=match):
+        await backend.generate(GenRequest(prompt="x", seed=1, preset="fast"))
+    assert fake_sd.requests == []  # nothing was sent
+    await backend.aclose()
+
+
+async def test_unknown_preset(fake_sd: FakeSdCpp) -> None:
+    backend = await _backend(fake_sd.url, presets=FAST)
+    with pytest.raises(
+        InvalidRequestError, match=r"no image preset 'slow' \(it has: fast, plain\)"
+    ):
+        await backend.generate(GenRequest(prompt="x", seed=1, preset="slow"))
+    with pytest.raises(ValueError, match="unknown sigma preset"):
+        SdCppBackend("sd", sd_config(fake_sd.url, presets={"t": {"sigmas": "nope"}}))
+    await backend.aclose()
+
+
+def test_lora_matches() -> None:
+    catalog: dict[str, dict[str, Any]] = {
+        "a/one.safetensors": {"name": "one"},
+        "b/one.gguf": {"name": "one"},
+        "two.safetensors": {"name": "two"},
+    }
+    assert lora_matches("two.safetensors", catalog) == ["two.safetensors"]
+    assert lora_matches(r"a\one.safetensors", catalog) == ["a/one.safetensors"]
+    assert lora_matches("one.gguf", catalog) == ["b/one.gguf"]
+    assert lora_matches("two", catalog) == ["two.safetensors"]
+    assert lora_matches("one", catalog) == ["a/one.safetensors", "b/one.gguf"]
+    assert lora_matches("three", catalog) == []

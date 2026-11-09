@@ -9,7 +9,7 @@ from typing import Any
 import httpx
 import pytest
 
-from imaginer.core.config import LinkShare, RoutingConfig
+from imaginer.core.config import ImagePreset, LinkShare, LoraRef, RoutingConfig
 from imaginer.domain.enums import BackendKind
 from tests.conftest import llama_config, sd_config
 from tests.fakes.fake_llama import FakeLlama
@@ -154,6 +154,57 @@ async def test_images_come_from_the_linked_instance(desk_and_nas: Pair, fake_sd:
     assert fake_sd.requests  # the desk's engine made it
     async with desk.client() as client:
         assert (await client.get("/v1/conversations")).json()["items"] == []
+
+
+async def test_presets_and_loras_reach_the_engine_through_the_link(
+    make_instance: InstanceFactory, fake_llama: FakeLlama, fake_sd: FakeSdCpp
+) -> None:
+    fake_sd.loras = ["draft-8-steps.safetensors", "styles/ink.safetensors"]
+    draft = ImagePreset(loras=[LoraRef(path="draft-8-steps")], steps=2, cfg_scale=1.0)
+    desk = make_instance(
+        "desk",
+        backends={"sd": sd_config(fake_sd.url, presets={"draft": draft})},
+        routing=RoutingConfig(t2i="sd", edit="sd"),
+        share={"sd": LinkShare()},
+    )
+    nas = make_instance(
+        "nas",
+        backends={
+            "llama": llama_config(fake_llama.url),
+            "sd_desk": linked("desk", "sd", BackendKind.IMAGE),
+        },
+        routing=RoutingConfig(chat="llama", t2i="sd_desk", edit="sd_desk"),
+    )
+    await pair(nas, desk, name="desk")
+    fake_llama.queue(
+        FakeLlama.tool_call("generate_image", {"prompt": "a fox"}), FakeLlama.text("Done.")
+    )
+    async with nas.client() as client:
+        backends = {b["name"]: b for b in (await client.get("/v1/backends")).json()}
+        sd = backends["sd_desk"]
+        assert "lora" in sd["capabilities"]
+        assert sd["available_loras"] == fake_sd.loras
+        assert [(p["name"], p["steps"]) for p in sd["image_presets"]] == [("draft", 2)]
+        cid = (await client.post("/v1/conversations", json={})).json()["id"]
+        options = {"preset": "draft", "loras": [{"path": "ink", "weight": 0.5}]}
+        resp = await client.post(
+            f"/v1/conversations/{cid}/messages",
+            json={"content": "draw a fox", "image_options": options},
+        )
+        assert resp.status_code == 200, resp.text
+        (job,) = (await client.get(f"/v1/conversations/{cid}/jobs")).json()["items"]
+    assert (job["backend"], job["status"]) == ("sd_desk", "succeeded")
+    (body,) = fake_sd.requests  # the desk's engine, with the preset and LoRAs applied there
+    assert body["lora"] == [
+        {"path": "draft-8-steps.safetensors", "multiplier": 1.0},
+        {"path": "styles/ink.safetensors", "multiplier": 0.5},
+    ]
+    assert body["sample_params"]["sample_steps"] == 2
+    resolved = job["params"]["resolved"]
+    assert [(x["path"], x["weight"]) for x in resolved["loras"]] == [
+        ("draft-8-steps.safetensors", 1.0),
+        ("styles/ink.safetensors", 0.5),
+    ]
 
 
 async def test_gallery_shows_both_and_remote_conversations_run_at_their_origin(

@@ -97,7 +97,7 @@ Engines or Links routes, the merged gallery, or the proxy, so nothing is transit
 ### Shared engines and fit
 
 Each shared engine in `PeerStatus` carries its model, health, capabilities, image defaults,
-queue depth and an `availability`:
+image presets, `available_loras`, queue depth and an `availability`:
 
 | `state` | Meaning |
 |---|---|
@@ -124,10 +124,19 @@ loaded engine is still checked before each request runs on it.
 - then `done`, or `error` with problem details (`status`, `code`, `title`, `detail`).
 
 `images` takes `{op: generate|edit, prompt, seed, negative_prompt, width, height,
-aspect_ratio, alpha, params, images: [{data_b64, mime, label, width, height}], mask}` and sends
+aspect_ratio, alpha, params, images: [{data_b64, mime, label, width, height}], mask, preset,
+loras: [{path, weight}]}` and sends
 `status` (`loading`, `queued`, `running`), `submitted` `{request_id}`, `progress` `{step,
 total_steps}`, `result` (the image as base64, with its size, alpha, seed and resolved
 params), then `done` or `error`.
+
+A shared image engine's presets and LoRAs show on the calling side as a local engine's do,
+in the prompt bar's Preset and LoRAs rows. A request names them, and the sharing instance
+resolves them as it would for its own jobs: the preset's settings, its LoRAs merged with the
+request's, then the job's record (with each LoRA's SHA-256 when the engine runs there). `preset`
+and `loras` are sent only when set, and `lora` is offered only by an engine that reports
+`available_loras`, so an instance from before them still takes every other request. A `cold`
+engine that will take LoRAs reports an empty list until it is up.
 
 Image requests wait at the same gate as the sharing instance's own jobs (`concurrency`), so
 a GPU never runs more than it is set to, whoever asked. When the caller disconnects, the

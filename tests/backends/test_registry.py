@@ -14,12 +14,18 @@ from imaginer.core.config import (
     OrchestrationConfig,
     RoutingConfig,
     SdCppBackendConfig,
+    SdCppLaunch,
     Settings,
 )
 from imaginer.domain.enums import BackendStatus, Capability
-from imaginer.domain.errors import CapabilityUnavailableError, EngineUnavailableError
-from tests.conftest import SettingsFactory, llama_config, refusing_llama
+from imaginer.domain.errors import (
+    CapabilityUnavailableError,
+    EngineUnavailableError,
+    InvalidRequestError,
+)
+from tests.conftest import SettingsFactory, llama_config, refusing_llama, sd_config
 from tests.fakes.fake_llama import FakeLlama
+from tests.fakes.fake_sdcpp import FakeSdCpp
 from tests.fakes.live import dead_url
 
 
@@ -213,6 +219,19 @@ async def test_launch_only_changes_keep_the_adapter(make_settings: SettingsFacto
     await registry.aclose()
 
 
+async def test_a_new_lora_folder_gets_a_new_adapter(make_settings: SettingsFactory) -> None:
+    """sd-server's adapter reads its LoRA folder (to hash LoRAs), unlike other launch settings."""
+    settings = make_settings(backends={"sd": sd_config("http://127.0.0.1:1")})
+    registry = BackendRegistry.from_settings(settings)
+    config = registry.config("sd")
+    files = config.model_copy(update={"launch": SdCppLaunch(diffusion_model=Path("q.gguf"))})
+    assert registry.reconfigure("sd", files) is False
+    assert isinstance(files, SdCppBackendConfig) and files.launch is not None
+    folder = files.launch.model_copy(update={"lora_model_dir": Path("loras")})
+    assert registry.reconfigure("sd", files.model_copy(update={"launch": folder})) is True
+    await registry.aclose()
+
+
 async def test_shutdown_closes_retired_adapters_still_leased(
     make_settings: SettingsFactory,
 ) -> None:
@@ -222,3 +241,50 @@ async def test_shutdown_closes_retired_adapters_still_leased(
     registry.reconfigure("llama", moved)
     await registry.aclose()
     assert _closed(lease.backend)
+
+
+# --- presets -------------------------------------------------------------------------
+
+PRESETS = {
+    "fast": {"loras": [{"path": "distill.safetensors"}], "steps": 8, "cfg_scale": 1.0},
+    "crisp": {"cfg_scale": 3.0},
+}
+
+
+def _two_image_backends(make_settings: SettingsFactory, url: str) -> Settings:
+    """t2i on "draw" (with presets), edit on "edit" (none)."""
+    return make_settings(
+        backends={"draw": sd_config(url, presets=PRESETS), "edit": sd_config(url)},
+        routing=RoutingConfig(t2i="draw", edit="edit"),
+        orchestration=OrchestrationConfig(probe_ttl_s=0),
+    )
+
+
+async def test_validate_image_preset(make_settings: SettingsFactory, fake_sd: FakeSdCpp) -> None:
+    registry = BackendRegistry.from_settings(_two_image_backends(make_settings, fake_sd.url))
+    registry.validate_image_preset("fast")  # the t2i default has it
+    registry.validate_image_preset("fast", "draw")
+    with pytest.raises(InvalidRequestError, match=r"backend 'edit' has no image preset 'fast'"):
+        registry.validate_image_preset("fast", "edit")
+    with pytest.raises(
+        InvalidRequestError, match=r"no image preset 'slow' on draw, edit \(presets: crisp, fast\)"
+    ):
+        registry.validate_image_preset("slow")
+    await registry.aclose()
+
+
+async def test_a_preset_with_loras_routes_only_to_an_engine_that_takes_them(
+    make_settings: SettingsFactory, fake_sd: FakeSdCpp
+) -> None:
+    registry = BackendRegistry.from_settings(_two_image_backends(make_settings, fake_sd.url))
+    lease = await registry.image_backend("t2i", preset="crisp")  # no LoRAs: no lora needed
+    lease.release()
+    with pytest.raises(CapabilityUnavailableError, match="lacks lora"):
+        await registry.image_backend("t2i", preset="fast")  # the fake lists no LoRAs
+    fake_sd.loras = ["distill.safetensors"]
+    (await registry.image_backend("t2i", preset="fast")).release()
+    with pytest.raises(InvalidRequestError, match="no image preset 'fast'"):
+        await registry.image_backend("edit", preset="fast")
+    assert registry.image_preset("t2i", None, "fast") is not None
+    assert registry.image_preset("edit", None, "fast") is None
+    await registry.aclose()

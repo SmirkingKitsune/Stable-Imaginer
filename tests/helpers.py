@@ -1,6 +1,8 @@
 import io
 import json
 import os
+import struct
+from pathlib import Path
 from typing import Any
 
 from PIL import Image
@@ -47,3 +49,12 @@ def parse_sse(text: str) -> list[tuple[str, int, dict[str, Any]]]:
         if "event" in fields:
             events.append((fields["event"], int(fields["id"]), json.loads("\n".join(data_lines))))
     return events
+
+
+def safetensors_file(path: Path, metadata: dict[str, str]) -> Path:
+    """A one-tensor safetensors file with ``metadata`` in its header, as a LoRA trainer
+    leaves its trigger phrase."""
+    header = {"__metadata__": metadata, "w": {"dtype": "F16", "shape": [1], "data_offsets": [0, 2]}}
+    raw = json.dumps(header).encode()
+    path.write_bytes(struct.pack("<Q", len(raw)) + raw + b"\0\0")
+    return path

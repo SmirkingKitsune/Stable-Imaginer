@@ -30,6 +30,7 @@ from imaginer.core.config import (
     BackendConfig,
     LinkedBackendConfig,
     LlamaCppBackendConfig,
+    LoraRef,
     SdCppBackendConfig,
     Settings,
     backend_kind,
@@ -106,10 +107,13 @@ class PeerEngines:
         )
         kind = backend_kind(config)
         capabilities = info.capabilities
+        loras = info.available_loras
         if availability.state == "cold" and not capabilities:
             # A stopped engine reports none, but the caller routes by them: without these
             # its first request would be refused there and never get here to start it.
             capabilities = sorted(_expected(config))
+            if Capability.LORA in capabilities:
+                loras = []  # listed once it is up; a preset's LoRAs can still be asked for
         return dto.SharedEngine(
             name=name,
             type=config.type,
@@ -120,6 +124,8 @@ class PeerEngines:
             capabilities=capabilities,
             max_ref_images=getattr(config, "max_ref_images", None),
             image_defaults=info.image_defaults,
+            image_presets=info.image_presets,
+            available_loras=loras,
             queue_depth=self._gates.queue_depth(name) if kind is BackendKind.IMAGE else 0,
             availability=availability,
         )
@@ -227,10 +233,12 @@ class PeerEngines:
             require.add(Capability.RGBA)
         if len(body.images) > 1:
             require.add(Capability.MULTI_REF)
+        if body.loras:
+            require.add(Capability.LORA)
         async for state in self._ensure_ready(name):
             yield "status", state
         task: Literal["t2i", "edit"] = "edit" if body.op == "edit" else "t2i"
-        lease = await self._registry.image_backend(task, name, require=require)
+        lease = await self._registry.image_backend(task, name, require=require, preset=body.preset)
         request_id = new_id()
         try:
             if self._gates.queue_depth(name):
@@ -310,6 +318,8 @@ def _request(body: dto.PeerImageRequest, on_progress: Any) -> GenRequest | EditR
         "height": body.height,
         "aspect_ratio": body.aspect_ratio,
         "alpha": body.alpha,
+        "preset": body.preset,
+        "loras": tuple(LoraRef(path=x.path, weight=x.weight) for x in body.loras),
         "params": body.params,
         "on_progress": on_progress,
     }

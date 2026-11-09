@@ -11,7 +11,17 @@ from fastapi import APIRouter, Depends, FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from imaginer import __version__
-from imaginer.api import artifacts, backends, conversations, engines, hub, jobs, links, messages
+from imaginer.api import (
+    artifacts,
+    backends,
+    conversations,
+    engines,
+    hub,
+    jobs,
+    links,
+    loras,
+    messages,
+)
 from imaginer.api.auth import allow_gallery, require_auth, require_user
 from imaginer.api.errors import install_error_handlers
 from imaginer.api.middleware import RequestContextMiddleware
@@ -71,6 +81,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     own = APIRouter(dependencies=[Depends(require_auth), Depends(require_user)])
     own.include_router(engines.router)
     own.include_router(hub.router)
+    own.include_router(loras.router)
     own.include_router(links.router)
     own.include_router(links.gallery_router)
     app.include_router(own)

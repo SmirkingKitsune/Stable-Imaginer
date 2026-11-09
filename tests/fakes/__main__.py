@@ -17,10 +17,16 @@ def main() -> None:
     parser.add_argument("--llama-port", type=int, default=18080)
     parser.add_argument("--sd-port", type=int, default=11234)
     parser.add_argument("--sd-step-delay", type=float, default=0.3, help="seconds per fake step")
+    parser.add_argument(
+        "--sd-loras",
+        default="draft-8-steps.safetensors,styles/ink-wash.safetensors,styles/film-grain.safetensors",
+        help="comma-separated LoRA paths the fake sd-server lists ('' for none)",
+    )
     args = parser.parse_args()
 
     llama = FakeLlama(url=f"http://127.0.0.1:{args.llama_port}")
     sd = FakeSdCpp(url=f"http://127.0.0.1:{args.sd_port}", step_delay_s=args.sd_step_delay)
+    sd.loras = [path for path in args.sd_loras.split(",") if path]
     sd_server = uvicorn.Server(
         uvicorn.Config(sd.app(), host="127.0.0.1", port=args.sd_port, log_level="warning")
     )

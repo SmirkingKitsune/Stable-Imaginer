@@ -16,6 +16,8 @@ it runs the same on a live listing and in tests. The shapes it knows:
   conversion, which the Hub lists as the repo's quantized versions; sd-server can read one as
   a text encoder through its index.
 * **Loose safetensors:** anything else, classified by folder and file name.
+* **Adapters:** a repo the Hub tags as a LoRA (``lora``, ``base_model:adapter:...``) holds
+  LoRAs wherever no folder names another component, whatever the files are called.
 """
 
 import re
@@ -170,13 +172,20 @@ def task_kind(pipeline_tag: str | None) -> TaskKind | None:
     return None
 
 
+def is_adapter(tags: Iterable[str]) -> bool:
+    """Whether the Hub tags a repo as LoRA weights for some base model."""
+    return any(t.lower() == "lora" or t.startswith("base_model:adapter:") for t in tags)
+
+
 def classify(
     files: Iterable[RepoFile],
     *,
     repo_id: str = "",
     pipeline_tag: str | None = None,
     model_index: Mapping[str, Any] | None = None,
+    adapter: bool = False,
 ) -> RepoLayout:
+    """``adapter``: the repo is tagged as a LoRA (``is_adapter``)."""
     files = list(files)
     paths = {f.path for f in files}
     task = task_kind(pipeline_tag)
@@ -227,7 +236,13 @@ def classify(
             Variant(
                 name=(prefix.rstrip("/") or repo_name or base) if generic else base,
                 component=_component(
-                    shards[-1].path, base, task, repo_id, "config.json" in paths, components
+                    shards[-1].path,
+                    base,
+                    task,
+                    repo_id,
+                    "config.json" in paths,
+                    components,
+                    adapter=adapter and pipeline is None,
                 ),
                 format=fmt,
                 files=shards,
@@ -274,6 +289,8 @@ def _component(
     repo_id: str,
     configured: bool,
     pipeline_components: set[str],
+    *,
+    adapter: bool = False,
 ) -> Component:
     p = PurePosixPath(path)
     lower = base.lower()
@@ -285,6 +302,8 @@ def _component(
             return found
     if len(p.parts) > 1 and p.parts[0] in pipeline_components:
         return "other"  # a pipeline part no engine setting takes (image_encoder, ...)
+    if adapter:
+        return "lora"  # e.g. Qwen-Image-Lightning-8steps-V1.0.safetensors
     repo_name = repo_id.rpartition("/")[2].lower()
     if lower == "diffusion_pytorch_model":
         # One Diffusers component published on its own: only the repo's name says which.
@@ -411,6 +430,14 @@ ROLES: dict[str, dict[str, Role]] = {
         "llm_vision": Role(frozenset({"mmproj"}), _GGUF, split_gguf=False),
     },
 }
+# Not a launch setting: a LoRA goes into sd-server's --lora-model-dir, which lists it.
+LORA_ROLE = Role(frozenset({"lora"}), _ANY, split_gguf=False)
+
+
+def loras_in(layout: RepoLayout) -> list[Variant]:
+    """The repo's LoRAs sd-server can apply (single files), by name."""
+    found = [v for v in layout.variants if v.component in LORA_ROLE.components]
+    return sorted((v for v in found if LORA_ROLE.loads(v)), key=lambda v: v.name.lower())
 
 
 def roles_for(engine_type: str, layout: RepoLayout) -> dict[str, list[Variant]]:

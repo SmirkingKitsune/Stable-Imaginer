@@ -7,9 +7,13 @@ from imaginer.tools.base import Tool, ToolContext, ToolOutcome
 from imaginer.tools.images import (
     ImageOptions,
     apply_user_options,
+    image_prompt,
+    loras_requested,
     run_image_job,
     sampler_params,
+    user_loras,
     user_options_note,
+    user_preset,
 )
 
 
@@ -48,16 +52,20 @@ class GenerateImageTool(Tool):
         options = ctx.image_options
         args = apply_user_options(args, options)
         params = sampler_params(ctx)
+        preset = user_preset(options)
+        loras = user_loras(options)
         require = {Capability.RGBA} if args.transparent else set()
+        if loras:
+            require.add(Capability.LORA)
         lease = await self._registry.image_backend(
-            "t2i", options.backend if options else None, require=require
+            "t2i", options.backend if options else None, require=require, **preset
         )
         spec = JobSpec(
             conversation_id=ctx.conversation_id,
             task=JobTask.T2I,
             backend=lease.backend,
             lease=lease,
-            prompt=args.prompt,
+            prompt=image_prompt(args.prompt),
             negative_prompt=args.negative_prompt,
             seed=args.seed if args.seed is not None else random_seed(),
             n=args.n,
@@ -66,7 +74,14 @@ class GenerateImageTool(Tool):
             aspect_ratio=args.aspect_ratio,
             alpha=args.transparent,
             params=params,
-            requested={**args.model_dump(exclude_none=True), **params},
+            requested={
+                **args.model_dump(exclude_none=True),
+                **params,
+                **preset,
+                **loras_requested(loras),
+            },
+            **preset,
+            loras=loras,
             request_message_id=ctx.message_id,
             tool_call_id=ctx.tool_call_id,
         )

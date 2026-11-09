@@ -8,6 +8,7 @@ class Capability(StrEnum):
     EDIT = "edit"
     MULTI_REF = "multi_ref"
     RGBA = "rgba"
+    LORA = "lora"  # applies LoRAs named in a request
     CHAT = "chat"
     VISION_IN = "vision_in"
     TOOLS = "tools"

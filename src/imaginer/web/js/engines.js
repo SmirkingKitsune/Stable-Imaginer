@@ -1,5 +1,5 @@
-// Engines (designs 1a–1d): one backend at a time, with its runtime, model files, endpoint,
-// capabilities and startup log; engines that have launch settings start and stop here.
+// Engines (designs 1a–1d): one backend at a time, with its runtime, model files, LoRA folder,
+// endpoint, capabilities and startup log; engines that have launch settings start and stop here.
 // Runtime installs run in a dialog (1b plan, 1c progress) and keep going in the background.
 // The status line in any header opens a popover of the default engines (1d).
 //
@@ -22,10 +22,16 @@ const TITLES = {
 };
 const EXE = { sdcpp: 'sd-server', llamacpp: 'llama-server' };
 const CAPS = {
-  image: ['t2i', 'edit', 'multi_ref', 'rgba'],
+  image: ['t2i', 'edit', 'multi_ref', 'rgba', 'lora'],
   llm: ['chat', 'stream', 'tools', 'vision_in'],
 };
 const STATUS_WORD = { ok: 'ready', degraded: 'loading', down: 'down', unavailable: 'off', unknown: '…' };
+/** sd-server's --lora-apply-mode: [value ('' is its default), label, what it does]. */
+const LORA_MODES = [
+  ['', 'auto', 'sd-server decides: merged into full-precision weights, applied at runtime on quantized ones'],
+  ['immediately', 'merge', 'merged into the weights before sampling: no slower per step, but switching LoRAs re-merges'],
+  ['at_runtime', 'runtime', 'applied at every step: slower, but switching LoRAs costs nothing'],
+];
 
 const roleOf = (e) => (e.kind === 'llm' ? 'chat' : 'image');
 const size = (bytes) => (bytes == null ? '' : bytes >= 1e9 ? `${(bytes / 1e9).toFixed(1)} GB`
@@ -219,6 +225,7 @@ export function enginesScreen({ name: wanted = null, navigate }) {
     if (e.type === 'diffusers') left.append(modelCell(e));
     if (e.launchable) left.append(filesCell(e));
     else if (e.files.length) left.append(remoteCell(e));
+    if (e.loras) left.append(lorasCell(e));
     left.append(h('div.cell-pair', endpointCell(e), capsCell(e)));
     const right = e.launchable ? logPanel(e) : remoteNote(e);
     return [head, h('div.engine-grid', left, right)];
@@ -278,6 +285,62 @@ export function enginesScreen({ name: wanted = null, navigate }) {
         h('button.mini', { type: 'button', onclick: () => hubDialog(e, { onChange: refresh }) }, icon('search', 12), 'Hugging Face')),
       grid,
       needsVision && h('span.tray-hint', 'Without --llm_vision, sd-server can only do t2i: drop edit and multi_ref below.'));
+  }
+
+  /** The engine's LoRA folder (sd-server's --lora-model-dir, Diffusers' lora_dir): what
+   *  presets and messages can apply. */
+  function lorasCell(e) {
+    const l = e.loras;
+    const diffusers = e.type === 'diffusers';
+    const flag = diffusers ? 'lora_dir' : '--lora-model-dir';
+    const input = h('input.seed-input.path-input', {
+      type: 'text', value: l.path ?? '', placeholder: `not set · Hugging Face installs to ${l.default_path}`, spellcheck: false,
+      'aria-label': `${flag} (LoRA folder)`, title: 'A folder of LoRAs only, on this machine; made if it is not there yet',
+      onchange: () => {
+        const value = input.value.trim();
+        if (value === (l.path ?? '')) return;
+        save(e, diffusers ? { lora_dir: value } : { launch: { lora_model_dir: value } });
+      },
+      onkeydown: (ev) => { if (ev.key === 'Enter') input.blur(); },
+    });
+    const bad = !!(l.path && l.problem);
+    const mode = l.apply_mode ?? '';
+    const modes = !diffusers && h('div.tray-seg.small.lora-modes', LORA_MODES.map(([value, label, what]) => h('button.pick', {
+      type: 'button', class: mode === value ? 'on' : '', 'aria-pressed': String(mode === value), title: what,
+      onclick: () => mode !== value && save(e, { launch: { lora_apply_mode: value } }),
+    }, label)));
+    const restart = !diffusers && l.path && !bad && loraFolderPending(e);
+    const engine = diffusers ? 'Diffusers' : 'sd-server';
+    const hint = !l.path ? `Not set: ${engine} applies no LoRAs. The first LoRA installed from Hugging Face sets it.`
+      : restart ? `Restart ${EXE[e.type]} to load LoRAs from this folder.`
+        : diffusers ? 'Diffusers lists the .safetensors LoRAs in it, subfolders too, and loads one the first time an image uses it. A new folder needs no reload.'
+          : 'sd-server lists the LoRAs in it, subfolders too, and finds new ones without a restart.';
+    return h('div.tray-cell',
+      h('div.cell-head', h('span.eyebrow', 'LoRAs'), h('span.spacer'),
+        l.count > 0 && h('a.mini', { href: '#/loras' }, icon('puzzle', 12), 'Library'),
+        h('button.mini', { type: 'button', onclick: () => hubDialog(e, { onChange: refresh }) }, icon('search', 12), 'Hugging Face')),
+      h('div.files-grid',
+        h('span.mono-meta', { class: bad ? 'strong' : '' }, flag),
+        h('label.seed-field', { class: bad ? 'bad' : '' }, icon('folder', 13), input),
+        h('span.mono-meta', l.count == null ? '' : plural(l.count, 'LoRA')),
+        h('span.file-mark', { class: bad ? 'bad' : l.path ? 'ok' : '', title: l.problem ?? (l.path ? 'found' : 'not set') },
+          l.path ? icon(bad ? 'alert' : 'check', 15) : null),
+        bad && [h('span'), h('span.file-problem', `${l.problem}.`)],
+        modes && [h('span.mono-meta', '--lora-apply-mode'), modes, h('span'), h('span')]),
+      l.warning && h('span.file-problem.wrap', `${l.warning}.`),
+      h('span.tray-hint.wrap', { class: restart ? 'accent' : '' }, hint),
+      modes && h('span.tray-hint.wrap', LORA_MODES.find(([v]) => v === mode)[2]));
+  }
+
+  /** Whether the running sd-server was started without this LoRA folder. */
+  function loraFolderPending(e) {
+    const cmd = e.process?.state === 'running' || e.process?.state === 'starting' ? e.process.command : null;
+    if (!cmd) return false;
+    const at = cmd.indexOf('--lora-model-dir');
+    if (at < 0) return true;
+    if (/[%$~]/.test(e.loras.path)) return false; // expanded on launch: can't compare
+    const key = (p) => p.replace(/\\/g, '/').replace(/\/+$/, '').toLowerCase();
+    return key(cmd[at + 1] ?? '') !== key(e.loras.path);
   }
 
   /** A Diffusers backend's model: a Hub repo id, or a local Diffusers folder. */
@@ -354,8 +417,10 @@ export function enginesScreen({ name: wanted = null, navigate }) {
       save(e, { declared_capabilities: [...next] });
     };
     const hint = e.type === 'sdcpp'
-      ? (e.files.find((f) => f.key === 'llm_vision')?.path ? 'edit and multi_ref need --llm_vision ✓' : 'edit and multi_ref need --llm_vision')
-      : e.status === 'ok' ? `the engine reports ${e.capabilities.join(', ') || 'none'}` : 'checked against the engine when it is up';
+      ? [e.files.find((f) => f.key === 'llm_vision')?.path ? 'edit and multi_ref need --llm_vision ✓' : 'edit and multi_ref need --llm_vision',
+        e.loras && (e.loras.path ? 'lora needs a LoRA folder ✓' : 'lora needs a LoRA folder')].filter(Boolean).join(' · ')
+      : [e.status === 'ok' ? `the engine reports ${e.capabilities.join(', ') || 'none'}` : 'checked against the engine when it is up',
+        e.loras && (e.loras.path ? 'lora needs a LoRA folder ✓' : 'lora needs a LoRA folder')].filter(Boolean).join(' · ');
     return h('div.tray-cell', h('span.eyebrow', 'Capabilities'),
       h('div.tray-opts', all.map((cap) => h('button.pick.cap', {
         type: 'button', class: picked.has(cap) ? 'on' : '', 'aria-pressed': String(picked.has(cap)),
@@ -376,9 +441,9 @@ export function enginesScreen({ name: wanted = null, navigate }) {
     return h('div.engine-note',
       h('span.eyebrow', 'Health'),
       h('div.tool-row.wrap', h('span.tool-name', 'GET'), h('span.tool-args', `${e.base_url ?? 'in process'} · ${STATUS_WORD[e.status] ?? e.status}${e.detail ? ` · ${e.detail}` : ''}`)),
-      h('p.rail-hint', e.loopback
-        ? 'Start it yourself, or set up launch to start it from here.'
-        : `This engine runs on ${e.host}. Start and update it there; this screen manages only how this server reaches it.`));
+      h('p.rail-hint', !e.host ? 'It runs inside this server: it loads on first use, or at startup with preload.'
+        : e.loopback ? 'Start it yourself, or set up launch to start it from here.'
+          : `This engine runs on ${e.host}. Start and update it there; this screen manages only how this server reaches it.`));
   }
 
   // --- startup log -------------------------------------------------------------------------
@@ -766,6 +831,8 @@ export async function enginePopover(anchor) {
   rows.length ? rows : h('div.pop-engine', h('span.tray-hint', 'No default engines are configured.')),
   h('button.menu-item.pop-settings', { type: 'button', onclick: () => go('#/engines') },
     icon('sliders', 15), 'Engine settings', h('span.spacer'), icon('arrowRight', 15)),
+  h('button.menu-item.pop-settings', { type: 'button', onclick: () => go('#/loras') },
+    icon('puzzle', 15), 'LoRA library', h('span.spacer'), icon('arrowRight', 15)),
   h('button.menu-item.pop-settings', { type: 'button', onclick: () => go('#/links') },
     icon('link', 15), 'Linked instances', h('span.spacer'), icon('arrowRight', 15)));
   document.body.append(sheet);

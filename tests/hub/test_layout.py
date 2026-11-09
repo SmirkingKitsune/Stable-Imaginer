@@ -7,6 +7,8 @@ from imaginer.hub.layout import (
     RepoFile,
     RepoLayout,
     classify,
+    is_adapter,
+    loras_in,
     quant_of,
     roles_for,
     shard_base,
@@ -178,3 +180,33 @@ def test_quants_are_read_from_names(name: str, quant: str | None) -> None:
 def test_shard_suffixes_come_off() -> None:
     assert shard_base("Q4_K_M/x-Q4_K_M-00002-of-00003.gguf") == "x-Q4_K_M"
     assert shard_base("diffusion_pytorch_model.safetensors") == "diffusion_pytorch_model"
+
+
+def test_the_loras_in_a_comfy_repo_are_found_by_their_folder() -> None:
+    loras = loras_in(_layout("Comfy-Org/Qwen-Image-2.1"))
+    assert [v.id for v in loras] == [
+        "loras/p_q_image_2.1_5_steps_v0.1_comfyui_bf16.safetensors",
+        "loras/p_q_image_2.1_6_steps_upsampled_v0.2_comfyui_bf16.safetensors",
+        "loras/p_q_image_2.1_6_steps_v0.2_comfyui_bf16.safetensors",
+        "loras/p_q_image_2.1_8_steps_v0.1_comfyui_bf16.safetensors",
+        "loras/qwen_image_2.1_turbo_lora_avg_rank_178_bf16.safetensors",
+    ]
+
+
+def test_an_adapter_repos_weights_are_loras_whatever_their_names() -> None:
+    files = [
+        RepoFile("Lightning-8steps-V1.0.safetensors", 900),
+        RepoFile("Lightning-4steps-V1.0.safetensors", 900),
+        RepoFile("vae/ae.safetensors", 100),
+    ]
+    plain = classify(files, repo_id="acme/Lightning", pipeline_tag="text-to-image")
+    assert {v.component for v in plain.variants} == {"diffusion_model", "vae"}
+    adapter = classify(files, repo_id="acme/Lightning", pipeline_tag="text-to-image", adapter=True)
+    assert [v.id for v in loras_in(adapter)] == [
+        "Lightning-4steps-V1.0.safetensors",
+        "Lightning-8steps-V1.0.safetensors",
+    ]
+    assert adapter.variant("vae/ae.safetensors").component == "vae"  # type: ignore[union-attr]
+    assert is_adapter(["diffusers", "LoRA"])
+    assert is_adapter(["base_model:adapter:Qwen/Qwen-Image"])
+    assert not is_adapter(["base_model:quantized:Qwen/Qwen-Image", "gguf"])

@@ -3,7 +3,9 @@
 Shapes follow sd.cpp's examples/server (async_jobs.cpp ``make_async_job_json``,
 routes_sdcpp.cpp): ``img_gen`` answers 202 with a job id; jobs go
 ``queued -> generating -> completed|failed|cancelled``; previews carry step progress;
-each result image has ``generation_info`` with the seed as a decimal string.
+each result image has ``generation_info`` with the seed as a decimal string. LoRAs are
+listed under ``loras`` in the capabilities (when ``loras`` is not None, as from a server new
+enough to take them), and a request naming one that isn't listed fails with 400.
 
 Images are deterministic per seed. A prompt using Qwen-Image-2.1's RGBA phrasing yields a
 transparent background.
@@ -15,6 +17,7 @@ import io
 import itertools
 import threading
 from dataclasses import dataclass, field
+from pathlib import PurePosixPath
 from typing import Any
 
 from PIL import Image
@@ -33,6 +36,8 @@ class FakeSdCpp:
     state: str = "ready"  # ready | loading | empty | error
     origin: str = "command_line"
     ref_images_feature: bool = True
+    loras: list[str] | None = None  # LoRA paths listed in capabilities; None: no list at all
+    lora_feature: bool = True
     preview_modes: list[str] = field(default_factory=lambda: ["none", "proj", "tae", "vae"])
     default_steps: int = 3
     step_delay_s: float = 0.0
@@ -49,6 +54,8 @@ class FakeSdCpp:
         self.state = "ready"
         self.origin = "command_line"
         self.ref_images_feature = True
+        self.loras = None
+        self.lora_feature = True
         self.preview_modes = ["none", "proj", "tae", "vae"]
         self.default_steps = 3
         self.step_delay_s = 0.0
@@ -73,8 +80,16 @@ class FakeSdCpp:
 
     async def _capabilities(self, request: Request) -> Response:
         features = {"ref_images": self.ref_images_feature, "init_image": True, "preview": True}
+        extra: dict[str, Any] = {}
+        if self.loras is not None:
+            features["lora"] = self.lora_feature
+            extra["loras"] = [
+                {"name": PurePosixPath(path).stem, "path": path, "display_path": path}
+                for path in self.loras
+            ]
         return JSONResponse(
             {
+                **extra,
                 "model": {
                     "name": "qwen_image_2.1-Q4_K.gguf",
                     "stem": "qwen_image_2.1-Q4_K",
@@ -103,6 +118,9 @@ class FakeSdCpp:
         body = await request.json()
         if not body.get("prompt"):
             return JSONResponse({"error": "invalid generation parameters"}, status_code=400)
+        for lora in body.get("lora") or []:  # resolved against the listing, as sd-server does
+            if lora.get("path") not in (self.loras or []):
+                return JSONResponse({"error": "invalid generation parameters"}, status_code=400)
         self.requests.append(body)
         job_id = f"job-{next(_ids)}"
         job: dict[str, Any] = {

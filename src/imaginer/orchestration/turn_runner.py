@@ -27,12 +27,17 @@ images (``orchestration/qa.py``). If it wants them redone, the call runs again w
 changes as a new attempt beside the old result, like ``retry``, at most
 ``orchestration.qa.max_retries`` times. Each result records the check in ``metadata.qa``,
 and in its content so the assistant can tell the user.
+
+LoRA mentions (``@lora:<name>``, ``domain/mentions.py``) in the user's words add LoRAs to
+every image call of the turn, on top of ``image_options.loras``. The stored message keeps
+them as written; the LLM, the quality check and a raw prompt get the words without them.
 """
 
 import asyncio
 import json
+from collections.abc import Iterable
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, Literal
 
 import structlog
 from pydantic import BaseModel
@@ -49,6 +54,7 @@ from imaginer.db.engine import Database
 from imaginer.db.repositories import artifacts as art_repo
 from imaginer.db.repositories import conversations as conv_repo
 from imaginer.db.repositories import messages as msg_repo
+from imaginer.domain import mentions
 from imaginer.domain import models as dto
 from imaginer.domain.enums import ArtifactKind, Capability, MessageStatus, PromptMode, Role
 from imaginer.domain.errors import (
@@ -70,7 +76,14 @@ from imaginer.orchestration.context_builder import ContextBuilder
 from imaginer.orchestration.event_bus import TurnChannel, TurnManager
 from imaginer.orchestration.jobs import Emit
 from imaginer.orchestration.modes import MODE_GUIDANCE
-from imaginer.orchestration.qa import PINNABLE, QA_GUIDANCE, QualityChecker, Review, Subject
+from imaginer.orchestration.qa import (
+    PINNABLE,
+    QA_GUIDANCE,
+    QualityChecker,
+    Review,
+    Subject,
+    preset_pins,
+)
 from imaginer.services import mappers
 from imaginer.tools.base import ToolContext, ToolOutcome, ToolRegistry
 
@@ -123,8 +136,11 @@ class TurnRunner:
             raise InvalidRequestError("a message needs content or attachments")
         if len(set(body.attachments)) != len(body.attachments):
             raise InvalidRequestError("attachments contain duplicates")
-        if body.mode is PromptMode.RAW and not body.content.strip():
-            raise InvalidRequestError("raw mode sends the message as the image prompt: add text")
+        if body.mode is PromptMode.RAW and not mentions.strip(body.content):
+            raise InvalidRequestError(
+                "raw mode sends the message as the image prompt: add text (besides any LoRAs)"
+            )
+        options = mentions.with_mentions(body.image_options, body.content)
 
         async with self._db.session() as session, session.begin():
             await conv_repo.require_active(session, conversation_id)
@@ -142,7 +158,7 @@ class TurnRunner:
         qa = body.qa if body.qa is not None else self._config.qa.enabled
         raw_call = None
         if body.mode is PromptMode.RAW:
-            raw_call = self._raw_call(body.content.strip(), attached)
+            raw_call = self._raw_call(mentions.strip(body.content), attached)
             lease = await self._optional_reviewer(body.backend) if qa else None
         else:
             required = {Capability.CHAT, Capability.STREAM}
@@ -159,6 +175,10 @@ class TurnRunner:
         try:
             if body.image_options is not None and body.image_options.backend is not None:
                 self._registry.validate_image_backend(body.image_options.backend)
+            if body.image_options is not None and body.image_options.preset is not None:
+                self._registry.validate_image_preset(
+                    body.image_options.preset, body.image_options.backend
+                )
             if body.image_options is not None and body.image_options.mask is not None:
                 await self._check_mask(conversation_id, body.image_options.mask)
 
@@ -176,11 +196,11 @@ class TurnRunner:
         state = _TurnState(
             message_ids=[user_message.id],
             leaf_id=user_message.id,
-            image_options=body.image_options,
+            image_options=options,
             mode=body.mode,
             raw_call=raw_call,
             force_tool=body.mode is PromptMode.INTERPRET,
-            request=body.content,
+            request=mentions.for_llm(body.content),
         )
         self._set_reviewer(state, lease, qa=qa)
         channel.task = self._start(channel, lease, state)
@@ -254,7 +274,8 @@ class TurnRunner:
         if caller is None or call is None:
             raise InvalidRequestError("the tool call behind this result is not stored")
         asker = next((m for m in reversed(path[: callers[-1]]) if m.role is Role.USER), None)
-        options = _options_without_seed(asker)
+        asked_for = (asker.content_text or "") if asker is not None else ""
+        options = mentions.with_mentions(_options_without_seed(asker), asked_for)
         asked = (asker.metadata_json if asker is not None else None) or {}
         mode = PromptMode(asked.get("mode", PromptMode.CHAT))
         qa = bool(asked.get("qa", self._config.qa.enabled))
@@ -290,7 +311,7 @@ class TurnRunner:
             image_options=options,
             placeholders={call["id"]: attempt.id},
             mode=mode,
-            request=(asker.content_text or "") if asker is not None else "",
+            request=mentions.for_llm(asked_for),
         )
         self._set_reviewer(state, lease, qa=qa)
         channel.task = self._start(channel, lease, state)
@@ -448,7 +469,9 @@ class TurnRunner:
                 review = Review(status="skipped", detail=state.qa_skip)
             else:
                 await self._publish_qa(channel, result, {"status": "checking"})
-                subject = _subject(channel.conversation_id, state, call, outcome)
+                subject = _subject(
+                    channel.conversation_id, state, call, outcome, self._preset_pins(state, name)
+                )
                 review = await self._qa.review(state.reviewer, subject)
             redo = review.status == "redo" and len(earlier) < self._config.qa.max_retries
             await self._record_qa(channel, result, outcome, _qa_record(review, earlier, redo))
@@ -464,6 +487,14 @@ class TurnRunner:
             state.message_ids.append(attempt.id)
             await channel.publish(EventType.MESSAGE, MessageEventData(message=attempt))
             log.info("qa.redo", tool_call_id=call["id"], attempt=len(earlier) + 1)
+
+    def _preset_pins(self, state: _TurnState, tool: str) -> set[str]:
+        """The settings the user's preset fixes, as the backend this tool used has it."""
+        options = state.image_options
+        if options is None or options.preset is None:
+            return set()
+        task: Literal["t2i", "edit"] = "edit" if tool == "edit_image" else "t2i"
+        return preset_pins(self._registry.image_preset(task, options.backend, options.preset))
 
     async def _execute(
         self,
@@ -787,10 +818,15 @@ def _options_without_seed(asker: orm.Message | None) -> dto.ImageRequestOptions 
 
 
 def _subject(
-    conversation_id: str, state: _TurnState, call: dict[str, Any], outcome: ToolOutcome
+    conversation_id: str,
+    state: _TurnState,
+    call: dict[str, Any],
+    outcome: ToolOutcome,
+    fixed_by_preset: Iterable[str] = (),
 ) -> Subject:
     options = state.image_options
     pinned = {k for k in PINNABLE if options is not None and getattr(options, k) is not None}
+    pinned.update(fixed_by_preset)
     return Subject(
         conversation_id=conversation_id,
         request=state.request,

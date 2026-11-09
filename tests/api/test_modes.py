@@ -370,6 +370,40 @@ async def test_the_check_leaves_the_users_settings_alone(
     assert rejected["metadata"]["qa"]["changes"] == {"new_seed": True}
 
 
+async def test_the_check_leaves_a_presets_steps_and_cfg_alone(
+    make_settings: SettingsFactory, fake_llama: FakeLlama, fake_sd: FakeSdCpp
+) -> None:
+    # A step-distill LoRA only works at the steps and CFG it was made for.
+    lora = "p_q_image_2.1_8_steps_v0.1_comfyui_bf16.safetensors"
+    fake_sd.loras = [lora]
+    presets = {"fast": {"loras": [{"path": lora}], "steps": 2, "cfg_scale": 1.0}}
+    settings = make_settings(
+        backends={
+            "llama": llama_config(fake_llama.url),
+            "sd": sd_config(fake_sd.url, presets=presets),
+        },
+        routing=RoutingConfig(chat="llama", t2i="sd", edit="sd"),
+        orchestration=OrchestrationConfig(probe_ttl_s=0),
+    )
+    fake_llama.queue(
+        FakeLlama.tool_call("generate_image", {"prompt": "a fox"}),
+        _verdict(verdict="redo", issues=["noisy"], steps=40, cfg_scale=5.0, new_seed=False),
+        _verdict(verdict="pass"),
+        FakeLlama.text("Done."),
+    )
+    async for client in _client_for(settings):
+        cid = await _conversation(client)
+        await _send(client, cid, content="draw a fox", qa=True, image_options={"preset": "fast"})
+
+    assert "leave them null: steps, cfg_scale" in _system(fake_llama.requests[1])
+    first, second = fake_sd.requests
+    for body in (first, second):
+        assert body["sample_params"]["sample_steps"] == 2
+        assert body["sample_params"]["guidance"] == {"txt_cfg": 1.0}
+        assert body["lora"] == [{"path": lora, "multiplier": 1.0}]
+    assert second["seed"] != first["seed"]
+
+
 async def test_attempts_run_out_and_the_last_image_is_kept_flagged(
     strict: httpx.AsyncClient, fake_llama: FakeLlama, fake_sd: FakeSdCpp
 ) -> None:

@@ -4,7 +4,9 @@ from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field
 
-from imaginer.domain.errors import ImaginerError
+from imaginer.core.config import LoraRef
+from imaginer.domain import mentions
+from imaginer.domain.errors import ImaginerError, InvalidRequestError
 from imaginer.domain.models import SEED_MAX, Artifact, AspectRatio, ImageRequestOptions
 from imaginer.orchestration.jobs import JobManager, JobSpec
 from imaginer.tools.base import ToolContext, ToolOutcome
@@ -63,6 +65,36 @@ def user_params(options: ImageRequestOptions | None) -> dict[str, Any]:
         return {}
     params = {"steps": options.steps, "cfg_scale": options.cfg_scale}
     return {k: v for k, v in params.items() if v is not None}
+
+
+def user_preset(options: ImageRequestOptions | None) -> dict[str, Any]:
+    """The backend preset the user picked, as keyword arguments for the lease and the job
+    (only the user picks one: its LoRAs and settings aren't offered to the model)."""
+    return {"preset": options.preset} if options is not None and options.preset else {}
+
+
+def user_loras(options: ImageRequestOptions | None) -> tuple[LoraRef, ...]:
+    """The LoRAs the user added to this message (only the user picks them, like presets)."""
+    if options is None or not options.loras:
+        return ()
+    return tuple(LoraRef(path=x.path, weight=x.weight) for x in options.loras)
+
+
+def image_prompt(prompt: str) -> str:
+    """The prompt the engine gets: without LoRA mentions, which only the user's own
+    message applies (a raw prompt has none left by now; the LLM's are dropped), and without
+    the note that lists them, should the LLM have copied it."""
+    text = mentions.strip(mentions.without_note(prompt))
+    if not text:
+        raise InvalidRequestError(
+            "the prompt is only LoRA mentions: describe the image (the user picks LoRAs)"
+        )
+    return text
+
+
+def loras_requested(loras: tuple[LoraRef, ...]) -> dict[str, Any]:
+    """The user's LoRAs as the job records what was asked for."""
+    return {"loras": [x.model_dump() for x in loras]} if loras else {}
 
 
 def sampler_params(ctx: ToolContext) -> dict[str, Any]:

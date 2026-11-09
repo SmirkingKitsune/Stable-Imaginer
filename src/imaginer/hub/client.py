@@ -90,6 +90,8 @@ class RepoInfo:
     sha: str | None
     files: tuple[RepoFile, ...]
     base_models: tuple[str, ...] = ()
+    instance_prompt: str | None = None  # a LoRA card's trigger words
+    images: tuple[str, ...] = ()  # the card's example images, as paths in the repo
 
 
 class HubClient:
@@ -160,7 +162,17 @@ class HubClient:
         bases = (
             (base,) if isinstance(base, str) else tuple(b for b in base or () if isinstance(b, str))
         )
-        return RepoInfo(_summary(data), data.get("sha"), tuple(files), bases)
+        prompt = card.get("instance_prompt") if isinstance(card, dict) else None
+        if isinstance(prompt, list):
+            prompt = ", ".join(str(p) for p in prompt if isinstance(p, str))
+        return RepoInfo(
+            _summary(data),
+            data.get("sha"),
+            tuple(files),
+            bases,
+            instance_prompt=prompt.strip()[:500] or None if isinstance(prompt, str) else None,
+            images=_card_images(card, data.get("widgetData"), {f.path for f in files}),
+        )
 
     async def json_file(self, repo_id: str, revision: str, path: str) -> Any:
         """A small JSON file from the repo, such as model_index.json."""
@@ -243,6 +255,24 @@ def _error_text(resp: httpx.Response) -> str:
 
 def _reason(exc: httpx.HTTPError) -> str:
     return str(exc) or type(exc).__name__
+
+
+_IMAGE_TYPES = (".png", ".jpg", ".jpeg", ".webp")
+
+
+def _card_images(card: Any, widget_data: Any, paths: set[str]) -> tuple[str, ...]:
+    """The example images a model card shows (its widget's outputs) that are files in the
+    repo, in order; without any, the repo's image files (most cards show those)."""
+    widgets = card.get("widget") if isinstance(card, dict) else None
+    found = []
+    for item in [*(widgets if isinstance(widgets, list) else []), *(widget_data or [])]:
+        output = item.get("output") if isinstance(item, dict) else None
+        url = output.get("url") if isinstance(output, dict) else None
+        if isinstance(url, str) and url in paths and _safe(url) and url not in found:
+            found.append(url)
+    if not found:
+        found = sorted(p for p in paths if p.lower().endswith(_IMAGE_TYPES) and _safe(p))
+    return tuple(found[:12])
 
 
 def _summary(item: dict[str, Any]) -> RepoSummary:

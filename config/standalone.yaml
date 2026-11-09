@@ -35,7 +35,7 @@ backends:
     type: sdcpp
     base_url: http://127.0.0.1:1234
     launch: {}  # diffusion_model, vae, llm, llm_vision: paths to the model files
-    declared_capabilities: [t2i, edit, multi_ref, rgba]
+    declared_capabilities: [t2i, edit, multi_ref, rgba, lora]
     defaults:
       width: 2048
       height: 2048

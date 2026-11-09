@@ -1,8 +1,8 @@
 """The quality check: a vision LLM looks at the images a tool made and decides whether to keep them.
 
 The turn runner calls ``review`` after an image tool succeeds, when the turn has QA on. The
-reviewer gets the user's request, the prompt and settings the image model got, the result,
-and for an edit the image being edited. It answers with a JSON verdict: ``pass``, or
+reviewer gets the user's request, the prompt, settings and LoRAs the image model got, the
+result, and for an edit the image being edited. It answers with a JSON verdict: ``pass``, or
 ``redo`` with what to change (prompt, negative prompt, steps, CFG scale, seed). Its changes
 never touch what the user fixed: their image options and, in raw mode, the prompt itself.
 
@@ -11,11 +11,13 @@ A check that can't run or can't be read never fails the turn; it comes back ``sk
 
 import re
 from dataclasses import dataclass, field
+from pathlib import PurePosixPath
 from typing import Any, Literal
 
 from pydantic import BaseModel, ValidationError
 
 from imaginer.backends.base import ChatRequest, LLMBackend
+from imaginer.core.config import ImagePreset
 from imaginer.core.logging import get_logger
 from imaginer.db import models as orm
 from imaginer.db.engine import Database
@@ -57,6 +59,17 @@ REVIEW_PROMPT = (
 PINNABLE = ("steps", "cfg_scale", "seed", "negative_prompt")  # image options the check obeys
 MAX_ISSUES = 8
 _SETTINGS = ("steps", "cfg_scale", "sampler", "width", "height")
+
+
+def preset_pins(preset: ImagePreset | None) -> set[str]:
+    """The PINNABLE settings a preset fixes. A step-distill LoRA is made for its steps and
+    CFG, so the check must not change them; a sigma schedule sets the steps too."""
+    if preset is None:
+        return set()
+    pins = {k for k in ("steps", "cfg_scale") if getattr(preset, k) is not None}
+    if preset.sigmas is not None:
+        pins.add("steps")
+    return pins
 
 
 class Verdict(BaseModel):
@@ -149,6 +162,12 @@ class QualityChecker:
             f"Negative prompt: {resolved.get('negative_prompt') or '(none)'}",
             f"Settings: {', '.join(settings) or 'engine defaults'}",
         ]
+        loras = [x for x in resolved.get("loras") or requested.get("loras") or [] if x]
+        if loras:
+            lines.append(
+                "LoRAs (the style or look they give is wanted): "
+                + "; ".join(_lora_text(x) for x in loras if isinstance(x, dict))
+            )
         async with self._db.session() as session:
             outputs = await art_repo.get_many_in_conversation(
                 session, subject.conversation_id, subject.artifact_ids
@@ -196,6 +215,14 @@ def _instructions(subject: Subject) -> str:
     if "seed" in subject.pinned:
         rules.append("The user fixed the seed: new_seed must be false.")
     return "\n\n".join(rules)
+
+
+def _lora_text(lora: dict[str, Any]) -> str:
+    """One LoRA the image model got, by its file's name, and the trigger words it added."""
+    name = PurePosixPath(str(lora.get("path", "")).replace("\\", "/")).stem
+    text = f"{name} at weight {float(lora.get('weight', 1.0)):g}"
+    trigger = lora.get("trigger")
+    return f'{text}, which added "{trigger}" to the prompt' if trigger else text
 
 
 def _normalized(

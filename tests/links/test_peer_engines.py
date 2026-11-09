@@ -2,6 +2,7 @@
 and the linked adapter never replaying a stream that already started."""
 
 import asyncio
+import json
 from collections.abc import AsyncIterator
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
@@ -12,8 +13,8 @@ import httpx
 import pytest
 
 from imaginer.backends import llamacpp
-from imaginer.backends.base import BackendHealth, ChatDelta, ChatRequest
-from imaginer.backends.linked import LinkedLLMBackend, linked_backend
+from imaginer.backends.base import BackendHealth, ChatDelta, ChatRequest, GenRequest
+from imaginer.backends.linked import LinkedImageBackend, LinkedLLMBackend, linked_backend
 from imaginer.backends.openai_http.transport import HttpTransport
 from imaginer.backends.registry import BackendRegistry
 from imaginer.core.config import (
@@ -21,6 +22,7 @@ from imaginer.core.config import (
     LinkedBackendConfig,
     LinksConfig,
     LinkShare,
+    LoraRef,
     RetryConfig,
     Settings,
     TimeoutConfig,
@@ -219,6 +221,51 @@ async def test_a_cold_engine_can_be_routed_to_from_the_linked_instance(
     registry = BackendRegistry.from_settings(settings, {"linked": factory})
     lease = await registry.chat_backend("llama_nas")
     lease.release()
+    await link.transport.aclose()
+
+
+async def test_presets_and_loras_go_to_an_instance_that_lists_them() -> None:
+    link, sent = _link(lambda _: _sse(("done", "{}")))
+    older = dto.SharedEngine(
+        name="sd",
+        type="sdcpp",
+        kind=BackendKind.IMAGE,
+        status=BackendStatus.OK,
+        capabilities=[Capability.T2I, Capability.LORA],
+        availability=dto.EngineAvailability(state="ready"),
+    )
+    link.engines = {"sd": older}
+    backend = linked_backend("sd_nas", linked("nas", "sd", BackendKind.IMAGE), Directory(link))
+    assert isinstance(backend, LinkedImageBackend)
+    # An instance that lists no LoRAs (one too old to take them) gets no request naming any.
+    assert backend.capabilities() == {Capability.T2I}
+    assert (backend.available_loras, backend.image_presets) == (None, {})
+
+    fast = dto.ImagePresetInfo(
+        name="fast",
+        description="8 steps",
+        loras=[dto.LoraInfo(path="draft", weight=1.0)],
+        steps=8,
+        cfg_scale=1.0,
+        sampler=None,
+    )
+    link.engines["sd"] = older.model_copy(
+        update={
+            "available_loras": ["draft.safetensors", "ink.safetensors"],
+            "image_presets": [fast],
+        }
+    )
+    assert backend.capabilities() == {Capability.T2I, Capability.LORA}
+    assert backend.available_loras == ["draft.safetensors", "ink.safetensors"]
+    preset = backend.image_presets["fast"]
+    assert (preset.steps, preset.cfg_scale, preset.loras) == (8, 1.0, [LoraRef(path="draft")])
+
+    await backend.generate(GenRequest(prompt="plain", seed=1))
+    picked = (LoraRef(path="ink", weight=0.5),)
+    await backend.generate(GenRequest(prompt="fox", seed=2, preset="fast", loras=picked))
+    plain, styled = (json.loads(request.content) for request in sent)
+    assert "preset" not in plain and "loras" not in plain  # what an older instance takes
+    assert (styled["preset"], styled["loras"]) == ("fast", [{"path": "ink", "weight": 0.5}])
     await link.transport.aclose()
 
 

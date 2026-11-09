@@ -16,6 +16,7 @@ from imaginer.links.admin import LinkAdmin
 from imaginer.links.gallery import Gallery
 from imaginer.links.serve import PeerEngines
 from imaginer.links.service import LinkService
+from imaginer.loras.library import LoraLibrary
 from imaginer.orchestration.context_builder import ContextBuilder
 from imaginer.orchestration.event_bus import TurnManager
 from imaginer.orchestration.gates import EngineGates
@@ -52,6 +53,7 @@ class Container:
     peers: PeerEngines
     link_admin: LinkAdmin
     gallery: Gallery
+    loras: LoraLibrary
     _tasks: list[asyncio.Task[None]] = field(default_factory=list)
 
     @classmethod
@@ -108,6 +110,12 @@ class Container:
 
         conversations.add_delete_hook(stop_work)
         engines = EngineService(settings, registry)
+        hub = HubService(settings, engines)
+        loras = LoraLibrary(settings, db, registry, engines, artifacts, hub)
+        await loras.start()
+        registry.set_lora_words(loras.words_for)
+        context.set_lora_lookup(loras.briefs)
+        hub.on_lora_install = loras.note_source
         container = cls(
             settings=settings,
             db=db,
@@ -120,12 +128,13 @@ class Container:
             jobs=jobs,
             turn_runner=turn_runner,
             engines=engines,
-            hub=HubService(settings, engines),
+            hub=hub,
             gates=gates,
             links=links,
             peers=PeerEngines(settings, registry, engines, gates),
             link_admin=LinkAdmin(settings, links, registry, engines, gates),
             gallery=Gallery(turns=turns, conversations=conversations, links=links),
+            loras=loras,
         )
         # Probe engines in the background: the API must come up even when they are down.
         container._tasks.append(asyncio.create_task(registry.refresh()))

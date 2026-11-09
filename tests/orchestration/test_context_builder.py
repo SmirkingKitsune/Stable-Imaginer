@@ -12,6 +12,7 @@ from imaginer.db import models as orm
 from imaginer.db.engine import Database
 from imaginer.db.repositories import conversations as conv_repo
 from imaginer.db.repositories import messages as msg_repo
+from imaginer.domain import mentions
 from imaginer.domain.enums import ArtifactSource, MessageStatus, Role
 from imaginer.orchestration.context_builder import DEFAULT_SYSTEM_PROMPT, ContextBuilder
 from imaginer.services.artifacts import ArtifactService, NewArtifact
@@ -93,6 +94,39 @@ async def test_plain_history(world: World) -> None:
         {"role": "user", "content": "hello"},
         {"role": "assistant", "content": "hi!"},
     ]
+
+
+async def test_a_messages_loras_are_named_and_listed(world: World) -> None:
+    cid = await world.conversation()
+    options = {"backend": "diff", "loras": [{"path": "ink", "weight": 0.5}]}
+    meta = {"image_options": options}
+    await world.message(cid, Role.USER, "a @lora:clay fox", metadata_json=meta)
+    asked: list[set[mentions.LoraKey]] = []
+
+    async def lookup(wanted: Any) -> dict[mentions.LoraKey, mentions.LoraBrief]:
+        asked.append(set(wanted))
+        return {("clay", "diff"): mentions.LoraBrief("Clay Sculpture", ("clay",))}
+
+    builder = world.builder()
+    builder.set_lora_lookup(lookup)
+    system, user = await builder.build(cid, vision=False)
+    assert asked == [{("clay", "diff"), ("ink", "diff")}]
+    assert system["content"] == f"{DEFAULT_SYSTEM_PROMPT}\n\n{mentions.LLM_GUIDANCE}"
+    assert user["content"] == (
+        "a Clay Sculpture fox\n\n"
+        "[LoRAs the user picked for this message's images:\n"
+        "- ink, weight 0.5\n"
+        '- Clay Sculpture, weight 1, trigger words "clay"]'
+    )
+
+    # Without the library, the note names them by their files.
+    async def broken(wanted: Any) -> dict[mentions.LoraKey, mentions.LoraBrief]:
+        raise RuntimeError("no library")
+
+    builder.set_lora_lookup(broken)
+    user = (await builder.build(cid, vision=False))[1]
+    assert user["content"].startswith("a clay fox\n\n[LoRAs the user picked")
+    assert user["content"].endswith("- ink, weight 0.5\n- clay, weight 1]")
 
 
 async def test_manifest_lists_artifacts_by_label(world: World) -> None:
