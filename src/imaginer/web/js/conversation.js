@@ -8,7 +8,11 @@
 // switchers sit at each fork (an edited message, or a retried call's attempts), the rail
 // (wide screens) and the header picker list every branch, and Edit & branch turns one of
 // your messages into an editor that sends the new version on a new branch.
+//
+// Agents (design "Agent Mockups" 1c): the agent's portrait and name head each of its
+// replies; set_portrait shows what the portrait is now and the self-portrait it becomes.
 
+import { portrait } from './agents.js';
 import { setImage } from './api.js';
 import { announce, connectionStrip, dialog, menu, modelName, statusLine, toast } from './chrome.js';
 import { corners, h, icon, iconButton, clear } from './dom.js';
@@ -21,8 +25,9 @@ import {
 import { convHash } from './origin.js';
 import { promptBar } from './promptbar.js';
 import {
-  byLabel, cancelJob, connection, currentBranch, ensureLoaded, imageEngine, images, libraryLora, loraLibrary, on, pathOf, remove,
-  rename, retry, reloadConversation, running, select, send, setArchivedFlag, siblingsOf, stale, stop,
+  agentOfMessage, byLabel, cancelJob, connection, currentBranch, ensureLoaded, imageEngine, images, libraryLora,
+  loraLibrary, on, pathOf, remove, rename, retry, reloadConversation, running, select, send, setArchivedFlag, siblingsOf,
+  stale, stop,
 } from './store.js';
 
 /** The image engine's LoRAs, with what the library knows of each (display names). */
@@ -203,7 +208,9 @@ export function conversationScreen({ id, navigate, focusBar = false }) {
       const edit = m.id === editing && [c.branches.length, currentBranch(c)?.name];
       return [m.content_text, m.attachments.map(art), m.metadata, siblingsOf(c, m).map((s) => s.id), running(id), edit];
     }
-    return [running(id), stale(id) && connection().status, g.messages.map((m) => [
+    const agent = agentOfMessage(c, g.messages[0]);
+    return [running(id), stale(id) && connection().status, agent && [agent.name, agent.portrait.url, agent.portrait.images.length],
+      g.messages.map((m) => [
       m.status, m.content_text, m.reasoning_text, openReasoning.has(m.id), m.metadata?.error,
       (m.tool_calls ?? []).map((call) => {
         const key = `${m.id}:${call.id}`;
@@ -279,6 +286,7 @@ export function conversationScreen({ id, navigate, focusBar = false }) {
     const alternatives = siblingsOf(c, m);
     return h('section.msg.user',
       h('div.msg-head.user-head',
+        h('span.you-mark', { 'aria-hidden': 'true' }, 'YOU'),
         h('span.eyebrow', 'You'), h('span.msg-sub', `· ${clock(m.created_at)}`),
         h('span.spacer'),
         alternatives.length > 1 && switcher(alternatives, m),
@@ -332,6 +340,7 @@ export function conversationScreen({ id, navigate, focusBar = false }) {
     const streaming = messages.some((m) => m.status === 'streaming');
     const model = lead.metadata?.mode === 'raw' ? 'raw prompt' : modelName(lead.model) || lead.backend || 'assistant';
     const parts = [];
+    const agent = agentOfMessage(c, lead);
     for (const m of messages) {
       if (m.reasoning_text) parts.push(reasoning(m));
       if (m.content_text) parts.push(h('p.msg-text', m.content_text));
@@ -342,9 +351,15 @@ export function conversationScreen({ id, navigate, focusBar = false }) {
         parts.push(h('div.msg-error', m.metadata?.error?.detail || 'This reply failed.'));
       }
       if (m.status === 'cancelled') parts.push(h('span.state.wait', 'STOPPED'));
-      for (const call of m.tool_calls ?? []) parts.push(toolCall(m, call, ctx));
+      for (const call of m.tool_calls ?? []) parts.push(toolCall(m, call, ctx, agent));
     }
-    return h('section.msg.assistant', head('Imaginer', `${model} · ${streaming ? 'streaming' : clock(lead.created_at)}`), parts);
+    const when = streaming ? 'streaming' : clock(lead.created_at);
+    const who = agent
+      ? h('div.msg-head.agent-head',
+        h('a.agent-head-link', { href: `#/agents/${agent.id}`, title: `${agent.name}: its card` }, portrait(agent, { size: 26 })),
+        h('span.eyebrow', agent.name), h('span.msg-sub', `· ${model} · ${when}`))
+      : head('Imaginer', `${model} · ${when}`);
+    return h('section.msg.assistant', who, parts);
   }
 
   function reasoning(m) {
@@ -364,7 +379,7 @@ export function conversationScreen({ id, navigate, focusBar = false }) {
     ];
   }
 
-  function toolCall(m, call, ctx) {
+  function toolCall(m, call, ctx, agent = null) {
     const name = call.function.name;
     const args = parseArgs(call.function.arguments);
     const key = `${m.id}:${call.id}`;
@@ -421,17 +436,40 @@ export function conversationScreen({ id, navigate, focusBar = false }) {
         retryButton(finished, 'Try again on a new branch')));
     }
     const inputs = name === 'edit_image' && Array.isArray(args?.images) ? args.images : [];
+    // set_portrait: what the portrait is now, and the self-portrait it becomes.
+    const self = name === 'set_portrait' && outcome?.status !== 'error' ? portraitLineage(agent, outcome, job) : null;
     if (gaveUp) {
       const where = stepText ? `Progress stopped at step ${stepText.replace('/', ' / ')}.` : 'Progress stopped.';
       parts.push(h('div.tool-error', h('span', `${where} Reconnect to see the result. Nothing is lost.`)));
     } else if (live) {
-      parts.push(jobPanel(job, shown, inputs, args?.mask, lost));
+      parts.push(jobPanel(job, shown, inputs, args?.mask, lost, self));
+    } else if (self && !outs.length) {
+      parts.push(h('div.fig-with-lineage', self));
     }
     if (outs.length) {
       const figs = h('div.figures', outs.map((a, i) => figure(a, finished, i === outs.length - 1 ? attemptSwitch : null)));
-      parts.push(inputs.length ? h('div.fig-with-lineage', figs, lineage(inputs, args?.mask, outs)) : figs);
+      parts.push(inputs.length ? h('div.fig-with-lineage', figs, lineage(inputs, args?.mask, outs))
+        : self ? h('div.fig-with-lineage', figs, self) : figs);
     }
     return h('div.tool', parts);
+  }
+
+  /** The agent's portrait before and after a set_portrait call. */
+  function portraitLineage(agent, outcome, job) {
+    const done = outcome?.portrait;
+    const shown = agent?.portrait;
+    const nowLabel = !shown?.source ? 'Monogram' : shown.source === 'hub' ? `Hub · ${shown.hub_owner ?? ''}`.trim()
+      : shown.source === 'self' ? `self-portrait v${shown.images.find((i) => i.key === shown.key)?.version ?? ''}` : 'Uploaded';
+    const next = (shown?.images ?? []).filter((i) => i.source === 'self').length + 1;
+    const busy = running(id) && [...c.jobs.values()].some((j) => j.id !== job?.id && (j.status === 'running' || j.status === 'queued'));
+    return h('div.lineage',
+      h('span.eyebrow', 'Portrait'),
+      !done && h('div.lin-row', agent ? portrait(agent, { size: 22, cls: 'lin-thumb' }) : h('span.lin-thumb'),
+        h('span.lin-label.plain', nowLabel), h('span.muted', 'now')),
+      h('div.lin-row',
+        h('span.lin-thumb.arrow', { class: done ? '' : 'pending' }, icon('arrowRight', 12)),
+        h('span.lin-label', `self-portrait v${done?.version ?? next}`),
+        h('span.muted', done ? 'in use' : busy ? 'after the image in progress' : job ? 'painting' : 'next')));
   }
 
   /** The whole call, which its row cuts to one line: each argument in full, the LoRAs
@@ -527,7 +565,7 @@ export function conversationScreen({ id, navigate, focusBar = false }) {
       outs ? outs.map((a) => output(a.label, 'edited', false)) : output('output', 'pending', true));
   }
 
-  function jobPanel(job, shown, inputs, mask, lost = false) {
+  function jobPanel(job, shown, inputs, mask, lost = false, aside = null) {
     const p = job.progress ?? {};
     const total = p.total_steps ?? null;
     const step = p.step ?? 0;
@@ -543,7 +581,7 @@ export function conversationScreen({ id, navigate, focusBar = false }) {
     return h('div.job', { class: lost ? 'stale' : '' },
       preview,
       h('div.job-side',
-        inputs.length ? lineage(inputs, mask) : h('div'),
+        aside ?? (inputs.length ? lineage(inputs, mask) : h('div')),
         h('div.job-progress',
           h('div.job-step',
             h('span.job-step-n', total ? ['Step ', String(step), h('span.muted', ` / ${total}`)] : job.status === 'queued' ? 'Queued' : 'Starting'),
@@ -715,7 +753,7 @@ export function conversationScreen({ id, navigate, focusBar = false }) {
     render();
   };
   const unsubscribe = [
-    on(`conv:${id}`, render), on('turns', render), on('loras', relabel), on('backends', relabel),
+    on(`conv:${id}`, render), on('turns', render), on('loras', relabel), on('backends', relabel), on('agents', render),
   ];
 
   ensureLoaded(id).then((loaded) => {

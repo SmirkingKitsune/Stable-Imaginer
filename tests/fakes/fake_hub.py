@@ -59,16 +59,37 @@ class FakeHub:
     drop_once: dict[str, int] = field(default_factory=dict)  # "repo/path": cut after n bytes
     slow: dict[str, float] = field(default_factory=dict)  # "repo/path": seconds per 1 KB
     requests: list[dict[str, Any]] = field(default_factory=list)  # file requests, in order
+    avatars: dict[str, bytes] = field(default_factory=dict)  # organization -> its avatar image
 
     def app(self) -> Starlette:
         return Starlette(
             routes=[
+                Route("/api/organizations/{name}/avatar", self._avatar),
+                Route("/api/users/{name}/avatar", self._no_avatar),
+                Route("/avatars/{name}.png", self._avatar_file),
                 Route("/api/models", self._search),
                 Route("/api/models/{owner}/{name}/revision/{rev}", self._info),
                 Route("/{owner}/{name}/resolve/{rev}/{path:path}", self._resolve),
                 Route("/cdn/{owner}/{name}/{rev}/{path:path}", self._cdn),
             ]
         )
+
+    # --- avatars ------------------------------------------------------------------------
+
+    async def _avatar(self, request: Request) -> Response:
+        name = request.path_params["name"]
+        if name not in self.avatars:
+            return _error(404, "EntryNotFound", "no such organization")
+        return JSONResponse({"avatarUrl": f"/avatars/{name}.png"})
+
+    async def _no_avatar(self, request: Request) -> Response:
+        return _error(404, "EntryNotFound", "no such user")
+
+    async def _avatar_file(self, request: Request) -> Response:
+        data = self.avatars.get(request.path_params["name"])
+        if data is None:
+            return _error(404, "EntryNotFound", "no such avatar")
+        return Response(data, media_type="image/png")
 
     # --- metadata -----------------------------------------------------------------------
 

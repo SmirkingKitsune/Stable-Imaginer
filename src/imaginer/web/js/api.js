@@ -206,6 +206,25 @@ export const api = {
   /** Live `download` events; read them with readEvents. */
   hubEvents: (signal) => request('GET', 'v1/hub/events', { signal, headers: { Accept: 'text/event-stream' } }),
 
+  // --- agents (a chat model plus a persona) ---
+  agents: () => getJson('v1/agents'),
+  agent: (id) => getJson(`v1/agents/${id}`),
+  createAgent: (body) => sendJson('POST', 'v1/agents', body),
+  updateAgent: (id, patch) => sendJson('PATCH', `v1/agents/${id}`, patch),
+  deleteAgent: (id) => sendJson('DELETE', `v1/agents/${id}`),
+  useAgent: (id, body = {}) => sendJson('POST', `v1/agents/${id}/use`, body),
+  stopAgent: (id) => sendJson('POST', `v1/agents/${id}/stop`),
+  /** {key} | {artifact_id} | {refresh: true} */
+  setAgentPortrait: (id, body) => sendJson('PUT', `v1/agents/${id}/portrait`, body),
+  async uploadAgentPortrait(id, file) {
+    const form = new FormData();
+    form.append('file', file, file.name || 'portrait');
+    const resp = await request('POST', `v1/agents/${id}/portrait/upload`, { body: form });
+    return resp.json();
+  },
+  paintAgent: (id) => sendJson('POST', `v1/agents/${id}/portrait/paint`),
+  createConversationWith: (title, agent) => sendJson('POST', 'v1/conversations', { title, metadata: { agent } }),
+
   // --- the LoRA library ---
   models: () => getJson('v1/models'),
   model: (id) => getJson(`v1/models/${id}`),

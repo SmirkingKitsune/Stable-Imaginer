@@ -52,7 +52,11 @@ async def test_edit_an_upload_through_chat(
 
     # The model saw the upload as pixels with its label, and the edit tool was offered.
     first = fake_llama.requests[-2]
-    assert {t["function"]["name"] for t in first["tools"]} == {"generate_image", "edit_image"}
+    assert {t["function"]["name"] for t in first["tools"]} == {
+        "generate_image",
+        "edit_image",
+        "set_portrait",
+    }
     user_parts = first["messages"][-1]["content"]
     assert {"type": "text", "text": "img-1:"} in user_parts
 

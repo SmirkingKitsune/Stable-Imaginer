@@ -20,6 +20,11 @@ from starlette.requests import Request
 from starlette.responses import JSONResponse, Response, StreamingResponse
 from starlette.routing import Route
 
+SELF_PORTRAIT = (
+    "a calm geometric figure drawn in thin steel-blue lines on pale graph paper: a lens-shaped "
+    "eye inside a square frame, registration marks at the corners, flat technical illustration"
+)
+
 
 @dataclass
 class Script:
@@ -44,6 +49,10 @@ class FakeLlama:
     scripts: deque[Script] = field(default_factory=deque)
     requests: list[dict[str, Any]] = field(default_factory=list)
     props_hits: int = 0
+    # Manual and UI work (python -m tests.fakes): unscripted answers stream slowly, after
+    # some reasoning, so the viewer's thought bubble has something to show.
+    echo_delay_s: float = 0.0
+    echo_reasoning: bool = False
 
     def reset(self) -> None:
         self.loading = False
@@ -222,12 +231,31 @@ class FakeLlama:
         yield _sse(final)
         yield "data: [DONE]\n\n"
 
+    def _echo(self, body: dict[str, Any]) -> Script:
+        script = self._echo_script(body)
+        if self.echo_reasoning and not body.get("response_format"):
+            final = body["messages"][-1]
+            asked = final["content"] if isinstance(final["content"], str) else "the image"
+            first = asked.split("\n\n")[0][:120]
+            thought = (
+                f"The user asked: {first}. Keep the composition simple and the horizon low, "
+                "let the light carry the mood, and say what I changed so they can compare. "
+                "Then call the tool with a detailed prompt."
+                if final["role"] == "user"
+                else "The tool answered. Name the new image by its label and keep it short."
+            )
+            pieces = [w + " " for w in thought.split(" ")]
+            script.chunks = [{"reasoning_content": w} for w in pieces] + script.chunks
+        script.delay_s = max(script.delay_s, self.echo_delay_s)
+        return script
+
     @staticmethod
-    def _echo(body: dict[str, Any]) -> Script:
+    def _echo_script(body: dict[str, Any]) -> Script:
         """Unscripted behaviour, handy for manual and UI work: "draw <x>" calls
         generate_image and "edit img-N: <x>" calls edit_image (when tools are offered), a
-        tool result gets a short summary, a quality check (a request for a JSON answer)
-        passes unless the request says "flawed", and anything else is echoed back."""
+        request that mentions a portrait calls set_portrait, a tool result gets a short
+        summary, a quality check (a request for a JSON answer) passes unless the request
+        says "flawed", and anything else is echoed back."""
         if body.get("response_format"):
             shown = body["messages"][-1]["content"]
             text = shown[0]["text"] if isinstance(shown, list) else shown
@@ -244,6 +272,9 @@ class FakeLlama:
             return FakeLlama.text(f"That didn't work: {result['error']['detail']}")
         if body.get("tools") and body.get("tool_choice") != "none" and final["role"] == "user":
             text = final["content"] if isinstance(final["content"], str) else ""
+            offered = {t["function"]["name"] for t in body["tools"]}
+            if "set_portrait" in offered and "portrait" in text.lower():
+                return FakeLlama.tool_call("set_portrait", {"prompt": SELF_PORTRAIT})
             if text.lower().startswith("draw "):  # its first paragraph: not the notes after it
                 prompt = text[5:].split("\n\n")[0].strip()
                 return FakeLlama.tool_call("generate_image", {"prompt": prompt})

@@ -257,6 +257,12 @@ class SdCppLaunch(_Launch):
 class LlamaCppBackendConfig(_HttpBackend):
     type: Literal["llamacpp"]
     launch: LlamaCppLaunch | None = None
+    agent: str | None = Field(
+        default=None,
+        max_length=64,
+        description="The agent (GET /v1/agents) this engine runs: its model files, chat "
+        "template, context size and sampling replace the ones set here.",
+    )
     model: str | None = Field(
         default=None, description="Model id sent with requests (needed in router mode)."
     )

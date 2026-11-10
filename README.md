@@ -4,6 +4,7 @@ Backend for a local, single-user multimodal chat app. A FastAPI orchestrator own
 conversations and their artifacts, and talks to separate inference engines over HTTP:
 
 - **Chat LLM:** `llama.cpp`'s `llama-server`. The reference model is Qwen3-VL-8B-Instruct, with vision and tool calling.
+  Each chat model is an [agent](docs/agent-library.md): the model plus a persona (name, system prompt, portrait).
 - **Images:** `stable-diffusion.cpp`'s `sd-server`, reached through its native `/sdcpp/v1` API. It runs
   any image family sd-server supports (SD 1.x/SDXL, SD3, FLUX.1/2/3, Chroma, Qwen Image, Z-Image…),
   each one a model card in the [model library](docs/models.md). The reference model is Qwen-Image-2.1.
@@ -283,6 +284,9 @@ conversation stays hidden and a background sweep finishes the delete later.
 | `PATCH`, `DELETE` | `/v1/models/{id}` | name, family, components, launch, defaults, presets, prompt note, notes, tags, pin; `DELETE` forgets the card (not while an engine runs it) |
 | `POST` | `/v1/models/{id}/use`, `/v1/models/detect` | run it on an sd-server engine (restarting one that runs); guess a file's or repo's family |
 | `GET` | `/v1/models/families`, `/v1/models/families/{id}` | the families sd-server runs: each recipe's slots, defaults, features and Hugging Face sources |
+| `GET`, `POST` | `/v1/agents`, `/v1/agents/{id}` | agents: a chat model (GGUF, vision projector, chat template) plus a persona (name, system prompt, portrait, tools, sampling); `POST` makes one from a file (`path`), a Hub reference (`ref`) or for whatever an engine runs. See [docs/agent-library.md](docs/agent-library.md) |
+| `PATCH`, `DELETE` | `/v1/agents/{id}` | name, engine, files, system prompt, viewer, tools, sampling, context, notes, tags, pin; `DELETE` forgets it (not while an engine runs it) |
+| `POST`, `PUT`, `GET` | `/v1/agents/{id}/use`, `/stop`, `/portrait`, `/portrait/upload`, `/portrait/paint`, `/portraits/{key}` | run its model on its engine; its portrait: the Hub uploader's avatar, an upload, or a self-portrait it paints with `set_portrait` |
 | `GET` | `/v1/gallery?limit=&cursor=&include_archived=` | this instance's conversations and every linked instance's, newest activity first; each item has an `origin` (`base_path` reaches a remote one), each page `sources` with their status |
 | `GET`, `POST` | `/v1/links`, `/v1/links/discovered` | the Links screen: this instance, its links and what each shares (with VRAM fit); `POST {url, code, name?}` pairs |
 | `POST` | `/v1/links/pairing-code` | a code another instance can pair with (10 minutes, single use) |
@@ -367,7 +371,7 @@ a leaf. Clients that ignore branches keep working: without `parent_id`, a messag
 ### Tools and jobs
 
 If the chat model supports tools and an image backend is configured, the model is offered
-two tools. Both also take `negative_prompt`, `aspect_ratio`, `width`, `height`, `n` (up to 4),
+two image tools, and an agent a third. The image tools also take `negative_prompt`, `aspect_ratio`, `width`, `height`, `n` (up to 4),
 `seed` and `transparent`.
 
 - **`generate_image(prompt, ...)`** creates new images.
@@ -381,6 +385,10 @@ two tools. Both also take `negative_prompt`, `aspect_ratio`, `width`, `height`, 
   - **Large inputs** are downscaled before they're sent (`max_ref_pixels`).
   - **Labels** resolve only within the conversation. An unknown label comes back to the model
     with the list of labels that do exist.
+- **`set_portrait(prompt, negative_prompt?)`**, offered to a turn that has an
+  [agent](docs/agent-library.md), paints a square self-portrait from the agent's own prompt and makes
+  it the agent's portrait. The image stays in the conversation like any other; the agent can
+  turn the tool off, and is told to ask before changing its portrait unless asked to.
 
 - **Storage:** each call becomes a **job**. Its images are stored as `generated` (generation)
   or `edited` (editing) artifacts with
@@ -470,7 +478,8 @@ It follows the "Imaginer Main Interface" design, which is built on the Industry 
 
 - **Gallery:** every conversation is a tile showing its latest image, in a masonry that loads
   more as you scroll. Hover a tile for its label, title and age. A running turn shows its
-  progress on the tile. Past the last tile, the prompt bar rises into the open space.
+  progress on the tile. Past the last tile, the prompt bar rises into the open space. Sending a
+  prompt from here opens the viewer, where the agent thinks and then paints.
 - **Prompt bar:** text, attachments (pick, paste or drop images) and quick-option chips. The
   chips open a tray with the prompt mode (Chat, Raw, Interpret, Curate) and the quality check
   (on by default), then aspect ratio, image count, seed and image backend, and a row for
@@ -488,11 +497,16 @@ It follows the "Imaginer Main Interface" design, which is built on the Industry 
   mask or download from here. Focusing the bar opens the conversation, on the shown image's
   branch. A zoom bar fits, shows actual size or zooms to 400% (keys `+ − 0 1`; drag, arrows or
   Ctrl+scroll), with a minimap once the image outgrows the stage. Compare (`C`) pairs an edit
-  with its source, as a slider or side by side.
+  with its source, as a slider or side by side. The agent shows on the stage: with no images
+  yet its portrait stands in the middle under a thought bubble (its status, and its reasoning
+  as it streams) that becomes a speech bubble when it answers; with images it sits in the
+  stage's corner. While the image engine paints, the stage shows the steps loading with the
+  job's progress and Cancel, and the reel a tile for each image on its way.
 - **Mask editor:** "Mask" on an image opens a brush to paint the area to change (B brush,
   E eraser, `[ ]` size, X invert, Ctrl+Z undo). The mask is uploaded at the image's size and
   goes into the bar beside it; the message sends it as `image_options.mask`.
-- **Conversation:** streaming replies and collapsible reasoning. Each tool call shows as a row
+- **Conversation:** streaming replies and collapsible reasoning, each reply headed by its agent's
+  portrait and name. Each tool call shows as a row
   with its job state, which opens to the whole call: every argument in full (the prompt with
   a Copy button), the LoRAs by their library names with the trigger words they added, and the
   engine, model, size, steps and CFG the job used. A running job shows step progress, engine
@@ -528,6 +542,14 @@ It follows the "Imaginer Main Interface" design, which is built on the Industry 
   file, or from Hugging Face (curated sources first), and edits its launch arguments,
   defaults, presets, prompt note, notes, tags and cover. **Use on an engine** points an
   sd-server at it, restarting one that is running. See [docs/models.md](docs/models.md).
+- **Agents** (`#/agents`, from the status line's menu): a tile per agent with its portrait as
+  the cover, its model, quant and size, turns, whether it is ready and the engine it runs on;
+  filters (pinned, vision, tools, running) and a table view. An agent's page (`#/agents/<id>`)
+  has its portrait (the Hub uploader's avatar, a self-portrait it paints with `set_portrait`,
+  or an upload), its persona (name, system prompt, what the viewer's thought bubble shows),
+  its tools, its files (GGUF, vision projector, chat template) and its sampling. **Use on** an
+  engine restarts a llama-server launched here with the agent's model. See
+  [docs/agent-library.md](docs/agent-library.md).
 - **Connection:** when the server can't be reached, a strip under the header counts down
   retries (1, 2, 4, 8, 16 s), running jobs dim to their last known step, and drafts are kept.
   Once back, running turns pick up from their last event.

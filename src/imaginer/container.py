@@ -4,8 +4,9 @@ import asyncio
 import contextlib
 from dataclasses import dataclass, field
 
+from imaginer.agents.library import AgentLibrary
 from imaginer.backends.registry import FACTORIES, BackendRegistry
-from imaginer.core.config import Settings, backend_kind, is_loopback_host
+from imaginer.core.config import BackendConfig, Settings, backend_kind, is_loopback_host
 from imaginer.core.logging import get_logger
 from imaginer.db import migrate
 from imaginer.db.engine import Database
@@ -31,6 +32,7 @@ from imaginer.storage.local_fs import LocalFSArtifactStore
 from imaginer.tools.base import ToolRegistry
 from imaginer.tools.edit_image import EditImageTool
 from imaginer.tools.generate_image import GenerateImageTool
+from imaginer.tools.set_portrait import SetPortraitTool
 
 log = get_logger(__name__)
 
@@ -56,6 +58,7 @@ class Container:
     gallery: Gallery
     loras: LoraLibrary
     models: ModelLibrary
+    agents: AgentLibrary
     _tasks: list[asyncio.Task[None]] = field(default_factory=list)
 
     @classmethod
@@ -78,9 +81,16 @@ class Container:
         # settings, so the registry is built from each backend's config as it runs.
         models = ModelLibrary(settings, db)
         await models.load()
+        # So does a llama-server with an agent: it runs the agent's model.
+        agents = AgentLibrary(settings, db)
+        await agents.load()
+
+        def view(name: str, config: BackendConfig) -> BackendConfig:
+            return agents.effective(name, models.effective(name, config))
+
         raw = dict(settings.backends)
         for name, config in raw.items():
-            settings.backends[name] = models.effective(name, config)
+            settings.backends[name] = view(name, config)
         registry = BackendRegistry.from_settings(
             settings, factories={**FACTORIES, "linked": links.backend_factory}
         )
@@ -94,7 +104,11 @@ class Container:
         jobs = JobManager(db, artifacts, gates)
         await jobs.fail_orphans()
         tools = ToolRegistry(
-            [GenerateImageTool(registry, jobs), EditImageTool(registry, jobs, artifacts)]
+            [
+                GenerateImageTool(registry, jobs),
+                EditImageTool(registry, jobs, artifacts),
+                SetPortraitTool(registry, jobs, artifacts, agents),
+            ]
         )
         turns = TurnManager()
         context = ContextBuilder(
@@ -118,9 +132,20 @@ class Container:
             await jobs.cancel_conversation(conversation_id)
 
         conversations.add_delete_hook(stop_work)
-        engines = EngineService(settings, registry, raw=raw, view=models.effective)
+        engines = EngineService(settings, registry, raw=raw, view=view)
         hub = HubService(settings, engines)
         models.attach(engines=engines, hub=hub, artifacts=artifacts)
+        agents.attach(
+            engines=engines,
+            registry=registry,
+            hub=hub,
+            artifacts=artifacts,
+            tools=tools,
+            turns=turn_runner,
+            conversations=conversations,
+            default_prompt=context.default_system_prompt,
+        )
+        turn_runner.set_agents(agents)
         try:
             await models.adopt_engines()
         except Exception:
@@ -153,9 +178,13 @@ class Container:
             gallery=Gallery(turns=turns, conversations=conversations, links=links),
             loras=loras,
             models=models,
+            agents=agents,
         )
         # Probe engines in the background: the API must come up even when they are down.
-        container._tasks.append(asyncio.create_task(registry.refresh()))
+        probed = asyncio.create_task(registry.refresh())
+        container._tasks.append(probed)
+        # Agents for engines that have none, once each engine said what it runs.
+        agents.start_adopting(after=probed)
         container._tasks.append(asyncio.create_task(container.engines.autostart()))
         if settings.storage.sweep_interval_s > 0:
             container._tasks.append(
@@ -171,6 +200,7 @@ class Container:
         return container
 
     async def aclose(self) -> None:
+        await self.agents.aclose()
         await self.turns.cancel_all()
         await self.jobs.cancel_all()
         for task in self._tasks:

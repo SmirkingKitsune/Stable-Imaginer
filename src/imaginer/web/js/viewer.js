@@ -11,16 +11,24 @@
 // bar (fit, 1:1, steps up to 400%) with a minimap. At fit, a sideways swipe on a touch
 // screen steps through the images. Compare pairs an edit with its edit_source from lineage,
 // as a slider or side by side; zoom applies to both sides.
+//
+// The agent (design "Agent Mockups" 1d–1h): a prompt sent from the gallery lands here. With
+// no images yet, the agent's portrait stands centred on the stage under a thought bubble
+// (its status, and its reasoning as it streams, unless it shows status only), which becomes
+// a speech bubble when it answers. With images, it moves to the stage's corner. While the
+// image engine paints, the bubbles clear: the stage shows the steps as they load, with the
+// job's progress and Cancel, and the reel a tile for each image on its way.
 
+import { portrait } from './agents.js';
 import { download, setImage } from './api.js';
-import { connectionStrip, toast } from './chrome.js';
+import { connectionStrip, modelName, toast } from './chrome.js';
 import { corners, h, icon, iconButton, clear } from './dom.js';
-import { imagesSummary, specOf } from './format.js';
+import { clock, imagesSummary, parseArgs, plural, specOf, truncate } from './format.js';
 import { convHash } from './origin.js';
 import { promptBar } from './promptbar.js';
 import {
-  attacherOf, branchAt, byLabel, currentBranch, ensureLoaded, images, lineageOf, on, onPath, retry,
-  running, select, send, stop,
+  agentOf, agentOfMessage, attacherOf, branchAt, byLabel, cancelJob, currentBranch, ensureLoaded, imageEngine,
+  images, lineageOf, on, onPath, pathOf, retry, running, select, send, stop,
 } from './store.js';
 
 const SOURCE_WORD = { upload: 'upload', generated: 'generated', edited: 'edited', derived: 'derived' };
@@ -34,6 +42,10 @@ const SWIPE = 60; // px of sideways travel that steps to the next image at fit
 const DOUBLE_TAP_MS = 300;
 const SIDE_KEY = 'imaginer.viewerSide';
 const ZOOM_HINT = matchMedia('(hover: none)').matches ? 'pinch to zoom' : 'scroll to zoom';
+const BUBBLE_CHARS = 220; // a corner speech bubble's text, before "Read more"
+const REASONING_TAIL = 320; // characters of streaming reasoning a thought bubble shows
+const STRANGER = { name: 'Imaginer', viewer: 'reasoning', portrait: { monogram: 'I' } };
+const words = (text) => (text?.trim() ? text.trim().split(/\s+/).length : 0);
 
 /** The column starts open on wide screens, until the user says otherwise. */
 function sideOpenAtStart() {
@@ -64,11 +76,12 @@ export function viewerScreen({ id, label, navigate }) {
 
   const title = h('span.topbar-title', '…');
   const meta = h('span.topbar-meta');
+  const downloadBtn = h('button.btn-line.only-wide', { type: 'button', onclick: () => current && save(current) }, icon('download', 15), 'Download');
   const header = h('header.topbar.sub',
     iconButton('back', 'Back to gallery', () => navigate('#/')),
     h('div.topbar-heading', title, meta),
     h('span.spacer'),
-    h('button.btn-line.only-wide', { type: 'button', onclick: () => current && save(current) }, icon('download', 15), 'Download'),
+    downloadBtn,
     h('button.btn-line.only-wide', { type: 'button', onclick: () => openChat() }, icon('chat', 15), 'Conversation'),
     h('span.only-narrow', iconButton('chat', 'Conversation', () => openChat())),
   );
@@ -109,6 +122,11 @@ export function viewerScreen({ id, label, navigate }) {
     h('span.zoom-sep'),
     fitBtn, oneBtn);
   main.el.append(minimap, zoomBar);
+  // The agent: on the stage (no images yet) or in its corner, and the steps loading.
+  const loading = h('div.stage-loading', { hidden: true });
+  const agentLayer = h('div.agent-layer');
+  main.el.querySelector('.stage-clip').append(loading);
+  main.el.append(agentLayer);
   const panes = h('div.stage-row', main.el, side.el);
 
   // --- side column: actions, prompt and details, the reel ---------------------------
@@ -514,9 +532,14 @@ export function viewerScreen({ id, label, navigate }) {
 
   // --- the image shown ---------------------------------------------------------------
 
-  async function show(artifact) {
+  async function show(artifact, { quiet = false } = {}) {
     const changed = current?.id !== artifact.id;
     current = artifact;
+    for (const b of actions.querySelectorAll('button')) b.disabled = false;
+    compareBtn.hidden = false;
+    main.kindChip.hidden = false;
+    main.labelChip.classList.remove('live');
+    main.labelChip.parentElement.querySelector('.handed')?.remove();
     setImage(main.pic, artifact);
     main.pic.alt = artifact.metadata?.prompt || artifact.label;
     setImage(miniPic, artifact);
@@ -524,8 +547,9 @@ export function viewerScreen({ id, label, navigate }) {
     sideKind.textContent = SOURCE_WORD[artifact.source] ?? artifact.source;
     prompt.textContent = artifact.source === 'upload' ? 'Your upload.' : artifact.metadata?.prompt || '';
     spec.textContent = specOf(artifact);
+    // The tool that made it, as its result message records (set_portrait paints too).
     source.textContent = artifact.source === 'upload' ? 'your upload'
-      : artifact.source === 'edited' ? 'edit_image' : 'generate_image';
+      : attacherOf(c, artifact.id)?.metadata?.tool ?? (artifact.source === 'edited' ? 'edit_image' : 'generate_image');
     if (changed) {
       view.zoom = null;
       view.panX = 0;
@@ -538,7 +562,7 @@ export function viewerScreen({ id, label, navigate }) {
     }
     fit();
     renderBranch();
-    renderReel();
+    if (!quiet) renderReel();
     if (location.hash !== convHash(id, artifact.label)) {
       history.replaceState(null, '', convHash(id, artifact.label));
     }
@@ -555,6 +579,7 @@ export function viewerScreen({ id, label, navigate }) {
 
   /** "branch · retry of img-3", and Retry, for the image on stage. */
   function renderBranch() {
+    if (!current) return;
     const by = attacherOf(c, current.id);
     const branch = by && (onPath(c).has(current.id) ? currentBranch(c) : branchAt(c, by.id));
     branchMeta.textContent = c.branches.length > 1 && branch ? `branch · ${branch.name}` : '';
@@ -567,7 +592,9 @@ export function viewerScreen({ id, label, navigate }) {
     clear(reel);
     const shown = onPath(c);
     const all = images(c);
-    reelCount.textContent = `Images · ${all.length}`;
+    const live = phase?.kind === 'painting' ? phase : null;
+    reelCount.textContent = live ? `${plural(all.length, 'image')} · ${live.left} painting` : `Images · ${all.length}`;
+    if (!all.length && !live) reel.append(h('div.reel-empty', { 'aria-hidden': 'true' }));
     for (const a of all) {
       const selected = a.id === current?.id;
       const before = compare?.before?.id === a.id;
@@ -581,7 +608,17 @@ export function viewerScreen({ id, label, navigate }) {
         onclick: () => pick(a),
       }, h('span.reel-thumb', thumb, elsewhere && h('span.reel-mark', icon('branch', 11))), h('span', a.label)));
     }
-    if (current) reel.setAttribute('aria-activedescendant', `reel-${current.id}`);
+    if (live) {
+      // The images on their way: the one painting with its progress, then the queued ones.
+      for (let i = 0; i < live.left; i += 1) {
+        const now = i === 0 && live.job.status === 'running';
+        reel.append(h('div.reel-item.pending', { class: now ? 'on' : '', 'aria-hidden': 'true' },
+          h('span.reel-thumb', h('span.reel-pic.live', { class: now ? '' : 'queued' }),
+            now && h('span.tile-progress', h('i', { style: { width: `${live.pct}%` } }))),
+          h('span', now ? live.label : 'queued')));
+      }
+    }
+    if (current && !live) reel.setAttribute('aria-activedescendant', `reel-${current.id}`);
     reel.querySelector('.on')?.scrollIntoView({ block: 'nearest', inline: 'nearest' });
   }
 
@@ -641,18 +678,256 @@ export function viewerScreen({ id, label, navigate }) {
     const info_ = c.info;
     title.textContent = info_?.title || 'Untitled';
     const all = images(c);
-    meta.textContent = imagesSummary(all, c.branches.length);
+    if (running(id)) watched = true;
+    phase = phaseOf(all);
+    const painting = phase.kind === 'painting' ? `${phase.left} painting` : null;
+    meta.textContent = all.length
+      ? [imagesSummary(all, c.branches.length), painting].filter(Boolean).join(' · ')
+      : ['no images yet', painting, currentBranch(c)?.name ?? 'main'].filter(Boolean).join(' · ');
     bar.refresh();
+    downloadBtn.disabled = !all.length;
+    el.classList.toggle('no-images', !all.length);
     if (!all.length) {
-      navigate(chat, { replace: true });
+      // Nothing to show yet: the stage is the agent's (design 1d, 1e).
+      current = null;
+      main.pic.removeAttribute('src');
+      main.el.classList.remove('pannable', 'sliding');
+      if (sideOpen) {
+        setSide(false, { remember: false });
+        sideEl.dataset.auto = '1';
+      }
+      renderReel();
+    } else {
+      if (sideEl.dataset.auto && !sideOpen) {
+        delete sideEl.dataset.auto;
+        setSide(sideOpenAtStart(), { remember: false });
+      }
+      const wanted = (label && byLabel(c, label)) || null;
+      const grew = seen !== null && all.length > seen && watched;
+      if (!current || !all.some((a) => a.id === current.id) || grew) show(grew ? all[all.length - 1] : wanted ?? all[all.length - 1]);
+      else {
+        renderBranch();
+        renderReel();
+      }
+    }
+    seen = all.length;
+    renderAgent(all);
+  }
+
+  // --- the agent on the stage (designs 1d–1h) -------------------------------------------
+
+  let phase = { kind: 'idle' };
+  let watched = false; // a turn ran while this viewer was open: its reply is shown
+  let seen = null; // images there were at the last render
+  let dismissed = null; // the reply whose bubble was closed
+  let ticker = null;
+  let wasPainting = false;
+
+  /** What the agent is doing on the branch shown: thinking (nothing said yet), speaking
+   * (its reply, or the call it makes), painting (an image job runs), or idle. */
+  function phaseOf(all) {
+    const path = pathOf(c);
+    const live = running(id);
+    const at = path.findLastIndex((m) => m.role === 'user');
+    const asked = at >= 0 ? path[at] : null;
+    const said = path.slice(at + 1).filter((m) => m.role === 'assistant');
+    const lead = said.at(-1) ?? null;
+    const spoke = [...said].reverse().find((m) => m.content_text?.trim()) ?? null;
+    const agent = (lead && agentOfMessage(c, lead)) || agentOf(c) || STRANGER;
+    const jobs = [...c.jobs.values()].filter((j) => j.status === 'running' || j.status === 'queued')
+      .sort((a, b) => (a.id < b.id ? -1 : 1));
+    const job = jobs.find((j) => j.status === 'running') ?? jobs[0] ?? null;
+    if (live && job) {
+      const p = job.progress ?? {};
+      const n = p.images ?? job.params?.requested?.n ?? 1;
+      const done = Math.max(0, (p.image ?? 1) - 1);
+      const pct = p.total_steps ? Math.round((100 * p.step) / p.total_steps) : 0;
+      const next = 1 + Math.max(0, ...all.map((a) => Number(/^img-(\d+)$/.exec(a.label)?.[1] ?? 0)));
+      return { kind: 'painting', job, jobs, agent, asked, lead, left: Math.max(1, n - done), n, pct, label: `img-${next}` };
+    }
+    if (live && (!lead || (lead.status === 'streaming' && !lead.content_text && !(lead.tool_calls ?? []).length))) {
+      return { kind: 'thinking', agent, asked, lead };
+    }
+    if (live) return { kind: 'speaking', agent, asked, lead, spoke, live: true };
+    if (watched && spoke && spoke.id !== dismissed) return { kind: 'speaking', agent, asked, lead, spoke, live: false };
+    return { kind: 'idle', agent, asked, lead };
+  }
+
+  function renderAgent(all) {
+    clearInterval(ticker);
+    ticker = null;
+    const empty = !all.length;
+    const painting = phase.kind === 'painting';
+    main.el.classList.toggle('loading', painting);
+    main.el.classList.toggle('agent-stage', empty && !painting);
+    zoomBar.hidden = empty || painting;
+    main.labelChip.parentElement.hidden = empty && !painting;
+    clear(agentLayer);
+    renderLoading();
+    if (painting) {
+      wasPainting = true;
+      renderSideForJob();
       return;
     }
-    const wanted = (label && byLabel(c, label)) || null;
-    if (!current || !all.some((a) => a.id === current.id)) show(wanted ?? all[all.length - 1]);
-    else {
-      renderBranch();
-      renderReel();
+    if (wasPainting && current) show(current, { quiet: true });
+    wasPainting = false;
+    if (empty) agentLayer.append(centred());
+    else if (phase.kind !== 'idle') agentLayer.append(corner());
+  }
+
+  /** Design 1d/1e: the portrait centred, a bubble over it, its name and what it runs under. */
+  function centred() {
+    const { agent } = phase;
+    const bubble = phase.kind === 'thinking' ? thought(false) : phase.kind === 'speaking' ? speech(false) : null;
+    const calling = phase.kind === 'speaking' && phase.live && (phase.lead?.tool_calls ?? []).length;
+    const hint = c.messages.size ? null : 'Describe an image below: it plans it here, then paints it.';
+    const engineLine = calling ? `handing the prompt to ${callEngine()}…`
+      : [phase.lead?.backend ? `chat · ${phase.lead.backend}` : agent.use?.engine && `chat · ${agent.use.engine}`,
+        agent.quant].filter(Boolean).join(' · ');
+    return h('div.agent-centre',
+      bubble,
+      phase.kind === 'thinking' && h('div.thought-dots', { 'aria-hidden': 'true' }, h('i'), h('i')),
+      portrait(agent, { size: 128, framed: true, cls: phase.kind === 'speaking' ? 'spoke' : '' }),
+      h('div.agent-centre-name', h('span.agent-name-big', agent.name), h('span.mono-meta', hint ?? (engineLine || ' '))));
+  }
+
+  /** Design 1f/1g: the bubble and a small portrait in the stage's corner. */
+  function corner() {
+    const thinking = phase.kind === 'thinking';
+    return h('div.agent-corner',
+      h('div.agent-corner-bubble', thinking ? thought(true) : speech(true),
+        thinking && h('div.thought-dots.side', { 'aria-hidden': 'true' }, h('i'), h('i'))),
+      h('a.agent-corner-portrait', { href: phase.agent.id ? `#/agents/${phase.agent.id}` : null, title: phase.agent.name },
+        portrait(phase.agent, { size: 64, framed: true })));
+  }
+
+  /** The thought bubble: how long it has thought, a status line, and its reasoning. */
+  function thought(small) {
+    const { agent, lead, asked } = phase;
+    const since = lead?.created_at ?? asked?.created_at;
+    const time = h('span.eyebrow.accent', 'Thinking');
+    const tick = () => { time.textContent = since ? `Thinking · ${Math.max(0, Math.round((Date.now() - new Date(since).getTime()) / 1000))} s` : 'Thinking'; };
+    tick();
+    ticker = setInterval(tick, 1000);
+    const reasoning = lead?.reasoning_text ?? '';
+    const showReasoning = (agent.viewer ?? 'reasoning') === 'reasoning' && reasoning.trim();
+    const tail = reasoning.length > REASONING_TAIL ? `…${reasoning.slice(-REASONING_TAIL).replace(/^\S*\s/, '')}` : reasoning;
+    return h('div.bubble.thought.blueprint', { class: small ? 'small' : '', role: 'status', 'aria-live': 'polite' },
+      corners(),
+      h('div.bubble-head', h('span.dot.busy'), time, h('span.spacer'),
+        h('span.mono-meta', small ? agent.name : reasoning ? plural(words(reasoning), 'word') : '')),
+      h('span.bubble-title', statusWords()),
+      showReasoning && h('p.bubble-reasoning', tail, h('span.typing', h('i'), h('i'), h('i'))));
+  }
+
+  /** A status line for the thought bubble, from what was asked. */
+  function statusWords() {
+    const { asked, lead } = phase;
+    if (!lead) return 'Reading your message';
+    const labels = [...(asked?.attachments ?? []).map((aid) => c.artifacts.get(aid)?.label),
+      ...((asked?.content_text ?? '').match(/@?\b(img-\d+)\b/g) ?? []).map((m) => m.replace('@', ''))].filter(Boolean);
+    if (labels.length) return `Looking at ${[...new Set(labels)].slice(0, 2).join(' and ')}`;
+    if (!images(c).length) return 'Planning the composition';
+    return lead.reasoning_text ? 'Thinking it through' : 'Reading your message';
+  }
+
+  /** The speech bubble: its reply, and the call it makes, with Read more in the corner. */
+  function speech(small) {
+    const { agent, spoke, lead } = phase;
+    const text = spoke?.content_text?.trim() ?? '';
+    const long = small && text.length > BUBBLE_CHARS;
+    const thoughtWords = words(spoke?.reasoning_text ?? lead?.reasoning_text);
+    const calls = (lead?.tool_calls ?? []).map((call) => callRow(lead, call));
+    const more = h('button.mini', { type: 'button', onclick: () => openChat() }, 'Read more');
+    return h('div.bubble.speech', { class: small ? 'small' : '', role: 'status', 'aria-live': 'polite' },
+      h('div.msg-head',
+        h('span.eyebrow.accent', agent.name),
+        h('span.msg-sub', `· ${spoke ? clock(spoke.created_at) : 'now'}${thoughtWords ? ` · ${plural(thoughtWords, 'word')} of reasoning` : ''}`),
+        h('span.spacer'),
+        !phase.live && h('button.bubble-x', { type: 'button', title: 'Hide', 'aria-label': 'Hide the reply', onclick: () => { dismissed = spoke?.id; render(); } }, icon('x', 13))),
+      text && h('p.msg-text.bubble-text', long ? truncate(text, BUBBLE_CHARS) : text),
+      (calls.length || small) && h('div.bubble-foot', calls, small && (long || calls.length || !phase.live) && more),
+      h('span.bubble-tail', { 'aria-hidden': 'true' }));
+  }
+
+  function callRow(m, call) {
+    const args = parseArgs(call.function.arguments) ?? {};
+    const job = [...c.jobs.values()].find((j) => j.request_message_id === m.id && j.tool_call_id === call.id);
+    const result = [...c.messages.values()].find((x) => x.role === 'tool' && x.tool_call_id === call.id && x.parent_id === m.id);
+    const state = job?.status === 'running' ? ['run', 'RUNNING'] : job?.status === 'queued' ? ['wait', 'QUEUED']
+      : job?.status === 'succeeded' || (result && result.status === 'complete') ? ['done', 'DONE']
+        : job?.status === 'failed' ? ['fail', 'FAILED'] : ['wait', running(id) ? 'CALLING' : '—'];
+    const bits = [args.images?.join(', '), args.mask && 'mask', args.aspect_ratio, args.n > 1 && `n=${args.n}`,
+      call.function.name !== 'edit_image' && !args.aspect_ratio && truncate(args.prompt ?? '', 40)].filter(Boolean);
+    return h('div.tool-row.bubble-call', h('span.tool-name', call.function.name), h('span.tool-args', bits.join(' · ')),
+      h(`span.state.${state[0]}`, state[1]));
+  }
+
+  /** The image engine a call goes to, by name: its job's, else the one the next job uses. */
+  function callEngine() {
+    const job = [...c.jobs.values()].filter((j) => j.request_message_id === phase.lead?.id).at(-1);
+    return job?.backend ?? imageEngine()?.name ?? 'the image engine';
+  }
+
+  /** Design 1h: the steps loading on the stage, the job's progress and Cancel. */
+  function renderLoading() {
+    const painting = phase.kind === 'painting';
+    loading.hidden = !painting;
+    clear(loading);
+    if (!painting) {
+      if (current) main.labelChip.classList.remove('live');
+      return;
     }
+    const { job, pct, label, n, agent } = phase;
+    const p = job.progress ?? {};
+    const requested = job.params?.requested ?? {};
+    const [rw, rh] = requested.width && requested.height ? [requested.width, requested.height]
+      : (requested.aspect_ratio ?? '1:1').split(':').map(Number);
+    // The image's shape, as large as the stage allows.
+    const room = [Math.max(80, (view.w || main.el.clientWidth) - 36), Math.max(80, (view.h || main.el.clientHeight) - 36)];
+    const k = Math.min(room[0] / rw, room[1] / rh);
+    loading.append(h('div.stage-steps', { style: { width: `${Math.round(rw * k)}px`, height: `${Math.round(rh * k)}px` } },
+      h('div.scanline', { style: { top: `${pct}%` } })));
+    const of = n > 1 ? ` · IMAGE ${p.image ?? 1}/${n}` : '';
+    main.labelChip.textContent = job.status === 'queued' ? `${label} · QUEUED` : `${label} · STEP ${p.step ?? 0}${of}`;
+    main.labelChip.classList.add('live');
+    main.kindChip.hidden = true;
+    const handed = h('button.mini.handed', { type: 'button', onclick: () => openChat() },
+      portrait(agent, { size: 22 }), `Handed to ${job.backend} · see its reasoning`);
+    main.labelChip.parentElement.querySelector('.handed')?.remove();
+    main.labelChip.parentElement.append(handed);
+    const total = p.total_steps ?? null;
+    const queuedNext = n > 1 && (p.image ?? 1) < n ? `image ${(p.image ?? 1) + 1} queued` : phase.jobs.length > 1 ? `${phase.jobs.length - 1} more queued` : '';
+    agentLayer.append(h('div.step-plate.blueprint', corners(),
+      h('div.job-progress',
+        h('div.job-step',
+          h('span.job-step-n', total ? ['Step ', String(p.step ?? 0), h('span.muted', ` / ${total}`)] : job.status === 'queued' ? 'Queued' : 'Starting'),
+          h('span.mono-meta.accent', total ? `${pct}%` : '')),
+        h('div.step-bar', h('i', { style: { width: `${pct}%` } })),
+        h('span.mono-meta', [job.backend, modelName(job.model), job.seed != null && `seed ${job.seed}`, requested.aspect_ratio].filter(Boolean).join(' · '))),
+      h('div.step-plate-row',
+        h('button.btn-line', { type: 'button', onclick: () => cancelJob(c, job.id).catch((err) => toast(err.message)) },
+          h('span.stop-square.hollow'), 'Cancel job'),
+        h('span.spacer'),
+        h('span.mono-meta', queuedNext))));
+  }
+
+  /** While a job paints, the side column describes the image on its way. */
+  function renderSideForJob() {
+    const { job, label, agent, n } = phase;
+    const requested = job.params?.requested ?? {};
+    sideLabel.textContent = label;
+    sideKind.textContent = 'painting';
+    for (const b of actions.querySelectorAll('button')) b.disabled = true;
+    compareBtn.hidden = true;
+    pixelNote.textContent = 'actions open when the image is done';
+    prompt.textContent = requested.prompt ?? '';
+    const tool = job.task === 'edit' ? 'edit_image' : job.tool_call_id && [...c.messages.values()].some((m) => (m.tool_calls ?? []).some((x) => x.id === job.tool_call_id && x.function.name === 'set_portrait')) ? 'set_portrait' : 'generate_image';
+    source.textContent = `${tool} · ${agent.name}`;
+    const size = requested.width && requested.height ? `${requested.width}×${requested.height}` : requested.aspect_ratio;
+    spec.textContent = [size, n > 1 && `×${n}`, job.progress?.total_steps && plural(job.progress.total_steps, 'step')].filter(Boolean).join(' · ');
+    branchMeta.textContent = '';
+    renderReel();
   }
 
   // --- keys: + − 0 1 zoom, arrows pan (or switch images at fit), C compare, I details --
@@ -695,9 +970,9 @@ export function viewerScreen({ id, label, navigate }) {
   // The stage resizes with the window, the side column, and compare's second pane.
   const sizer = new ResizeObserver(() => fit());
   sizer.observe(main.el);
-  const unsubscribe = [on(`conv:${id}`, render), on('turns', () => {
+  const unsubscribe = [on(`conv:${id}`, render), on('agents', render), on('turns', () => {
     bar.refresh();
-    if (current) renderBranch();
+    if (c) render();
   })];
 
   ensureLoaded(id).then((loaded) => {
@@ -711,6 +986,7 @@ export function viewerScreen({ id, label, navigate }) {
     el,
     bar,
     destroy() {
+      clearInterval(ticker);
       document.removeEventListener('keydown', onKey);
       document.removeEventListener('keyup', onKeyUp);
       sizer.disconnect();

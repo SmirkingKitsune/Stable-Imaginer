@@ -31,6 +31,7 @@ from imaginer.core.config import (
     BackendConfig,
     DiffusersBackendConfig,
     LlamaCppBackendConfig,
+    LlamaCppLaunch,
     SdCppBackendConfig,
     Settings,
 )
@@ -66,6 +67,8 @@ from imaginer.image_models import recipes
 
 MODEL_ID = "model_id"  # the "launch setting" of a Diffusers backend
 MODEL_CARD = "model:"  # what a download for a model card's slot is assigned to: model:<id>
+AGENT = "agent:"  # and for one of an agent's files: agent:<id>
+AGENT_FILES = ("model", "mmproj", "chat_template")
 LORA = "lora"  # the role of an engine's LoRAs: installed into its LoRA folder
 # The setting a LoRA install sets when the engine has no LoRA folder yet, by engine type.
 LORA_FOLDERS = {"sdcpp": "lora_model_dir", "diffusers": "lora_dir"}
@@ -101,6 +104,10 @@ class HubService:
         # slots; and every card's (card id, slot, path), to say which files are in use.
         self.model_config: Callable[[str], SdCppBackendConfig] | None = None
         self.model_components: Callable[[], Iterable[tuple[str, str, str]]] | None = None
+        # Told an agent's file is downloaded: agent id, key, file, where it came from.
+        self.on_agent_install: (
+            Callable[[str, str, Path, dict[str, Any]], Awaitable[None]] | None
+        ) = None
 
     def _token(self) -> str | None:
         return find_token(self._settings.hub.token_env).token
@@ -432,6 +439,18 @@ class HubService:
         assign: tuple[str, str] | None = None
         source: Path | None = None  # a copy on this machine to copy instead of downloading
         config: BackendConfig | None = None
+        if body.agent is not None:
+            if body.engine is not None or body.model is not None:
+                raise InvalidRequestError("say one thing to set: engine, model, or agent")
+            if body.key not in AGENT_FILES[:2]:
+                raise InvalidRequestError(f"say which of the agent's files to set: {body.key!r}")
+            if self.on_agent_install is None:
+                raise InvalidRequestError("there are no agents here")
+            # An agent's files are what a llama-server loads: matched to its settings.
+            config = LlamaCppBackendConfig(
+                type="llamacpp", base_url="http://127.0.0.1:1", launch=LlamaCppLaunch()
+            )
+            assign = (f"{AGENT}{body.agent}", body.key)
         if body.model is not None:
             if body.engine is not None:
                 raise InvalidRequestError("say one thing to set: engine, or model")
@@ -446,9 +465,12 @@ class HubService:
             if body.key is None:
                 raise InvalidRequestError("say which setting to set: key")
             card = getattr(config, "model_card", None)
-            # An engine that runs a model card loads the card's files: the download is it.
+            agent = getattr(config, "agent", None)
+            # An engine that runs a model card or an agent loads its files: the download is it.
             if card and body.key in recipes.SLOT_IDS and self.on_model_install is not None:
                 assign = (f"{MODEL_CARD}{card}", body.key)
+            elif agent and body.key in AGENT_FILES and self.on_agent_install is not None:
+                assign = (f"{AGENT}{agent}", body.key)
             else:
                 assign = (body.engine, body.key)
         info, layout = await self._load(ref)
@@ -521,6 +543,14 @@ class HubService:
         )
         return download_view(job)
 
+    async def avatar(self, owner: str, max_bytes: int) -> bytes | None:
+        """The avatar of a Hub user or organization (who uploaded a repo), if it has one."""
+        self._require_enabled()
+        url = await self.client.avatar_url(owner)
+        if url is None:
+            return None
+        return await self.client.fetch_url(url, max_bytes)
+
     async def card(self, repo_id: str, revision: str = "main") -> RepoInfo:
         """A repo's card, as the Hub reports it."""
         self._require_enabled()
@@ -548,6 +578,19 @@ class HubService:
         engine was removed meanwhile) doesn't stop the others."""
         failed = []
         for engine, key in job.assign:
+            if engine.startswith(AGENT):
+                agent = engine.removeprefix(AGENT)
+                where = {
+                    "repo": job.repo_id,
+                    "revision": job.revision,
+                    "path": job.target.relative_to(job.root).as_posix(),
+                }
+                try:
+                    assert self.on_agent_install is not None
+                    await self.on_agent_install(agent, key, job.target, where)
+                except ImaginerError as exc:
+                    failed.append(f"{agent}.{key}: {exc.detail}")
+                continue
             if engine.startswith(MODEL_CARD):
                 card = engine.removeprefix(MODEL_CARD)
                 where = {

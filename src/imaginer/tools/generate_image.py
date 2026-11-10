@@ -40,6 +40,8 @@ class GenerateImageTool(Tool):
         "did not ask for."
     )
     args_model = GenerateImageArgs
+    summary = "Paints from a prompt on the default image engine."
+    flags = "t2i"
 
     def __init__(self, registry: BackendRegistry, jobs: JobManager) -> None:
         self._registry = registry

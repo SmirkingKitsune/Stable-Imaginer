@@ -84,6 +84,9 @@ class Message(_Output):
     tool_call_id: str | None = None
     backend: str | None = None
     model: str | None = None
+    agent: str | None = Field(
+        default=None, description="Assistant messages: the agent that wrote it (GET /v1/agents)."
+    )
     attachments: list[str] = Field(
         default_factory=list, description="Artifact ids attached to this message, in order."
     )
@@ -175,6 +178,15 @@ class MessageCreate(_Input):
     )
     backend: str | None = Field(
         default=None, description="Chat backend to use instead of the configured default."
+    )
+    agent: str | None = Field(
+        default=None,
+        max_length=64,
+        description=(
+            "The agent to answer (GET /v1/agents): its engine, persona, tools and sampling. "
+            "Default: the conversation's (metadata.agent), else the one the default chat "
+            "engine runs. Stored as the conversation's metadata.agent."
+        ),
     )
     image_options: ImageRequestOptions | None = Field(
         default=None,
@@ -525,6 +537,9 @@ class EngineInfo(BaseModel):
     model_card: str | None = Field(
         default=None, description="sd-server engines: the model card it runs (GET /v1/models)."
     )
+    agent: str | None = Field(
+        default=None, description="llama-server engines: the agent it runs (GET /v1/agents)."
+    )
     family: str | None = Field(default=None, description="Its model's family (a recipe id).")
     family_name: str | None = None
     capabilities: list[Capability]
@@ -580,6 +595,11 @@ class EngineUpdate(_Input):
         default=None,
         max_length=64,
         description="sd-server engines: the model card to run; empty: none (its own files).",
+    )
+    agent: str | None = Field(
+        default=None,
+        max_length=64,
+        description="llama-server engines: the agent whose model to run; empty: its own files.",
     )
     model_id: str | None = Field(
         default=None,
@@ -746,6 +766,9 @@ class HubDownloadRequest(_Input):
     engine: str | None = Field(default=None, description="Set this engine's setting when done.")
     model: str | None = Field(
         default=None, max_length=64, description="Or put it in this model card's slot (key)."
+    )
+    agent: str | None = Field(
+        default=None, max_length=64, description="Or this agent's file (key: model or mmproj)."
     )
     key: str | None = Field(
         default=None, description="The launch setting, 'model_id', or a model card's slot."
@@ -1443,3 +1466,217 @@ class ModelUse(_Input):
 class ModelCoverSet(_Input):
     artifact_id: str | None = Field(default=None, max_length=36)
     hub: bool = Field(default=False, description="The first image on its main file's Hub card.")
+
+
+# --- agents (docs/agent-library.md) ------------------------------------------------------------
+
+AgentPortraitSource = Literal["hub", "self", "upload"]
+AgentViewer = Literal["status", "reasoning"]
+AgentFileKey = Literal["model", "mmproj", "chat_template"]
+
+
+class AgentPortraitImage(BaseModel):
+    """A portrait the agent has, in use or not."""
+
+    key: str = Field(description="'hub', 'upload' or 'self-<version>'.")
+    source: AgentPortraitSource
+    url: str
+    version: int | None = Field(default=None, description="A self-portrait's number (v1, v2…).")
+    prompt: str | None = Field(default=None, description="A self-portrait's prompt, its own.")
+    owner: str | None = Field(default=None, description="From the Hub: whose avatar it is.")
+    conversation_id: str | None = Field(default=None, description="Where it was painted.")
+    artifact_id: str | None = None
+    label: str | None = Field(default=None, description="Its label in that conversation.")
+    created_at: datetime | None = None
+
+
+class AgentPainting(BaseModel):
+    """A self-portrait being painted now."""
+
+    conversation_id: str
+    job_id: str | None = None
+    status: Literal["writing", "queued", "running"] = "writing"
+    step: int | None = None
+    total_steps: int | None = None
+
+
+class AgentPortrait(BaseModel):
+    key: str | None = Field(
+        default=None, description="The portrait in use (see images); null: its monogram."
+    )
+    source: AgentPortraitSource | None = None
+    url: str | None = None
+    monogram: str = Field(description="Shown while it has no portrait: its name's first letter.")
+    origin: str = Field(default="", description="Where it came from, e.g. 'HUB · QWEN'.")
+    hub_owner: str | None = Field(
+        default=None, description="The Hub user or organization whose avatar it can use."
+    )
+    hub_fetched_at: datetime | None = None
+    images: list[AgentPortraitImage] = Field(default_factory=list)
+    prompt: str | None = Field(default=None, description="Its latest self-portrait's prompt.")
+    painting: AgentPainting | None = None
+
+
+class AgentEngineUse(BaseModel):
+    """The chat engine an agent runs on."""
+
+    engine: str
+    kind: Literal["local", "remote", "linked"] = Field(
+        description="local: started here; remote: started elsewhere; linked: shared by a "
+        "linked instance."
+    )
+    link: str | None = Field(default=None, description="A linked engine's instance.")
+    launchable: bool
+    runs_it: bool = Field(
+        description="It is set to run this agent's model (always, for an agent with no files "
+        "of its own)."
+    )
+    running: bool = Field(description="Up and serving this agent's model now.")
+    status: str = Field(description="The engine's status: ok, degraded, down, unknown.")
+    default: bool = Field(description="The default chat engine: new prompts go to it.")
+    needs_restart: bool = False
+    runs_other: str | None = Field(
+        default=None, description="The agent it runs instead, if another one."
+    )
+
+
+class AgentFile(BaseModel):
+    key: AgentFileKey
+    flag: str
+    what: str
+    path: str | None = None
+    exists: bool = False
+    size_bytes: int | None = None
+    problem: str | None = None
+    required: bool = False
+    source: dict[str, Any] | None = Field(default=None, description="Where the Hub got it.")
+
+
+class AgentTool(BaseModel):
+    name: str
+    description: str
+    flags: str = Field(description="What it makes: 't2i', 'edit · mask', 't2i · 1:1'.")
+    enabled: bool = Field(description="The agent may call it.")
+    available: bool = Field(description="An engine here can serve it now.")
+
+
+class AgentItem(BaseModel):
+    id: str
+    name: str
+    engine: str | None = Field(description="The chat engine it runs on, as resolved.")
+    engine_set: str | None = Field(
+        default=None, description="As set on the agent; null: the default chat engine."
+    )
+    model: str | None = Field(
+        default=None, description="Its model file, or the model its engine reports."
+    )
+    quant: str | None = None
+    size_bytes: int = Field(default=0, description="Of its files on disk.")
+    family: str | None = Field(default=None, description="Its model's name without the size.")
+    vision: bool = False
+    tools: bool = Field(default=False, description="It can call tools (and has some on).")
+    own_files: bool = Field(description="It has model files of its own.")
+    ready: bool = Field(description="Everything it needs is here and usable.")
+    missing: list[AgentFileKey] = Field(default_factory=list)
+    problems: list[str] = Field(default_factory=list)
+    use: AgentEngineUse | None = None
+    default: bool = Field(default=False, description="New prompts go to it.")
+    working: bool = Field(default=False, description="Answering, or painting a portrait, now.")
+    portrait: AgentPortrait
+    viewer: AgentViewer = "reasoning"
+    pinned: bool = False
+    tags: list[str] = Field(default_factory=list)
+    notes: str = ""
+    source: dict[str, Any] | None = None
+    turns: int = 0
+    images: int = 0
+    last_used_at: datetime | None = None
+    created_at: datetime
+    updated_at: datetime
+
+
+class AgentDetail(AgentItem):
+    files: list[AgentFile]
+    system_prompt: str = Field(description="What it is told, as used.")
+    system_prompt_custom: bool = Field(description="Its own, rather than the built-in one.")
+    default_system_prompt: str
+    tool_list: list[AgentTool]
+    sampling: dict[str, Any] = Field(
+        default_factory=dict, description="Its own, over its engine's."
+    )
+    engine_sampling: dict[str, Any] = Field(default_factory=dict)
+    context: int | None = None
+
+
+class AgentLibraryEngine(BaseModel):
+    name: str
+    kind: Literal["local", "remote", "linked"]
+    link: str | None = None
+    launchable: bool
+    running: bool
+    agent: str | None = Field(default=None, description="The agent it is set to run.")
+    default: bool
+    model: str | None = None
+
+
+class AgentLibraryView(BaseModel):
+    items: list[AgentItem]
+    engines: list[AgentLibraryEngine] = Field(description="The chat engines.")
+    default: str | None = Field(default=None, description="The agent new prompts go to.")
+    tags: list[str] = Field(default_factory=list)
+
+
+class AgentCreate(_Input):
+    """A new agent: from a GGUF on this machine (path), from a Hub reference (ref: its model
+    and vision projector are downloaded into it next), or for whatever an engine runs."""
+
+    name: str | None = Field(default=None, max_length=120)
+    engine: str | None = Field(default=None, max_length=64)
+    path: str | None = Field(default=None, max_length=1024)
+    mmproj: str | None = Field(default=None, max_length=1024)
+    ref: str | None = Field(default=None, max_length=1024)
+    system_prompt: str | None = Field(default=None, max_length=20_000)
+
+
+class AgentUpdate(_Input):
+    """Only fields present are changed."""
+
+    name: str | None = Field(default=None, max_length=120)
+    engine: str | None = Field(default=None, max_length=64, description="Empty: the default.")
+    files: dict[AgentFileKey, str | None] | None = Field(
+        default=None, description="key -> path; null or empty clears it."
+    )
+    system_prompt: str | None = Field(
+        default=None, max_length=20_000, description="Empty: back to the built-in one."
+    )
+    viewer: AgentViewer | None = None
+    tools: dict[str, bool] | None = Field(default=None, description="Turn tools on or off.")
+    sampling: dict[str, Any] | None = Field(
+        default=None, description="Merged over its own; a null value removes that setting."
+    )
+    context: int | None = Field(default=None, ge=0, le=1_048_576, description="0: the engine's.")
+    notes: str | None = Field(default=None, max_length=4000)
+    tags: list[str] | None = Field(default=None, max_length=24)
+    pinned: bool | None = None
+
+
+class AgentUse(_Input):
+    start: bool = Field(
+        default=True,
+        description="Start its engine with it if the engine isn't running (one that is "
+        "restarts with its model).",
+    )
+
+
+class AgentPortraitSet(_Input):
+    """Which portrait to show: one it has (key), an image from a conversation (artifact_id,
+    kept as its upload), its Hub uploader's avatar fetched again (refresh), or none."""
+
+    key: str | None = Field(default=None, max_length=32, pattern=r"^(hub|upload|self-\d+|none)$")
+    artifact_id: str | None = Field(default=None, max_length=36)
+    refresh: bool = False
+
+
+class AgentPainted(BaseModel):
+    agent: AgentDetail
+    conversation_id: str = Field(description="Where it is painting; the image stays there.")

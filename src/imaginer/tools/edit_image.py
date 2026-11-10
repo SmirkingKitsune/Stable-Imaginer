@@ -83,6 +83,8 @@ class EditImageTool(Tool):
         "and earlier results can all be edited."
     )
     args_model = EditImageArgs
+    summary = "Changes an image in the conversation."
+    flags = "edit · mask"
 
     def __init__(
         self, registry: BackendRegistry, jobs: JobManager, artifacts: ArtifactService

@@ -1674,3 +1674,197 @@ button.mi-step:hover { background: var(--hover); }
   .mi-name .seed-field { flex: 1; width: auto; }
   .mi-status { text-align: left; }
 }
+
+/* — agents (design "Agent Mockups" 1a–1h): portraits, the agent card, the agent on the stage — */
+:root { --portrait-bg: var(--color-accent-200); }
+@media (prefers-color-scheme: dark) {
+  :root { --portrait-bg: color-mix(in srgb, var(--color-accent) 22%, var(--color-bg)); }
+}
+.portrait {
+  position: relative; flex: none; display: grid; place-items: center; overflow: hidden;
+  border: 1px solid var(--color-divider); background: var(--portrait-bg); color: var(--color-accent-700);
+  font-family: var(--font-heading); font-weight: 600; line-height: 1;
+}
+.portrait.blueprint { overflow: visible; }
+.portrait-pic { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: cover; }
+.portrait-mono { line-height: 1; user-select: none; }
+.portrait.fill { position: absolute; inset: 0; width: 100%; height: 100%; border: 0; font-size: clamp(56px, 9vw, 112px); }
+.portrait-origin { top: auto; bottom: 8px; right: 8px; z-index: 1; }
+.you-mark {
+  flex: none; width: 22px; height: 22px; display: grid; place-items: center;
+  border: 1px solid var(--color-divider); font: 600 9px/1 var(--mono); letter-spacing: .02em; color: var(--muted);
+}
+.msg-head.agent-head { align-items: center; gap: 8px; min-height: 26px; }
+.agent-head-link { display: flex; color: inherit; }
+.agent-head-link:hover .portrait { border-color: var(--color-accent); }
+.lin-thumb.portrait { font-size: 12px; }
+
+/* The library: tiles with the portrait as their cover, or a table. */
+.agent-tile .tile-img.agent-cover { position: relative; aspect-ratio: 1 / 1; max-height: none; background: var(--portrait-bg); }
+.agent-tile .tile-img.agent-cover.live { background: var(--stripe-live); }
+.agent-tile .tile-img.agent-cover .tile-desc { position: relative; }
+.agent-tile .tile-run { bottom: auto; aspect-ratio: 1 / 1; }
+.agent-default {
+  margin-left: 8px; padding: 2px 5px; vertical-align: 2px;
+  font: 600 10px/1 var(--mono); letter-spacing: .04em; text-transform: uppercase;
+  color: var(--color-accent-800); background: var(--color-accent-100);
+}
+.agent-table { display: flex; flex-direction: column; }
+.agent-row {
+  display: grid; grid-template-columns: 32px minmax(0, 2fr) minmax(0, 1fr) 140px 80px 90px; gap: 14px; align-items: center;
+  padding: 10px; border-bottom: 1px solid var(--color-divider); color: inherit; text-decoration: none;
+}
+.agent-row:not(.head):hover { background: var(--hover); }
+.agent-row.head { padding-top: 0; border-bottom-color: var(--color-text); }
+.agent-row-name { display: flex; flex-direction: column; gap: 3px; min-width: 0; }
+.agent-row-name b { font: 600 17px/1.1 var(--font-heading); }
+.agent-row-name .mono-meta { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.agent-row .right { text-align: right; }
+
+/* One agent: the hero's portrait, three ways to get one, the persona. */
+.mc-hero.agent-hero { gap: 28px; }
+.agent-hero-portrait { align-self: center; }
+.agent-tag { font: 600 13px/1 var(--font-heading); padding: 4px 7px; white-space: nowrap; }
+.mc-opts.agent-opts { grid-template-columns: repeat(3, minmax(0, 1fr)); margin-left: 0; }
+.agent-opts .mc-opt { gap: 10px; }
+.agent-opt-head { display: flex; align-items: center; justify-content: space-between; gap: 8px; min-height: 18px; }
+.agent-opt-who { display: flex; gap: 12px; align-items: center; }
+.agent-opt-text { display: flex; flex-direction: column; gap: 4px; min-width: 0; }
+.agent-opt-text b { font: 600 17px/1.1 var(--font-heading); overflow-wrap: anywhere; }
+.agent-selves { display: grid; grid-template-columns: repeat(4, 1fr); gap: 6px; }
+.agent-self {
+  position: relative; aspect-ratio: 1; display: grid; place-items: center; padding: 0; overflow: hidden;
+  border: 0; outline: 1px solid var(--color-divider); background: var(--stripe-fine); cursor: pointer;
+  font: 600 10px/1 var(--mono); color: var(--color-accent-700); text-decoration: none;
+}
+.agent-self .portrait { position: absolute; inset: 0; width: 100%; height: 100%; border: 0; }
+.agent-self.on { outline: 1px solid var(--color-accent); outline-offset: 2px; cursor: default; }
+.agent-self:not(.on):not(.empty):hover { outline-color: var(--color-accent); }
+.agent-self.live { background: var(--stripe-live); outline: 1px dashed var(--color-accent); }
+.agent-self.live span { padding: 2px 4px; background: var(--color-bg); }
+.agent-self.empty { cursor: default; opacity: .6; }
+.agent-opts code, .mc-muted code { font: 12px var(--mono); }
+.agent-paint { display: inline-flex; align-items: center; gap: 6px; white-space: nowrap; }
+.mi-drop.agent-drop { height: 86px; gap: 6px; padding: 0 10px; }
+.agent-drop .portrait { border-color: var(--color-accent); }
+.mc-srow.top { align-items: start; }
+.mc-srow.top .mc-slabel { padding-top: 8px; }
+.agent-prompt {
+  width: 100%; min-height: 84px; padding: 8px 10px; resize: vertical;
+  border: 1px solid var(--color-divider); background: var(--color-surface);
+  font: 14px/1.5 var(--font-body);
+}
+.agent-prompt:focus { outline: none; border-color: var(--color-accent); }
+.seed-field.agent-name { width: min(260px, 100%); }
+.seed-field.agent-num { width: 120px; }
+.agent-viewer-seg { width: min(300px, 100%); }
+.mc-file.agent-tool { grid-template-columns: 28px minmax(0, 190px) minmax(0, 1fr) 84px; }
+.mc-file.agent-tool.empty .mc-slot b { color: var(--muted); }
+.agent-new { margin-left: 6px; padding: 2px 5px; vertical-align: 2px; font: 600 11px/1 var(--font-heading); }
+.agent-engine { width: min(340px, 100%); }
+.agent-open, .agent-clear { display: inline-block; margin-top: 8px; text-decoration: none; }
+.agent-clear { color: var(--muted); font-weight: 500; }
+.agent-delete { align-self: flex-start; }
+.agent-add { width: min(560px, calc(100vw - 32px)); display: flex; flex-direction: column; gap: 12px; }
+.agent-add .field { display: flex; flex-direction: column; gap: 6px; }
+.agent-add .mc-muted { font-size: 13px; }
+
+/* The agent on the viewer's stage: centred while there is no image, in the corner after. */
+.agent-layer { position: absolute; inset: 0; z-index: 3; pointer-events: none; }
+.agent-layer > * { pointer-events: auto; }
+.agent-centre {
+  position: absolute; inset: 0; display: flex; flex-direction: column; align-items: center; justify-content: center;
+  padding: 24px; pointer-events: none;
+}
+.agent-layer > .agent-centre { pointer-events: none; }
+.agent-centre > * { pointer-events: auto; }
+.agent-centre .bubble.speech { margin-bottom: 26px; }
+/* A thought rises from the head, up and to the right. */
+.agent-centre .bubble.thought { margin-left: 120px; }
+.agent-centre-name { display: flex; flex-direction: column; align-items: center; gap: 6px; margin-top: 16px; text-align: center; }
+.agent-name-big { font: 600 22px/1 var(--font-heading); }
+.bubble {
+  position: relative; display: flex; flex-direction: column; gap: 8px; width: min(460px, 100%);
+  padding: 14px 16px 16px; background: var(--color-bg); box-shadow: var(--shadow-md);
+}
+.bubble.small { width: min(340px, calc(100vw - 140px)); padding: 12px 14px; gap: 6px; }
+.bubble-head { display: flex; align-items: center; gap: 8px; }
+.bubble-title { font: 600 20px/1.15 var(--font-heading); }
+.bubble.small .bubble-title { font-size: 17px; }
+.bubble-reasoning {
+  margin: 0; max-height: 7.5em; overflow: hidden; font: 13px/1.5 var(--font-body); color: var(--muted);
+  -webkit-mask-image: linear-gradient(to bottom, transparent, #000 40%); mask-image: linear-gradient(to bottom, transparent, #000 40%);
+}
+.bubble.small .bubble-reasoning { font-size: 12.5px; max-height: 6em; }
+.bubble-reasoning .typing { margin-left: 4px; vertical-align: -3px; height: auto; }
+.thought-dots { display: flex; flex-direction: column; align-items: center; gap: 6px; margin: 8px 0 10px 60px; }
+.thought-dots i {
+  width: 11px; height: 11px; border: 1.5px solid var(--color-accent); background: var(--color-bg); transform: rotate(45deg);
+}
+.thought-dots i + i { width: 7px; height: 7px; margin-left: -18px; }
+.thought-dots.side { flex-direction: row; gap: 5px; margin: 0 -2px 0 0; align-self: flex-end; }
+.thought-dots.side i { width: 6px; height: 6px; margin: 0; }
+.thought-dots.side i + i { width: 9px; height: 9px; margin: 0; }
+.bubble.speech { width: min(480px, 100%); gap: 12px; padding: 16px 18px; border: 1px solid var(--color-accent); }
+.bubble.speech.small { width: min(360px, calc(100vw - 140px)); gap: 10px; padding: 12px 14px; margin-bottom: 10px; }
+.bubble.speech .msg-head { align-items: center; }
+.bubble-text { margin: 0; font-size: 17px; overflow-wrap: anywhere; white-space: pre-wrap; max-height: 40vh; overflow-y: auto; }
+.bubble.small .bubble-text { font-size: 15px; max-height: none; }
+.bubble-foot { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.bubble-foot .tool-row { flex: 1; min-width: 0; }
+.bubble.small .bubble-call { padding: 6px 8px; }
+.bubble-x {
+  width: 22px; height: 22px; display: grid; place-items: center; padding: 0; border: 0; background: transparent;
+  color: var(--muted); cursor: pointer;
+}
+.bubble-x:hover { background: var(--hover); color: var(--color-text); }
+.bubble-tail {
+  position: absolute; left: 50%; bottom: -8px; width: 14px; height: 14px; margin-left: -7px; background: var(--color-bg);
+  border-right: 1px solid var(--color-accent); border-bottom: 1px solid var(--color-accent); transform: rotate(45deg);
+}
+.bubble.small .bubble-tail {
+  left: auto; right: -8px; bottom: 18px; margin: 0;
+  border-bottom: 0; border-top: 1px solid var(--color-accent);
+}
+.agent-corner { position: absolute; right: 14px; bottom: 14px; display: flex; align-items: flex-end; gap: 12px; max-width: calc(100% - 28px); }
+.agent-corner-bubble { display: flex; flex-direction: column; align-items: flex-end; gap: 4px; min-width: 0; }
+.agent-corner-portrait { display: flex; color: inherit; }
+.viewer.no-images .stage { background: color-mix(in srgb, var(--color-text) 2%, var(--color-bg)); }
+
+/* The steps loading on the stage while the image engine paints (design 1h). */
+.stage-loading { position: absolute; inset: 0; display: flex; align-items: center; justify-content: center; padding: 18px; }
+.stage-steps { position: relative; flex: none; background: var(--stripe-live); }
+.stage.loading .zoom-pic, .stage.loading .minimap { visibility: hidden; }
+.label-chip.live { background: var(--color-accent); color: var(--color-bg); border-color: var(--color-accent); }
+.stage-chips .mini.handed { pointer-events: auto; gap: 7px; padding-left: 3px; }
+.stage-chips .mini.handed .portrait { font-size: 13px; border: 0; }
+.step-plate {
+  position: absolute; left: 12px; bottom: 12px; width: min(380px, calc(100% - 24px)); display: flex; flex-direction: column; gap: 10px;
+  padding: 12px 14px; background: var(--color-bg); box-shadow: var(--shadow-md);
+}
+.step-plate-row { display: flex; align-items: center; gap: 10px; }
+.step-plate-row .btn-line { height: 30px; font-size: 13px; }
+.reel-empty { aspect-ratio: 1; border: 1px dashed var(--color-divider); }
+.reel-item.pending { cursor: default; }
+.reel-pic.live { background: var(--stripe-live); opacity: 1; }
+.reel-pic.live.queued { opacity: .5; outline-style: dashed; }
+.reel-item.pending .tile-progress { bottom: 0; }
+.topbar .btn-line:disabled { opacity: .45; cursor: default; }
+
+@media (max-width: 999px) {
+  .mc-opts.agent-opts { grid-template-columns: minmax(0, 1fr); }
+  .agent-row { grid-template-columns: 32px minmax(0, 1fr) 120px 70px; }
+  .agent-row > :nth-child(3), .agent-row > :nth-child(6) { display: none; }
+}
+@media (max-width: 719px) {
+  .mc-hero.agent-hero { flex-wrap: wrap; }
+  .agent-hero-portrait { width: 112px !important; height: 112px !important; font-size: 64px !important; }
+  .mc-file.agent-tool { grid-template-columns: 28px minmax(0, 1fr) 72px; }
+  .mc-file.agent-tool > .mc-muted { grid-column: 2 / -1; grid-row: 2; }
+  .agent-centre .portrait.blueprint { width: 96px !important; height: 96px !important; font-size: 54px !important; }
+  .agent-corner .portrait { width: 44px !important; height: 44px !important; font-size: 26px !important; }
+  .bubble.small, .bubble.speech.small { width: min(300px, calc(100vw - 110px)); }
+  .agent-centre .bubble.thought { margin-left: 0; }
+  .thought-dots { margin-left: 30px; }
+  .step-plate { width: calc(100% - 24px); }
+}

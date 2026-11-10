@@ -33,6 +33,7 @@ from imaginer.core.config import (
     ConfigError,
     DiffusersBackendConfig,
     LinkedBackendConfig,
+    LlamaCppBackendConfig,
     SdCppBackendConfig,
     Settings,
     local_overrides_path,
@@ -58,8 +59,11 @@ log = get_logger(__name__)
 
 _CONFIG = TypeAdapter[BackendConfig](BackendConfig)
 # A backend's config as it runs: for an sd-server with a model card, the card's files and
-# settings over its own (ModelLibrary.effective).
+# settings over its own (ModelLibrary.effective); for a llama-server with an agent, the
+# agent's (AgentLibrary.effective).
 ConfigView = Callable[[str, BackendConfig], BackendConfig]
+# The engines whose config as it runs can differ from their own.
+_VIEWED = (SdCppBackendConfig, LlamaCppBackendConfig)
 # Where an engine's presets and default LoRAs go while it runs a model card: the card.
 CardSettings = Callable[
     [str, dict[str, dict[str, Any]] | None, list[dict[str, Any]] | None], Awaitable[None]
@@ -83,7 +87,7 @@ class EngineService:
         self._registry = registry
         source = raw if raw is not None else settings.backends
         self._raw: dict[str, BackendConfig] = {
-            n: c for n, c in source.items() if isinstance(c, SdCppBackendConfig)
+            n: c for n, c in source.items() if isinstance(c, _VIEWED)
         }
         self._view: ConfigView = view or (lambda _name, config: config)
         self.on_card_settings: CardSettings | None = None
@@ -169,6 +173,7 @@ class EngineService:
             detail=info.detail,
             model=info.model,
             model_card=getattr(config, "model_card", None),
+            agent=getattr(config, "agent", None),
             family=family.id if family is not None else getattr(running, "family", None),
             family_name=family.name if family is not None else None,
             capabilities=info.capabilities,
@@ -390,6 +395,10 @@ class EngineService:
                     f"{name} is not an sd-server engine; it runs no model card"
                 )
             patch["model_card"] = body.model_card.strip() or None
+        if body.agent is not None:
+            if not isinstance(config, LlamaCppBackendConfig):
+                raise InvalidRequestError(f"{name} is not a llama-server engine; it runs no agent")
+            patch["agent"] = body.agent.strip() or None
         if body.model_id is not None:
             if not isinstance(config, DiffusersBackendConfig):
                 raise InvalidRequestError(f"{name} is not a Diffusers backend; it has no model_id")
@@ -434,7 +443,7 @@ class EngineService:
         path = self._overrides_path()
         if path is not None:
             await asyncio.to_thread(_save_overrides, path, name, patch)
-        if isinstance(updated, SdCppBackendConfig):
+        if isinstance(updated, _VIEWED):
             self._raw[name] = updated
         # Turns and jobs already using the old adapter keep it until they end.
         if self._registry.reconfigure(name, self._view(name, updated)):

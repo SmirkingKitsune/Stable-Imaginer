@@ -19,7 +19,7 @@ from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
-from urllib.parse import quote
+from urllib.parse import quote, urljoin, urlsplit
 
 import httpx
 
@@ -209,6 +209,46 @@ class HubClient:
             yield resp
         finally:
             await resp.aclose()
+
+    async def avatar_url(self, owner: str) -> str | None:
+        """Where the avatar of a Hub organization or user is, if it has one."""
+        name = quote(owner, safe="")
+        for kind in ("organizations", "users"):
+            for leaf in ("avatar", "overview"):
+                url = f"{self.endpoint}/api/{kind}/{name}/{leaf}"
+                try:
+                    resp = await self._http.get(url, headers=self._headers())
+                except httpx.HTTPError as exc:
+                    raise HubError(f"couldn't reach {self.endpoint}: {_reason(exc)}") from exc
+                if not resp.is_success:
+                    continue
+                try:
+                    data = resp.json()
+                except ValueError:
+                    continue
+                value = data.get("avatarUrl") if isinstance(data, dict) else None
+                if isinstance(value, str) and value:
+                    return urljoin(f"{self.endpoint}/", value)
+        return None
+
+    async def fetch_url(self, url: str, max_bytes: int) -> bytes:
+        """A small file the Hub links to (an avatar on its CDN), up to ``max_bytes``. Only
+        https, or the Hub's own endpoint; the token goes to the endpoint alone."""
+        same = url.startswith(f"{self.endpoint}/")
+        if not same and urlsplit(url).scheme != "https":
+            raise HubError(f"won't fetch {url}: not https")
+        headers = self._headers() if same else {}
+        body = bytearray()
+        try:
+            async with self._http.stream("GET", url, headers=headers) as resp:
+                await _raise_for(resp, url)
+                async for chunk in resp.aiter_bytes():
+                    body += chunk
+                    if len(body) > max_bytes:
+                        raise HubError(f"{url} is over {max_bytes} bytes")
+        except httpx.HTTPError as exc:
+            raise HubError(f"couldn't fetch {url}: {_reason(exc)}") from exc
+        return bytes(body)
 
     async def _json(self, url: str, *, params: Any, what: str) -> Any:
         try:

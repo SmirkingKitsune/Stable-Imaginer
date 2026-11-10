@@ -130,6 +130,41 @@ export function loadModels() {
 
 export const modelLibrary = () => models;
 
+// --- agents ------------------------------------------------------------------------
+// A chat model plus a persona: name, system prompt, portrait. Assistant messages name the
+// agent that wrote them (message.agent); a conversation remembers its agent
+// (info.metadata.agent). Linked instances' agents aren't known here.
+
+let agents = null; // GET /v1/agents
+let agentsLoad = null;
+
+/** Load (or reload) the agents. Resolves with them; a failure keeps the last list. */
+export function loadAgents() {
+  agentsLoad ??= api.agents().then((lib) => {
+    agents = lib;
+    emit('agents');
+    return lib;
+  }, () => agents).finally(() => { agentsLoad = null; });
+  return agentsLoad;
+}
+
+export const agentLibrary = () => agents;
+export const agentById = (id) => (id && agents?.items.find((a) => a.id === id)) || null;
+/** The agent new prompts go to. */
+export const defaultAgent = () => agentById(agents?.default);
+
+/** The agent a conversation talks to: its own, else the default one (this server's only). */
+export function agentOf(c) {
+  if (!c || baseOf(c.id)) return null;
+  return agentById(c.info?.metadata?.agent) ?? defaultAgent();
+}
+
+/** The agent that wrote an assistant message, if it is known here. */
+export function agentOfMessage(c, m) {
+  if (!c || baseOf(c.id)) return null;
+  return agentById(m?.agent) ?? null;
+}
+
 // Where the user was working (a conversation, or the gallery) before opening a settings
 // screen: those screens' Back goes there, and so does "Use in next prompt" in the library,
 // however many cards were opened in between.
@@ -733,6 +768,8 @@ function apply(c, type, data) {
       c.turn.running = false;
       emit('turns');
       loadBranches(c);
+      // Its agent may have a new portrait, and has one more turn.
+      if (!baseOf(c.id)) loadAgents();
       api.conversation(c.id).then((info) => {
         c.info = info;
         patchGalleryItem(c.id, (item) => Object.assign(item, info, { turn_running: false }));

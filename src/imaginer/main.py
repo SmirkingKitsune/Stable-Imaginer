@@ -12,6 +12,7 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from imaginer import __version__
 from imaginer.api import (
+    agents,
     artifacts,
     backends,
     conversations,
@@ -84,6 +85,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     own.include_router(hub.router)
     own.include_router(loras.router)
     own.include_router(image_models.router)
+    own.include_router(agents.router)
     own.include_router(links.router)
     own.include_router(links.gallery_router)
     app.include_router(own)

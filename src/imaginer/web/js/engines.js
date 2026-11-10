@@ -899,6 +899,8 @@ export async function enginePopover(anchor) {
   rows.length ? rows : h('div.pop-engine', h('span.tray-hint', 'No default engines are configured.')),
   h('button.menu-item.pop-settings', { type: 'button', onclick: () => go('#/engines') },
     icon('sliders', 15), 'Engine settings', h('span.spacer'), icon('arrowRight', 15)),
+  h('button.menu-item.pop-settings', { type: 'button', onclick: () => go('#/agents') },
+    icon('bot', 15), 'Agents', h('span.spacer'), icon('arrowRight', 15)),
   h('button.menu-item.pop-settings', { type: 'button', onclick: () => go('#/models') },
     icon('layers', 15), 'Model library', h('span.spacer'), icon('arrowRight', 15)),
   h('button.menu-item.pop-settings', { type: 'button', onclick: () => go('#/loras') },

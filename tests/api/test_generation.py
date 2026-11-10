@@ -93,7 +93,12 @@ async def test_generate_image_round_trip(
 
     # What the model saw: tools offered with guidance, then its own call and the result.
     first, second = fake_llama.requests[-2:]
-    assert [t["function"]["name"] for t in first["tools"]] == ["generate_image", "edit_image"]
+    # The default agent (the one the chat engine runs) also has set_portrait.
+    assert [t["function"]["name"] for t in first["tools"]] == [
+        "generate_image",
+        "edit_image",
+        "set_portrait",
+    ]
     assert "generate_image" in first["messages"][0]["content"]
     assert [m["role"] for m in second["messages"]] == ["system", "user", "assistant", "tool"]
     assert second["messages"][2]["tool_calls"][0]["function"]["name"] == "generate_image"

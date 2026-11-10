@@ -83,11 +83,17 @@ class Message(Base):
     tool_call_id: Mapped[str | None] = mapped_column(sa.String(128))
     backend: Mapped[str | None] = mapped_column(sa.String(64))
     model: Mapped[str | None] = mapped_column(sa.String(256))
+    # The agent that wrote an assistant message (its persona and portrait). Not a foreign
+    # key: a deleted agent leaves its messages as they are.
+    agent_id: Mapped[str | None] = mapped_column(sa.String(64))
     metadata_json: Mapped[dict[str, Any] | None] = mapped_column(JSONType)
     created_at: Mapped[datetime] = mapped_column(UTCDateTime)
 
     # The unique constraint's index also serves (conversation_id, seq) range scans.
-    __table_args__ = (sa.UniqueConstraint("conversation_id", "seq"),)
+    __table_args__ = (
+        sa.UniqueConstraint("conversation_id", "seq"),
+        sa.Index("ix_message_agent", "agent_id"),
+    )
 
 
 class Artifact(Base):
@@ -300,5 +306,41 @@ class ImageModelRecord(Base):
     tags: Mapped[list[str] | None] = mapped_column(JSONType)
     pinned: Mapped[bool] = mapped_column(sa.Boolean, default=False, server_default=sa.false())
     cover: Mapped[dict[str, Any] | None] = mapped_column(JSONType)
+    created_at: Mapped[datetime] = mapped_column(UTCDateTime)
+    updated_at: Mapped[datetime] = mapped_column(UTCDateTime)
+
+
+# --- agents ---------------------------------------------------------------------------
+
+
+class AgentRecord(Base):
+    """An agent: a chat model as llama-server loads it, plus a persona. The model is its
+    GGUF, vision projector and chat template, on the chat engine it runs on; the persona is
+    a display name, a system prompt, a portrait, the tools it may call and its sampling."""
+
+    __tablename__ = "agent"
+
+    id: Mapped[str] = mapped_column(sa.String(64), primary_key=True)
+    name: Mapped[str] = mapped_column(sa.Text)
+    # The chat engine it runs on; None: whichever is the default chat engine.
+    engine: Mapped[str | None] = mapped_column(sa.String(64))
+    # {"model": path, "mmproj": path, "chat_template": path}; empty for an agent that uses
+    # whatever its engine runs (one started elsewhere, or shared by a linked instance).
+    files: Mapped[dict[str, Any] | None] = mapped_column(JSONType)
+    # {"repo", "revision", "path", "vision"}: the Hub repo its model came from.
+    source: Mapped[dict[str, Any] | None] = mapped_column(JSONType)
+    system_prompt: Mapped[str | None] = mapped_column(sa.Text)  # None: the built-in one
+    viewer: Mapped[str] = mapped_column(
+        sa.String(16), default="reasoning", server_default="reasoning"
+    )
+    tools: Mapped[dict[str, Any] | None] = mapped_column(JSONType)  # {tool name: false}
+    sampling: Mapped[dict[str, Any] | None] = mapped_column(JSONType)
+    context: Mapped[int | None] = mapped_column(sa.Integer)  # llama-server -c
+    # {"source": "hub" | "self" | "upload" | None, "v", "hub": {...}, "self": [...],
+    # "upload": {...}}: see agents/library.py.
+    portrait: Mapped[dict[str, Any] | None] = mapped_column(JSONType)
+    notes: Mapped[str | None] = mapped_column(sa.Text)
+    tags: Mapped[list[str] | None] = mapped_column(JSONType)
+    pinned: Mapped[bool] = mapped_column(sa.Boolean, default=False, server_default=sa.false())
     created_at: Mapped[datetime] = mapped_column(UTCDateTime)
     updated_at: Mapped[datetime] = mapped_column(UTCDateTime)

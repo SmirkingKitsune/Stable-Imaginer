@@ -78,7 +78,10 @@ class ContextBuilder:
         leaf_id: str | None = None,
         vision: bool,
         tool_guidance: Sequence[str] = (),
+        system_prompt: str | None = None,
     ) -> list[dict[str, Any]]:
+        """The branch as chat messages. ``system_prompt``: the agent's, instead of the
+        configured (or built-in) one."""
         async with self._db.session() as session, session.begin():
             if leaf_id is None:
                 leaf = await msg_repo.latest(session, conversation_id)
@@ -108,7 +111,7 @@ class ContextBuilder:
         briefs = await self._briefs(picks.values())
         guidance = [*tool_guidance, mentions.LLM_GUIDANCE] if picks else tool_guidance
         messages: list[dict[str, Any]] = [
-            {"role": "system", "content": self._system_prompt(manifest, guidance)}
+            {"role": "system", "content": self._system_prompt(manifest, guidance, system_prompt)}
         ]
         for message in history:
             if message.role is Role.TOOL and message.tool_call_id not in answered:
@@ -140,8 +143,17 @@ class ContextBuilder:
             log.exception("context.lora_lookup_failed")
             return {}
 
-    def _system_prompt(self, manifest: list[orm.Artifact], tool_guidance: Sequence[str]) -> str:
-        prompt = self._config.system_prompt or DEFAULT_SYSTEM_PROMPT
+    def default_system_prompt(self) -> str:
+        """What a turn without its own system prompt is told (before tools and artifacts)."""
+        return self._config.system_prompt or DEFAULT_SYSTEM_PROMPT
+
+    def _system_prompt(
+        self,
+        manifest: list[orm.Artifact],
+        tool_guidance: Sequence[str],
+        own: str | None = None,
+    ) -> str:
+        prompt = own or self.default_system_prompt()
         if tool_guidance:
             prompt += "\n\n" + "\n".join(tool_guidance)
         if not manifest:

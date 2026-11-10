@@ -27,6 +27,7 @@ class ToolContext:
     tool_call_id: str
     emit: Emit
     image_options: ImageRequestOptions | None = None  # the user's picks for this turn
+    agent_id: str | None = None  # the agent answering (agents/library.py)
     # Sampler settings (steps, cfg_scale) the quality check chose for a new attempt.
     # It never picks one the user set, so the two don't overlap.
     sampler: dict[str, Any] = field(default_factory=dict)
@@ -51,6 +52,9 @@ class Tool(ABC):
     description: ClassVar[str]
     guidance: ClassVar[str]  # one line for the system prompt when the tool is offered
     args_model: ClassVar[type[BaseModel]]
+    summary: ClassVar[str] = ""  # what it does, as the agent card says it
+    flags: ClassVar[str] = ""  # what it makes, in short: "t2i", "edit · mask"
+    needs_agent: ClassVar[bool] = False  # offered only to a turn with an agent
 
     @abstractmethod
     def available(self) -> bool:
@@ -76,6 +80,10 @@ class ToolRegistry:
 
     def offered(self) -> list[Tool]:
         return [tool for tool in self._tools.values() if tool.available()]
+
+    def all(self) -> list[Tool]:
+        """Every tool, offered now or not."""
+        return list(self._tools.values())
 
     async def execute(self, name: str, arguments: str, ctx: ToolContext) -> ToolOutcome:
         tool = self._tools.get(name)

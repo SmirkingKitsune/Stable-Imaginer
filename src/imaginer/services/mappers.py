@@ -40,6 +40,7 @@ def message(row: orm.Message, attachments: list[str] | None = None) -> dto.Messa
         tool_call_id=row.tool_call_id,
         backend=row.backend,
         model=row.model,
+        agent=row.agent_id,
         attachments=attachments or [],
         metadata=row.metadata_json,
         created_at=row.created_at,

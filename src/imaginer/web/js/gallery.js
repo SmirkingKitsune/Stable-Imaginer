@@ -111,8 +111,9 @@ export function galleryScreen({ archived = false, navigate }) {
     draftKey: 'new',
     placeholder: 'Describe an image, or drop one in…',
     onSubmit: async (msg) => {
+      // Land on the viewer: the agent thinks there, then the images arrive on its stage.
       const id = await send(null, msg);
-      navigate(`#/c/${id}/chat`);
+      navigate(`#/c/${id}`);
     },
     onStop: () => {},
   });

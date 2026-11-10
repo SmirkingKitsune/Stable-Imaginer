@@ -31,6 +31,12 @@ and in its content so the assistant can tell the user.
 LoRA mentions (``@lora:<name>``, ``domain/mentions.py``) in the user's words add LoRAs to
 every image call of the turn, on top of ``image_options.loras``. The stored message keeps
 them as written; the LLM, the quality check and a raw prompt get the words without them.
+
+Agents (``agents/library.py``): a turn goes to the agent the message names, else the
+conversation's, else the one the default chat engine runs. Its engine answers, told the
+agent's system prompt, offered only the tools it has on, with its sampling; each assistant
+message records the agent, and the conversation remembers it (``metadata.agent``). A message
+that names a backend but no agent runs as before, without one.
 """
 
 import asyncio
@@ -43,6 +49,7 @@ import structlog
 from pydantic import BaseModel
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from imaginer.agents.library import AgentLibrary, Persona
 from imaginer.backends.base import ChatRequest, LLMBackend
 from imaginer.backends.registry import BackendRegistry, Lease
 from imaginer.core.clock import utcnow
@@ -85,7 +92,7 @@ from imaginer.orchestration.qa import (
     preset_pins,
 )
 from imaginer.services import mappers
-from imaginer.tools.base import ToolContext, ToolOutcome, ToolRegistry
+from imaginer.tools.base import Tool, ToolContext, ToolOutcome, ToolRegistry
 
 log = get_logger(__name__)
 
@@ -109,6 +116,8 @@ class _TurnState:
     request: str = ""  # the user's words, for the quality check
     reviewer: LLMBackend | None = None  # the vision LLM that checks; None: checks are skipped
     qa_skip: str | None = None  # why there is no reviewer
+    persona: Persona | None = None  # the agent answering, if any
+    only_tools: frozenset[str] | None = None  # offer just these tools, and require a call
 
 
 class TurnRunner:
@@ -131,13 +140,41 @@ class TurnRunner:
         self._qa = qa
         self._config = config
         self._prompt_hints: Callable[[str | None], str | None] | None = None
+        self._agents: AgentLibrary | None = None
 
     def set_prompt_hints(self, hints: Callable[[str | None], str | None]) -> None:
         """How to prompt the model an image backend runs (None: the default one's): the
         model library's note, added to the system prompt when image tools are offered."""
         self._prompt_hints = hints
 
-    async def start(self, conversation_id: str, body: dto.MessageCreate) -> TurnChannel:
+    def set_agents(self, agents: AgentLibrary) -> None:
+        """Where a turn's agent comes from: its engine, persona, tools and sampling."""
+        self._agents = agents
+
+    async def _agent_for(
+        self, conversation_agent: str | None, agent_id: str | None, backend: str | None
+    ) -> tuple[Persona | None, str | None]:
+        """The persona a turn answers with and the chat backend it runs on. Naming a
+        backend but no agent runs without one, as before agents."""
+        if self._agents is None or (agent_id is None and backend is not None):
+            return None, backend
+        agent = await self._agents.resolve(agent_id, conversation_agent)
+        if agent is None:
+            return None, backend
+        engine = self._agents.check_runs(agent)
+        if backend is not None and backend != engine:
+            raise InvalidRequestError(f"{agent.name} runs on {engine}, not {backend}")
+        return self._agents.persona(agent), engine
+
+    async def start(
+        self,
+        conversation_id: str,
+        body: dto.MessageCreate,
+        *,
+        only_tools: frozenset[str] | None = None,
+    ) -> TurnChannel:
+        """Start a turn. ``only_tools``: offer just these tools and require one to be called
+        (an agent painting its portrait)."""
         if not body.content.strip() and not body.attachments:
             raise InvalidRequestError("a message needs content or attachments")
         if len(set(body.attachments)) != len(body.attachments):
@@ -149,7 +186,8 @@ class TurnRunner:
         options = mentions.with_mentions(body.image_options, body.content)
 
         async with self._db.session() as session, session.begin():
-            await conv_repo.require_active(session, conversation_id)
+            conversation = await conv_repo.require_active(session, conversation_id)
+            conversation_agent = (conversation.metadata_json or {}).get("agent")
             found = await art_repo.get_many_in_conversation(
                 session, conversation_id, body.attachments
             )
@@ -163,10 +201,16 @@ class TurnRunner:
 
         qa = body.qa if body.qa is not None else self._config.qa.enabled
         raw_call = None
+        persona: Persona | None = None
         if body.mode is PromptMode.RAW:
             raw_call = self._raw_call(mentions.strip(body.content), attached)
             lease = await self._optional_reviewer(body.backend) if qa else None
         else:
+            persona, backend = await self._agent_for(
+                conversation_agent if isinstance(conversation_agent, str) else None,
+                body.agent,
+                body.backend,
+            )
             required = {Capability.CHAT, Capability.STREAM}
             if any(a.kind is ArtifactKind.IMAGE for a in attached):
                 # Never drop the user's image silently: a backend that can't see it is an error.
@@ -177,7 +221,13 @@ class TurnRunner:
                         f"{body.mode.value} mode makes images, but no image backend is available"
                     )
                 required.add(Capability.TOOLS)
-            lease = await self._registry.chat_backend(body.backend, require=required)
+            if only_tools is not None:
+                if not any(t.name in only_tools for t in self._tools.offered()):
+                    raise InvalidRequestError(
+                        f"{', '.join(sorted(only_tools))}: no image engine is available"
+                    )
+                required.add(Capability.TOOLS)
+            lease = await self._registry.chat_backend(backend, require=required)
         try:
             if body.image_options is not None and body.image_options.backend is not None:
                 self._registry.validate_image_backend(body.image_options.backend)
@@ -190,7 +240,9 @@ class TurnRunner:
 
             channel = self._turns.open(conversation_id)
             try:
-                user_message = await self._store_user_message(conversation_id, body)
+                user_message = await self._store_user_message(
+                    conversation_id, body, persona.agent_id if persona is not None else None
+                )
             except BaseException:
                 self._turns.release(channel)
                 raise
@@ -205,8 +257,10 @@ class TurnRunner:
             image_options=options,
             mode=body.mode,
             raw_call=raw_call,
-            force_tool=body.mode is PromptMode.INTERPRET,
+            force_tool=body.mode is PromptMode.INTERPRET or only_tools is not None,
             request=mentions.for_llm(body.content),
+            persona=persona,
+            only_tools=only_tools,
         )
         self._set_reviewer(state, lease, qa=qa)
         channel.task = self._start(channel, lease, state)
@@ -285,11 +339,18 @@ class TurnRunner:
         asked = (asker.metadata_json if asker is not None else None) or {}
         mode = PromptMode(asked.get("mode", PromptMode.CHAT))
         qa = bool(asked.get("qa", self._config.qa.enabled))
+        persona: Persona | None = None
         if mode is PromptMode.RAW:
             lease = await self._optional_reviewer(None) if qa else None
         else:
+            caller_agent = caller.agent_id
+            if self._agents is not None and self._agents.agent(caller_agent) is None:
+                caller_agent = None  # deleted since: the conversation's, or the default
+            persona, backend = await self._agent_for(
+                await self._conversation_agent(conversation_id), caller_agent, None
+            )
             lease = await self._registry.chat_backend(
-                None, require={Capability.CHAT, Capability.STREAM}
+                backend, require={Capability.CHAT, Capability.STREAM}
             )
         try:
             if options is not None and options.backend is not None:
@@ -318,6 +379,7 @@ class TurnRunner:
             placeholders={call["id"]: attempt.id},
             mode=mode,
             request=mentions.for_llm(asked_for),
+            persona=persona,
         )
         self._set_reviewer(state, lease, qa=qa)
         channel.task = self._start(channel, lease, state)
@@ -342,6 +404,9 @@ class TurnRunner:
     async def _run(
         self, channel: TurnChannel, backend: LLMBackend | None, state: _TurnState
     ) -> None:
+        agent_id = state.persona.agent_id if state.persona is not None else None
+        if agent_id is not None and self._agents is not None:
+            self._agents.turn_started(agent_id)
         with structlog.contextvars.bound_contextvars(
             conversation_id=channel.conversation_id, turn_id=channel.turn_id
         ):
@@ -351,6 +416,7 @@ class TurnRunner:
                 qa=state.qa,
                 backend=backend.name if backend else None,
                 model=backend.model if backend else None,
+                agent=agent_id,
             )
             try:
                 if state.mode is PromptMode.RAW:
@@ -370,12 +436,15 @@ class TurnRunner:
             except Exception as exc:
                 await self._fail(channel, state, exc)
             finally:
+                if agent_id is not None and self._agents is not None:
+                    self._agents.turn_ended(agent_id)
                 await channel.close()
                 self._turns.release(channel)
 
     async def _loop(self, channel: TurnChannel, backend: LLMBackend, state: _TurnState) -> None:
         capabilities = backend.capabilities()
         tools = self._tools.offered() if Capability.TOOLS in capabilities else []
+        tools = [t for t in tools if _allowed(t, state)]
         schemas = [tool.schema() for tool in tools]
         guidance = [tool.guidance for tool in tools]
         if tools and state.mode in MODE_GUIDANCE:
@@ -398,16 +467,23 @@ class TurnRunner:
             for call in list(state.pending_calls):
                 await self._call_tool(channel, state, call)
             may_call = round_index < rounds
+            persona = state.persona
             context = await self._context.build(
                 channel.conversation_id,
                 leaf_id=state.leaf_id,
                 vision=vision,
                 tool_guidance=guidance,
+                system_prompt=persona.system_prompt if persona is not None else None,
             )
             tool_choice = None if may_call or not schemas else "none"
             if may_call and state.force_tool:
                 tool_choice, state.force_tool = "required", False
-            request = ChatRequest(messages=context, tools=schemas or None, tool_choice=tool_choice)
+            request = ChatRequest(
+                messages=context,
+                tools=schemas or None,
+                tool_choice=tool_choice,
+                params=dict(persona.sampling) if persona is not None else {},
+            )
             await self._stream_assistant(channel, backend, request, state, keep_calls=may_call)
             if not state.pending_calls:
                 return
@@ -436,7 +512,10 @@ class TurnRunner:
         keep_calls: bool,
     ) -> None:
         assistant = await self._store_assistant_placeholder(
-            channel.conversation_id, backend, state.leaf_id
+            channel.conversation_id,
+            backend,
+            state.leaf_id,
+            state.persona.agent_id if state.persona is not None else None,
         )
         state.assistant_id = state.streaming_id = state.leaf_id = assistant.id
         state.assembler = MessageAssembler()
@@ -536,6 +615,7 @@ class TurnRunner:
             tool_call_id=call["id"],
             emit=_emitter(channel),
             image_options=state.image_options,
+            agent_id=state.persona.agent_id if state.persona is not None else None,
             sampler=sampler,
         )
         outcome = await self._tools.execute(name, arguments, ctx)
@@ -664,8 +744,14 @@ class TurnRunner:
 
     # --- persistence ----------------------------------------------------------
 
+    async def _conversation_agent(self, conversation_id: str) -> str | None:
+        async with self._db.session() as session:
+            row = await conv_repo.get_active(session, conversation_id)
+        agent = (row.metadata_json or {}).get("agent") if row is not None else None
+        return agent if isinstance(agent, str) else None
+
     async def _store_user_message(
-        self, conversation_id: str, body: dto.MessageCreate
+        self, conversation_id: str, body: dto.MessageCreate, agent_id: str | None = None
     ) -> dto.Message:
         options = body.image_options.model_dump(exclude_none=True) if body.image_options else {}
         metadata: dict[str, Any] = {"image_options": options} if options else {}
@@ -691,10 +777,19 @@ class TurnRunner:
             await msg_repo.insert(session, row)
             await msg_repo.add_attachments(session, row.id, body.attachments)
             await art_repo.claim_uploads(session, body.attachments, row.id)
+            if agent_id is not None:
+                conversation = await conv_repo.require_active(session, conversation_id)
+                metadata = dict(conversation.metadata_json or {})
+                if metadata.get("agent") != agent_id:
+                    conversation.metadata_json = {**metadata, "agent": agent_id}
         return mappers.message(row, list(body.attachments))
 
     async def _store_assistant_placeholder(
-        self, conversation_id: str, backend: LLMBackend, parent_id: str
+        self,
+        conversation_id: str,
+        backend: LLMBackend,
+        parent_id: str,
+        agent_id: str | None = None,
     ) -> dto.Message:
         async with self._db.session() as session, session.begin():
             now = utcnow()
@@ -708,6 +803,7 @@ class TurnRunner:
                 status=MessageStatus.STREAMING,
                 backend=backend.name,
                 model=backend.model,
+                agent_id=agent_id,
                 created_at=now,
             )
             await msg_repo.insert(session, row)
@@ -810,6 +906,16 @@ async def _parent_for(
     if anchor.role is not Role.USER:
         raise InvalidRequestError("edit_of must be one of your own messages")
     return anchor.parent_id
+
+
+def _allowed(tool: Tool, state: _TurnState) -> bool:
+    """Whether the turn offers a tool: the agent has it on (a tool for agents needs one),
+    and it is one of the turn's only tools, if it has those."""
+    if state.only_tools is not None and tool.name not in state.only_tools:
+        return False
+    if state.persona is None:
+        return not tool.needs_agent
+    return tool.name not in state.persona.tools_off
 
 
 def _reseeded(call: dict[str, Any]) -> dict[str, Any]:
