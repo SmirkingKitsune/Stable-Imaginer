@@ -10,7 +10,7 @@ import { api } from './api.js';
 import { connectionStrip, dialog, statusLine, toast } from './chrome.js';
 import { append, corners, h, icon, iconButton, clear } from './dom.js';
 import { ago, plural } from './format.js';
-import { loadBackends } from './store.js';
+import { lastPlace, loadBackends } from './store.js';
 
 const POLL_MS = 5000;
 const STATUS = { ok: 'LINKED', unknown: 'CHECKING', unreachable: 'OFFLINE', incompatible: 'INCOMPATIBLE', unauthorized: 'REFUSED' };
@@ -31,7 +31,7 @@ export function linksScreen({ navigate }) {
   const status = statusLine();
   const meta = h('span.topbar-meta');
   const header = h('header.topbar.sub',
-    iconButton('back', 'Back', () => (history.length > 1 ? history.back() : navigate('#/'))),
+    iconButton('back', 'Back', () => navigate(lastPlace())),
     h('div.topbar-heading', h('span.topbar-title', 'Linked instances'), meta),
     h('span.spacer'),
     h('div.only-wide', status.el),

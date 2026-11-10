@@ -112,7 +112,8 @@ class LoraRef(_Strict):
 
 
 class ImageDefaults(_Strict):
-    """Per-backend sampler defaults. Engines disagree on good values for the same model."""
+    """Sampler defaults: a model card's, else the backend's. Engines disagree on good values
+    for the same model."""
 
     width: int = Field(default=2048, ge=64, le=8192, description="Qwen-Image-2.1 is native 2K.")
     height: int = Field(default=2048, ge=64, le=8192)
@@ -124,6 +125,14 @@ class ImageDefaults(_Strict):
     sigmas: list[float] | str | None = Field(
         default=None, description="Explicit sigma list, or an engine preset name."
     )
+    guidance: float | None = Field(
+        default=None,
+        description="Distilled guidance, for models with a guidance input (FLUX.1 dev, FLUX.2 "
+        "dev): sd.cpp's --guidance. Not CFG.",
+    )
+    clip_skip: int | None = Field(
+        default=None, ge=1, description="CLIP layers to skip (SD 1.x/2.x/SDXL); 1 skips none."
+    )
     loras: list[LoraRef] = Field(
         default_factory=list, description="Applied to every image unless a preset says otherwise."
     )
@@ -131,6 +140,10 @@ class ImageDefaults(_Strict):
     output_format: Literal["png", "webp", "jpeg"] = "png"
     extra: dict[str, Any] = Field(
         default_factory=dict, description="Engine-specific fields passed through verbatim."
+    )
+    extra_sample: dict[str, Any] = Field(
+        default_factory=dict,
+        description="More sd-server sample_params, sent as they are (e.g. shifted_timestep).",
     )
 
 
@@ -150,6 +163,8 @@ class ImagePreset(_Strict):
     scheduler: str | None = None
     flow_shift: float | None = None
     sigmas: list[float] | str | None = None
+    guidance: float | None = None
+    clip_skip: int | None = Field(default=None, ge=1)
 
 
 ImagePresets = dict[Annotated[str, Field(pattern=PRESET_PATTERN)], ImagePreset]
@@ -195,12 +210,37 @@ class LlamaCppLaunch(_Launch):
     mmproj: Path | None = Field(default=None, description="--mmproj: vision projector")
 
 
+VaeFormat = Literal["auto", "flux", "sd3", "flux2", "wan"]
+
+
 class SdCppLaunch(_Launch):
+    """The model files, by sd-server's slot names. Which a model needs depends on its family
+    (image_models/recipes.py): a checkpoint (``model``) for SD 1.x/SDXL, a diffusion model
+    with its text encoders and VAE for most others. A model card fills them when the engine
+    has one (``model_card``)."""
+
+    model: Path | None = Field(default=None, description="--model: a full checkpoint")
     diffusion_model: Path | None = Field(default=None, description="--diffusion-model")
+    uncond_diffusion_model: Path | None = Field(
+        default=None, description="--uncond-diffusion-model (Ideogram 4)"
+    )
     vae: Path | None = Field(default=None, description="--vae")
-    llm: Path | None = Field(default=None, description="--llm: the text encoder")
+    tae: Path | None = Field(default=None, description="--tae: a tiny autoencoder")
+    clip_l: Path | None = Field(default=None, description="--clip_l")
+    clip_g: Path | None = Field(default=None, description="--clip_g")
+    t5xxl: Path | None = Field(default=None, description="--t5xxl")
+    llm: Path | None = Field(default=None, description="--llm: an LLM text encoder")
     llm_vision: Path | None = Field(
         default=None, description="--llm_vision: needed for edit and multi_ref"
+    )
+    embeddings_connectors: Path | None = Field(default=None, description="--embeddings-connectors")
+    tokenizer: Path | None = Field(default=None, description="--tokenizer: a tokenizer.json")
+    vae_format: VaeFormat | None = Field(
+        default=None, description="--vae-format. Default: the family's, else auto."
+    )
+    model_args: dict[str, str | bool | int | float] = Field(
+        default_factory=dict,
+        description="--model-args, over the ones the model's family recommends.",
     )
     lora_model_dir: Path | None = Field(
         default=None,
@@ -228,17 +268,40 @@ class LlamaCppBackendConfig(_HttpBackend):
 class SdCppBackendConfig(_HttpBackend):
     type: Literal["sdcpp"]
     launch: SdCppLaunch | None = None
+    model_card: str | None = Field(
+        default=None,
+        max_length=64,
+        description="The model card (GET /v1/models) this engine runs: its files, family, "
+        "defaults and presets replace the ones set here.",
+    )
+    family: str | None = Field(
+        default=None,
+        max_length=64,
+        description="The model's family, an sd-server recipe id (GET /v1/models/families). "
+        "A model card sets it; name one for an engine set up by hand.",
+    )
     concurrency: int = Field(default=1, ge=1)
     max_ref_images: int = Field(default=10, ge=1)
-    size_multiple: int = Field(
-        default=32, ge=8, description="Qwen-Image-2.1 needs multiples of 32."
+    size_multiple: int | None = Field(
+        default=None,
+        ge=1,
+        description="Sizes snap to multiples of it. Default: the family's, else 32 "
+        "(Qwen-Image-2.1's).",
     )
     defaults: ImageDefaults = Field(default_factory=ImageDefaults)
     presets: ImagePresets = Field(
         default_factory=dict, description="Named settings a message can pick (image_options)."
     )
-    rgba_prompt_template: str = DEFAULT_RGBA_PROMPT_TEMPLATE
-    mask_instruction: str = DEFAULT_MASK_INSTRUCTION
+    rgba_prompt_template: str | None = Field(
+        default=None,
+        description="How a prompt asks for transparency, with {prompt}. Default: the "
+        "family's (Qwen-Image-2.1's without a family).",
+    )
+    mask_instruction: str | None = Field(
+        default=None,
+        description="How an edit's mask is explained in the prompt. Default: the family's "
+        "(Qwen-Image-2.1's without a family).",
+    )
     max_ref_pixels: int | None = Field(
         default=None,
         gt=0,

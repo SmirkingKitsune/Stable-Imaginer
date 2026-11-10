@@ -12,6 +12,7 @@ from imaginer.db.engine import Database
 from imaginer.domain.enums import BackendKind
 from imaginer.engines.service import EngineService
 from imaginer.hub.service import HubService
+from imaginer.image_models.library import ModelLibrary
 from imaginer.links.admin import LinkAdmin
 from imaginer.links.gallery import Gallery
 from imaginer.links.serve import PeerEngines
@@ -54,6 +55,7 @@ class Container:
     link_admin: LinkAdmin
     gallery: Gallery
     loras: LoraLibrary
+    models: ModelLibrary
     _tasks: list[asyncio.Task[None]] = field(default_factory=list)
 
     @classmethod
@@ -72,6 +74,13 @@ class Container:
         # Before the registry: linked backends resolve their link through it.
         links = LinkService(settings, db)
         await links.start()
+        # Before the registry too: an sd-server engine runs its model card's files and
+        # settings, so the registry is built from each backend's config as it runs.
+        models = ModelLibrary(settings, db)
+        await models.load()
+        raw = dict(settings.backends)
+        for name, config in raw.items():
+            settings.backends[name] = models.effective(name, config)
         registry = BackendRegistry.from_settings(
             settings, factories={**FACTORIES, "linked": links.backend_factory}
         )
@@ -109,8 +118,16 @@ class Container:
             await jobs.cancel_conversation(conversation_id)
 
         conversations.add_delete_hook(stop_work)
-        engines = EngineService(settings, registry)
+        engines = EngineService(settings, registry, raw=raw, view=models.effective)
         hub = HubService(settings, engines)
+        models.attach(engines=engines, hub=hub, artifacts=artifacts)
+        try:
+            await models.adopt_engines()
+        except Exception:
+            log.exception("models.adopt_failed")
+        turn_runner.set_prompt_hints(
+            lambda backend: models.prompt_hint(backend or settings.default_backend("t2i") or "")
+        )
         loras = LoraLibrary(settings, db, registry, engines, artifacts, hub)
         await loras.start()
         registry.set_lora_words(loras.words_for)
@@ -135,6 +152,7 @@ class Container:
             link_admin=LinkAdmin(settings, links, registry, engines, gates),
             gallery=Gallery(turns=turns, conversations=conversations, links=links),
             loras=loras,
+            models=models,
         )
         # Probe engines in the background: the API must come up even when they are down.
         container._tasks.append(asyncio.create_task(registry.refresh()))

@@ -1,0 +1,638 @@
+# Stable-Imaginer's notes on sd-server's image recipes (sdcpp_recipes.json, from
+# stable-diffusion.cpp's examples/server/recipes). The recipe says which component slots a
+# family needs and its generation defaults; this file says what the recipes don't:
+#
+#   group        how the model library groups families
+#   lora_group   which LoRAs fit: LoRAs made for the same group (by their metadata or Hub
+#                card) are taken as made for this family
+#   prompt       how the chat model should write prompts: natural (default), tags or json
+#   hint         a note for the chat model about prompting this family
+#   note         a note shown on the model card (e.g. a conversion it needs first)
+#   native       [width, height] to use instead of the recipe's (recipes cap them at 1024)
+#   defaults     sampling defaults to use over the recipe's (our names: steps, cfg_scale,
+#                sampler, scheduler, flow_shift, sigmas, guidance, clip_skip)
+#   model_args   --model-args the family's sd.cpp doc recommends
+#   rgba         prompt template for transparent output ({prompt}); without one the family
+#                makes no RGBA images
+#   mask         how an edit's mask is explained in the prompt; without one it takes none
+#   names        regexes on a file's name that point at the family (case-insensitive)
+#   repos        Hub repos (or "owner/" prefixes) that point at it
+#   gguf         GGUF general.architecture values that point at it
+#   sources      per slot, Hub references to get that component from, best first: a repo,
+#                a folder or file in it (owner/name/path), or owner/name:QUANT
+#
+# Families listed under hidden are edit, control and decoder recipes: out of the library's
+# scope, though an engine configured by hand may still name one.
+
+hidden:
+  - anima-edit
+  - boogu-image-edit
+  - cosxl-edit
+  - fibo2-edit-turbo
+  - flex2
+  - flux1-canny
+  - flux1-depth
+  - flux1-fill
+  - flux1-kontext
+  - flux1-pulid
+  - instruct-pix2pix
+  - krea2-raw-edit
+  - krea2-turbo-edit
+  - longcat-image-edit
+  - mage-flow-edit
+  - pid
+  - pid-15
+  - pid-15-flux2
+  - pid-15-qwen-image
+  - pid-15-sd3
+  - pid-flux2
+  - pid-qwen-image
+  - pid-sd3
+  - qwen-image-edit
+  - qwen-image-edit-2509
+  - qwen-image-edit-2511
+  - qwen-image-layered
+  - sd1-controlnet
+  - sd1-inpainting
+  - sd1-ip-adapter
+  - sd2-inpainting
+  - sdxl-controlnet
+  - sdxl-inpainting
+  - sdxl-ip-adapter
+  - sdxl-photomaker
+
+hints:
+  tags: >-
+    This model reads comma-separated tags and short phrases best: the subject first, then
+    details, style, lighting and quality words. Keep it under about 75 tokens (CLIP reads no
+    further), and put what to avoid in the negative prompt.
+  json: >-
+    This model was trained on structured JSON captions: write the prompt as one JSON object
+    whose "high_level_description" field describes the whole image, with any further
+    details as more fields.
+
+families:
+  # --- Stable Diffusion 1.x / 2.x / SDXL: single-file checkpoints -------------------------
+  sd1-checkpoint:
+    group: Stable Diffusion 1.x
+    lora_group: sd1
+    prompt: tags
+    names: ['\bsd[-_ ]?v?1[-_.]?[45]\b', 'v1-5', 'sd15', 'dreamshaper[-_]?[0-8]\b']
+    repos: [stable-diffusion-v1-5/, runwayml/, CompVis/]
+    gguf: [sd1]
+    sources:
+      model: [stable-diffusion-v1-5/stable-diffusion-v1-5/v1-5-pruned-emaonly.safetensors]
+  sd2-512-checkpoint:
+    group: Stable Diffusion 2.x
+    lora_group: sd2
+    prompt: tags
+    names: ['sd[-_]?2[-_.]?1?[-_]?base', 'v2-1_512', '512-base']
+    repos: [Manojb/stable-diffusion-2-1-base]
+    sources:
+      model: [Manojb/stable-diffusion-2-1-base]
+  sd2-768-checkpoint:
+    group: Stable Diffusion 2.x
+    lora_group: sd2
+    prompt: tags
+    names: ['v2-1_768', '768-v', 'sd[-_]?2[-_.]?1(?!.*base)']
+  sd-turbo:
+    group: Stable Diffusion 2.x
+    lora_group: sd2
+    prompt: tags
+    names: ['\bsd[-_]?turbo']
+    repos: [stabilityai/sd-turbo]
+    sources:
+      model: [stabilityai/sd-turbo]
+  sdxl-checkpoint:
+    group: SDXL
+    lora_group: sdxl
+    prompt: tags
+    names: ['sd[-_]?xl(?![-_]?turbo)', 'xl[-_]base', 'ssd[-_]?1b', 'segmind[-_]?vega', 'pony',
+            'illustrious', 'noob[-_]?ai', 'juggernaut[-_]?xl', 'realvis[-_]?xl']
+    repos: [stabilityai/stable-diffusion-xl-base-1.0, segmind/SSD-1B, segmind/Segmind-Vega]
+    gguf: [sdxl]
+    sources:
+      model: [stabilityai/stable-diffusion-xl-base-1.0/sd_xl_base_1.0.safetensors]
+      vae: [madebyollin/sdxl-vae-fp16-fix]
+  sdxl-turbo:
+    group: SDXL
+    lora_group: sdxl
+    prompt: tags
+    names: ['sd[-_]?xl[-_]?turbo']
+    repos: [stabilityai/sdxl-turbo]
+    sources:
+      model: [stabilityai/sdxl-turbo]
+  nitrosd-realism:
+    group: SDXL
+    lora_group: sdxl
+    prompt: tags
+    names: ['nitro[-_]?sd']
+  sdxs:
+    group: Stable Diffusion 1.x
+    lora_group: sd1
+    prompt: tags
+    names: ['\bsdxs\b', 'sdxs[-_]']
+    repos: [akleine/sdxs-512, concedo/sdxs-512-tinySDdistilled-GGUF]
+    sources:
+      model: [akleine/sdxs-512, concedo/sdxs-512-tinySDdistilled-GGUF]
+
+  # --- SD3 ---------------------------------------------------------------------------------
+  sd3-medium:
+    group: Stable Diffusion 3
+    lora_group: sd3
+    names: ['sd3[-_.]?medium', 'sd3_medium']
+    repos: [stabilityai/stable-diffusion-3-medium]
+    gguf: [sd3]
+    sources:
+      model: [stabilityai/stable-diffusion-3-medium]
+  sd35-large:
+    group: Stable Diffusion 3
+    lora_group: sd35-large
+    names: ['sd3[-_.]?5[-_.]?large']
+    repos: [stabilityai/stable-diffusion-3.5-large]
+    gguf: [sd3]
+    sources:
+      model: [Comfy-Org/stable-diffusion-3.5-fp8/sd3.5_large_fp8_scaled.safetensors,
+              stabilityai/stable-diffusion-3.5-large]
+      clip_l: [Comfy-Org/stable-diffusion-3.5-fp8/text_encoders/clip_l.safetensors]
+      clip_g: [Comfy-Org/stable-diffusion-3.5-fp8/text_encoders/clip_g.safetensors]
+      t5xxl: [Comfy-Org/stable-diffusion-3.5-fp8/text_encoders/t5xxl_fp16.safetensors,
+              Comfy-Org/stable-diffusion-3.5-fp8/text_encoders/t5xxl_fp8_e4m3fn.safetensors]
+  sd35-medium:
+    group: Stable Diffusion 3
+    lora_group: sd35-medium
+    names: ['sd3[-_.]?5[-_.]?medium']
+    repos: [stabilityai/stable-diffusion-3.5-medium]
+    gguf: [sd3]
+    sources:
+      model: [stabilityai/stable-diffusion-3.5-medium]
+      clip_l: [Comfy-Org/stable-diffusion-3.5-fp8/text_encoders/clip_l.safetensors]
+      clip_g: [Comfy-Org/stable-diffusion-3.5-fp8/text_encoders/clip_g.safetensors]
+      t5xxl: [Comfy-Org/stable-diffusion-3.5-fp8/text_encoders/t5xxl_fp16.safetensors,
+              Comfy-Org/stable-diffusion-3.5-fp8/text_encoders/t5xxl_fp8_e4m3fn.safetensors]
+
+  # --- FLUX ----------------------------------------------------------------------------------
+  flux1-dev:
+    group: FLUX.1
+    lora_group: flux1
+    names: ['flux[-_.]?1?[-_.]?dev', 'flux[-_.]?1[-_.]?lite']
+    repos: [black-forest-labs/FLUX.1-dev, leejet/FLUX.1-dev-gguf, city96/FLUX.1-dev-gguf]
+    gguf: [flux]
+    sources:
+      diffusion_model: [leejet/FLUX.1-dev-gguf, black-forest-labs/FLUX.1-dev/flux1-dev.safetensors]
+      clip_l: [comfyanonymous/flux_text_encoders/clip_l.safetensors]
+      t5xxl: [comfyanonymous/flux_text_encoders/t5xxl_fp16.safetensors,
+              comfyanonymous/flux_text_encoders/t5xxl_fp8_e4m3fn.safetensors]
+      vae: [black-forest-labs/FLUX.1-schnell/ae.safetensors,
+            Comfy-Org/z_image_turbo/split_files/vae/ae.safetensors]
+  flux1-schnell:
+    group: FLUX.1
+    lora_group: flux1
+    names: ['flux[-_.]?1?[-_.]?schnell', '\bschnell\b']
+    repos: [black-forest-labs/FLUX.1-schnell, leejet/FLUX.1-schnell-gguf]
+    gguf: [flux]
+    sources:
+      diffusion_model: [leejet/FLUX.1-schnell-gguf,
+                        black-forest-labs/FLUX.1-schnell/flux1-schnell.safetensors]
+      clip_l: [comfyanonymous/flux_text_encoders/clip_l.safetensors]
+      t5xxl: [comfyanonymous/flux_text_encoders/t5xxl_fp16.safetensors,
+              comfyanonymous/flux_text_encoders/t5xxl_fp8_e4m3fn.safetensors]
+      vae: [black-forest-labs/FLUX.1-schnell/ae.safetensors,
+            Comfy-Org/z_image_turbo/split_files/vae/ae.safetensors]
+  flux2-dev:
+    group: FLUX.2
+    lora_group: flux2-dev
+    names: ['flux[-_.]?2[-_.]?dev']
+    repos: [black-forest-labs/FLUX.2-dev, city96/FLUX.2-dev-gguf]
+    sources:
+      diffusion_model: [city96/FLUX.2-dev-gguf]
+      llm: ['unsloth/Mistral-Small-3.2-24B-Instruct-2506-GGUF:Q4_K_M']
+      vae: [Comfy-Org/flux2-klein-4B/split_files/vae/flux2-vae.safetensors]
+  flux2-klein-4b:
+    group: FLUX.2
+    lora_group: flux2-klein-4b
+    names: ['flux[-_.]?2[-_.]?klein[-_.]?4b(?!.*base)']
+    repos: [black-forest-labs/FLUX.2-klein-4B, leejet/FLUX.2-klein-4B-GGUF]
+    sources:
+      diffusion_model: [leejet/FLUX.2-klein-4B-GGUF,
+                        Comfy-Org/flux2-klein-4B/split_files/diffusion_models/flux-2-klein-4b.safetensors]
+      llm: [Comfy-Org/flux2-klein-4B/split_files/text_encoders/qwen_3_4b.safetensors,
+            'unsloth/Qwen3-4B-GGUF:Q4_K_M']
+      vae: [Comfy-Org/flux2-klein-4B/split_files/vae/flux2-vae.safetensors]
+  flux2-klein-base-4b:
+    group: FLUX.2
+    lora_group: flux2-klein-4b
+    names: ['flux[-_.]?2[-_.]?klein[-_.]?base[-_.]?4b', 'flux[-_.]?2[-_.]?klein[-_.]?4b.*base']
+    repos: [black-forest-labs/FLUX.2-klein-base-4B, leejet/FLUX.2-klein-base-4B-GGUF]
+    sources:
+      diffusion_model: [leejet/FLUX.2-klein-base-4B-GGUF,
+                        Comfy-Org/flux2-klein-4B/split_files/diffusion_models/flux-2-klein-base-4b.safetensors]
+      llm: [Comfy-Org/flux2-klein-4B/split_files/text_encoders/qwen_3_4b.safetensors,
+            'unsloth/Qwen3-4B-GGUF:Q4_K_M']
+      vae: [Comfy-Org/flux2-klein-4B/split_files/vae/flux2-vae.safetensors]
+  flux2-klein-9b:
+    group: FLUX.2
+    lora_group: flux2-klein-9b
+    names: ['flux[-_.]?2[-_.]?klein[-_.]?9b(?!.*base)']
+    repos: [black-forest-labs/FLUX.2-klein-9B, leejet/FLUX.2-klein-9B-GGUF]
+    sources:
+      diffusion_model: [leejet/FLUX.2-klein-9B-GGUF]
+      llm: [Comfy-Org/flux2-klein-9B, 'unsloth/Qwen3-8B-GGUF:Q4_K_M']
+      vae: [Comfy-Org/flux2-klein-4B/split_files/vae/flux2-vae.safetensors]
+  flux2-klein-base-9b:
+    group: FLUX.2
+    lora_group: flux2-klein-9b
+    names: ['flux[-_.]?2[-_.]?klein[-_.]?base[-_.]?9b', 'flux[-_.]?2[-_.]?klein[-_.]?9b.*base']
+    repos: [black-forest-labs/FLUX.2-klein-base-9B, leejet/FLUX.2-klein-base-9B-GGUF]
+    sources:
+      diffusion_model: [leejet/FLUX.2-klein-base-9B-GGUF]
+      llm: [Comfy-Org/flux2-klein-9B, 'unsloth/Qwen3-8B-GGUF:Q4_K_M']
+      vae: [Comfy-Org/flux2-klein-4B/split_files/vae/flux2-vae.safetensors]
+  flux3-klein:
+    group: FLUX.3
+    lora_group: flux3-klein
+    names: ['flux[-_.]?3.*klein(?!.*base)']
+    repos: [black-forest-labs/flux-3-image-klein, leejet/flux-3-image-klein-GGUF]
+    sources:
+      diffusion_model: [leejet/flux-3-image-klein-GGUF,
+                        black-forest-labs/flux-3-image-klein/model.safetensors]
+      llm: ['Qwen/Qwen3-VL-4B-Instruct-GGUF:Q4_K_M', Comfy-Org/Krea-2]
+      vae: [Comfy-Org/flux2-klein-4B/split_files/vae/flux2-vae.safetensors]
+  flux3-klein-base:
+    group: FLUX.3
+    lora_group: flux3-klein
+    names: ['flux[-_.]?3.*klein.*base']
+    repos: [black-forest-labs/flux-3-image-klein-base, leejet/flux-3-image-klein-base-GGUF]
+    sources:
+      diffusion_model: [leejet/flux-3-image-klein-base-GGUF,
+                        black-forest-labs/flux-3-image-klein-base/model.safetensors]
+      llm: ['Qwen/Qwen3-VL-4B-Instruct-GGUF:Q4_K_M', Comfy-Org/Krea-2]
+      vae: [Comfy-Org/flux2-klein-4B/split_files/vae/flux2-vae.safetensors]
+
+  # --- Chroma ------------------------------------------------------------------------------
+  chroma:
+    group: Chroma
+    lora_group: chroma
+    names: ['chroma(?![-_]?1?[-_]?radiance)']
+    repos: [lodestones/Chroma, lodestones/Chroma1-HD, silveroxides/Chroma-GGUF]
+    model_args: {chroma_use_dit_mask: 'false'}
+    sources:
+      diffusion_model: [silveroxides/Chroma-GGUF, lodestones/Chroma1-HD, lodestones/Chroma]
+      t5xxl: [comfyanonymous/flux_text_encoders/t5xxl_fp16.safetensors,
+              comfyanonymous/flux_text_encoders/t5xxl_fp8_e4m3fn.safetensors]
+      vae: [lodestones/Chroma/ae.safetensors, Comfy-Org/z_image_turbo/split_files/vae/ae.safetensors]
+  chroma-radiance:
+    group: Chroma
+    lora_group: chroma-radiance
+    names: ['radiance']
+    repos: [lodestones/Chroma1-Radiance, silveroxides/Chroma1-Radiance-GGUF]
+    sources:
+      diffusion_model: [silveroxides/Chroma1-Radiance-GGUF, lodestones/Chroma1-Radiance]
+      t5xxl: [comfyanonymous/flux_text_encoders/t5xxl_fp16.safetensors,
+              comfyanonymous/flux_text_encoders/t5xxl_fp8_e4m3fn.safetensors]
+
+  # --- Qwen Image --------------------------------------------------------------------------
+  qwen-image:
+    group: Qwen Image
+    lora_group: qwen-image
+    names: ['qwen[-_]?image(?![-_.]?(2[._]?1|edit|layered))']
+    repos: [Qwen/Qwen-Image, QuantStack/Qwen-Image-GGUF, Comfy-Org/Qwen-Image_ComfyUI]
+    gguf: [qwen_image]
+    sources:
+      diffusion_model: [Comfy-Org/Qwen-Image_ComfyUI/split_files/diffusion_models,
+                        QuantStack/Qwen-Image-GGUF]
+      llm: [Comfy-Org/Qwen-Image_ComfyUI/split_files/text_encoders/qwen_2.5_vl_7b.safetensors,
+            'mradermacher/Qwen2.5-VL-7B-Instruct-GGUF:Q4_K_M']
+      vae: [Comfy-Org/Qwen-Image_ComfyUI/split_files/vae/qwen_image_vae.safetensors]
+  qwen-image-21:
+    group: Qwen Image
+    lora_group: qwen-image-21
+    native: [2048, 2048]
+    names: ['qwen[-_]?image[-_.]?2[._]?1(?!.*turbo)']
+    repos: [Qwen/Qwen-Image-2.1, Comfy-Org/Qwen-Image-2.1, leejet/Qwen-Image-2.1-GGUF,
+            unsloth/Qwen-Image-2.1-FP8]
+    gguf: [qwen_image]
+    rgba: 'This is an RGBA image with transparency. {prompt}. The image has alpha channel and the background is transparent.'
+    mask: 'The last image is a mask: change only the area that is white in the mask and keep everything else exactly as it is.'
+    sources:
+      diffusion_model: [Comfy-Org/Qwen-Image-2.1/diffusion_models/qwen_image_2.1_bf16.safetensors,
+                        Comfy-Org/Qwen-Image-2.1/diffusion_models/qwen_image_2.1_int8_convrot.safetensors,
+                        leejet/Qwen-Image-2.1-GGUF]
+      llm: [Comfy-Org/Qwen-Image-2.1/text_encoders/qwen3vl_8b_bf16.safetensors,
+            'Qwen/Qwen3-VL-8B-Instruct-GGUF:Q4_K_M']
+      llm_vision: [Qwen/Qwen3-VL-8B-Instruct-GGUF/mmproj-Qwen3VL-8B-Instruct-F16.gguf]
+      vae: [Comfy-Org/Qwen-Image-2.1/vae/qwen_image_2.1_vae_bf16.safetensors]
+  qwen-image-21-turbo:
+    group: Qwen Image
+    lora_group: qwen-image-21
+    native: [2048, 2048]
+    names: ['qwen[-_]?image[-_.]?2[._]?1.*turbo']
+    gguf: [qwen_image]
+    rgba: 'This is an RGBA image with transparency. {prompt}. The image has alpha channel and the background is transparent.'
+    mask: 'The last image is a mask: change only the area that is white in the mask and keep everything else exactly as it is.'
+    sources:
+      diffusion_model: [Comfy-Org/Qwen-Image-2.1/diffusion_models/qwen_image_2.1_turbo_bf16.safetensors,
+                        Comfy-Org/Qwen-Image-2.1/diffusion_models/qwen_image_2.1_turbo_int8_convrot.safetensors]
+      llm: [Comfy-Org/Qwen-Image-2.1/text_encoders/qwen3vl_8b_bf16.safetensors,
+            'Qwen/Qwen3-VL-8B-Instruct-GGUF:Q4_K_M']
+      llm_vision: [Qwen/Qwen3-VL-8B-Instruct-GGUF/mmproj-Qwen3VL-8B-Instruct-F16.gguf]
+      vae: [Comfy-Org/Qwen-Image-2.1/vae/qwen_image_2.1_vae_bf16.safetensors]
+
+  # --- Z-Image -----------------------------------------------------------------------------
+  z-image-turbo:
+    group: Z-Image
+    lora_group: z-image-turbo
+    names: ['z[-_]?image[-_]?turbo']
+    repos: [Tongyi-MAI/Z-Image-Turbo, Comfy-Org/z_image_turbo, leejet/Z-Image-Turbo-GGUF]
+    sources:
+      diffusion_model: [Comfy-Org/z_image_turbo/split_files/diffusion_models, leejet/Z-Image-Turbo-GGUF]
+      llm: [Comfy-Org/z_image_turbo/split_files/text_encoders/qwen_3_4b.safetensors,
+            'unsloth/Qwen3-4B-Instruct-2507-GGUF:Q4_K_M']
+      vae: [Comfy-Org/z_image_turbo/split_files/vae/ae.safetensors]
+  z-image:
+    group: Z-Image
+    lora_group: z-image
+    names: ['z[-_]?image(?![-_]?(turbo|l2p))']
+    repos: [Tongyi-MAI/Z-Image, Comfy-Org/z_image, unsloth/Z-Image-GGUF]
+    sources:
+      diffusion_model: [Comfy-Org/z_image/split_files/diffusion_models, unsloth/Z-Image-GGUF]
+      llm: [Comfy-Org/z_image_turbo/split_files/text_encoders/qwen_3_4b.safetensors,
+            'unsloth/Qwen3-4B-Instruct-2507-GGUF:Q4_K_M']
+      vae: [Comfy-Org/z_image_turbo/split_files/vae/ae.safetensors]
+  z-image-l2p:
+    group: Z-Image
+    lora_group: z-image-l2p
+    names: ['\bl2p\b', 'model-1k-merge']
+    repos: [zhen-nan/L2P]
+    defaults: {cfg_scale: 2.0, steps: 30, width: 1024, height: 1024}
+    note: Pixel-space model, so it has no VAE.
+    sources:
+      diffusion_model: [zhen-nan/L2P/model-1k-merge.safetensors]
+      llm: [Comfy-Org/z_image_turbo/split_files/text_encoders/qwen_3_4b.safetensors]
+
+  # --- Other families ------------------------------------------------------------------------
+  anima:
+    group: Anima
+    lora_group: anima
+    names: ['\banima']
+    repos: [circlestone-labs/Anima, Bedovyy/Anima-GGUF, JusteLeo/Anima2-GGUF]
+    sources:
+      diffusion_model: [circlestone-labs/Anima/split_files/diffusion_models, Bedovyy/Anima-GGUF]
+      llm: [circlestone-labs/Anima/split_files/text_encoders,
+            'mradermacher/Qwen3-0.6B-Base-GGUF:Q8_0']
+      vae: [circlestone-labs/Anima/split_files/vae]
+  boogu-image:
+    group: Boogu Image
+    lora_group: boogu-image
+    names: ['boogu(?!.*edit)']
+    repos: [Comfy-Org/Boogu-Image]
+    sources:
+      diffusion_model: [Comfy-Org/Boogu-Image]
+      llm: ['unsloth/Qwen3-VL-8B-Instruct-GGUF:Q4_K_M']
+      vae: [Comfy-Org/z_image_turbo/split_files/vae/ae.safetensors]
+  ernie-image:
+    group: ERNIE-Image
+    lora_group: ernie-image
+    names: ['ernie[-_]?image(?!.*turbo)']
+    repos: [unsloth/ERNIE-Image-GGUF]
+    sources:
+      diffusion_model: [Comfy-Org/ERNIE-Image, unsloth/ERNIE-Image-GGUF]
+      llm: [Comfy-Org/ERNIE-Image, 'unsloth/Ministral-3-3B-Instruct-2512-GGUF:Q4_K_M']
+      vae: [Comfy-Org/ERNIE-Image]
+  ernie-image-turbo:
+    group: ERNIE-Image
+    lora_group: ernie-image
+    names: ['ernie[-_]?image.*turbo']
+    repos: [unsloth/ERNIE-Image-Turbo-GGUF]
+    sources:
+      diffusion_model: [Comfy-Org/ERNIE-Image, unsloth/ERNIE-Image-Turbo-GGUF]
+      llm: [Comfy-Org/ERNIE-Image, 'unsloth/Ministral-3-3B-Instruct-2512-GGUF:Q4_K_M']
+      vae: [Comfy-Org/ERNIE-Image]
+  fibo2-dev:
+    group: Fibo
+    lora_group: fibo2
+    names: ['fibo(?!.*edit)']
+    repos: [briaai/Fibo-2.0-dev, Comfy-Org/Fibo-2.0]
+    hint: Plain prompts and structured JSON captions both work.
+    sources:
+      diffusion_model: [Comfy-Org/Fibo-2.0]
+      llm: ['Qwen/Qwen3-VL-4B-Instruct-GGUF:Q4_K_M', Comfy-Org/Fibo-2.0]
+      llm_vision: [Qwen/Qwen3-VL-4B-Instruct-GGUF]
+      vae: [Comfy-Org/flux2-klein-4B/split_files/vae/flux2-vae.safetensors]
+  hidream-o1-dev:
+    group: HiDream
+    lora_group: hidream-o1
+    names: ['hidream[-_]?o1']
+    repos: [Comfy-Org/HiDream-O1-Image]
+    sources:
+      model: [Comfy-Org/HiDream-O1-Image/checkpoints]
+  ideogram4:
+    group: Ideogram
+    lora_group: ideogram4
+    prompt: json
+    names: ['ideogram[-_]?4(?!.*uncond)']
+    repos: [ideogram-ai/ideogram-4-fp8]
+    sources:
+      diffusion_model: [ideogram-ai/ideogram-4-fp8/transformer]
+      uncond_diffusion_model: [ideogram-ai/ideogram-4-fp8/unconditional_transformer]
+      llm: ['unsloth/Qwen3-VL-8B-Instruct-GGUF:Q4_K_M']
+      vae: [Comfy-Org/flux2-klein-4B/split_files/vae/flux2-vae.safetensors]
+  iris-3b:
+    group: Iris
+    lora_group: iris
+    names: ['\biris[-_]?3b']
+    repos: [speridlabs/iris-3b]
+    hint: Keep the prompt under about 300 tokens; longer ones are cut off.
+    note: Pixel-space model, so it has no VAE.
+    sources:
+      diffusion_model: [speridlabs/iris-3b/model.safetensors]
+      llm: ['Qwen/Qwen3-VL-4B-Instruct-GGUF:Q4_K_M']
+  krea2-raw:
+    group: Krea 2
+    lora_group: krea2
+    names: ['krea[-_]?2(?!.*turbo)']
+    repos: [krea/Krea-2-Raw, realrebelai/KREA-2_GGUFs]
+    sources:
+      diffusion_model: [realrebelai/KREA-2_GGUFs/BASE, krea/Krea-2-Raw]
+      llm: ['Qwen/Qwen3-VL-4B-Instruct-GGUF:Q4_K_M', Comfy-Org/Krea-2]
+      vae: [Comfy-Org/Wan_2.1_ComfyUI_repackaged/split_files/vae/wan_2.1_vae.safetensors]
+  krea2-turbo:
+    group: Krea 2
+    lora_group: krea2
+    names: ['krea[-_]?2.*turbo']
+    repos: [krea/Krea-2-Turbo]
+    sources:
+      diffusion_model: [realrebelai/KREA-2_GGUFs/TURBO, krea/Krea-2-Turbo]
+      llm: ['Qwen/Qwen3-VL-4B-Instruct-GGUF:Q4_K_M', Comfy-Org/Krea-2]
+      vae: [Comfy-Org/Wan_2.1_ComfyUI_repackaged/split_files/vae/wan_2.1_vae.safetensors]
+  lens:
+    group: Lens
+    lora_group: lens
+    names: ['\blens(?!.*turbo)']
+    sources:
+      diffusion_model: [Comfy-Org/Lens]
+      llm: ['unsloth/gpt-oss-20b-GGUF:Q4_K_M']
+      tokenizer: [openai/gpt-oss-20b/tokenizer.json]
+      vae: [Comfy-Org/flux2-klein-4B/split_files/vae/flux2-vae.safetensors]
+  lens-turbo:
+    group: Lens
+    lora_group: lens
+    names: ['\blens.*turbo']
+    sources:
+      diffusion_model: [Comfy-Org/Lens]
+      llm: ['unsloth/gpt-oss-20b-GGUF:Q4_K_M']
+      tokenizer: [openai/gpt-oss-20b/tokenizer.json]
+      vae: [Comfy-Org/flux2-klein-4B/split_files/vae/flux2-vae.safetensors]
+  llada-image:
+    group: LLaDA-Image
+    lora_group: llada-image
+    names: ['llada[-_]?image(?!.*turbo)']
+    repos: [inclusionAI/LLaDA-Image, fszontagh/LLaDA-Image-GGUF]
+    note: Use the text encoder and connectors made for this model; the Turbo ones don't fit.
+    sources:
+      diffusion_model: [fszontagh/LLaDA-Image-GGUF]
+      llm: [fszontagh/LLaDA-Image-GGUF]
+      embeddings_connectors: [fszontagh/LLaDA-Image-GGUF]
+      tokenizer: [inclusionAI/LLaDA-Image]
+      vae: [inclusionAI/LLaDA-Image/vae]
+  llada-image-turbo:
+    group: LLaDA-Image
+    lora_group: llada-image
+    names: ['llada[-_]?image.*turbo']
+    repos: [inclusionAI/LLaDA-Image-Turbo, fszontagh/LLaDA-Image-Turbo-GGUF]
+    note: Use the text encoder and connectors made for this model; the Base ones don't fit.
+    sources:
+      diffusion_model: [fszontagh/LLaDA-Image-Turbo-GGUF]
+      llm: [fszontagh/LLaDA-Image-Turbo-GGUF]
+      embeddings_connectors: [fszontagh/LLaDA-Image-Turbo-GGUF]
+      tokenizer: [inclusionAI/LLaDA-Image-Turbo]
+      vae: [inclusionAI/LLaDA-Image-Turbo/vae]
+  longcat-image:
+    group: LongCat-Image
+    lora_group: longcat-image
+    names: ['longcat(?!.*edit)']
+    repos: [meituan-longcat/LongCat-Image, Comfy-Org/LongCat-Image, vantagewithai/LongCat-Image-GGUF]
+    hint: Put any text the image should show in quotation marks.
+    sources:
+      diffusion_model: [Comfy-Org/LongCat-Image/split_files/diffusion_models,
+                        vantagewithai/LongCat-Image-GGUF]
+      llm: [Comfy-Org/Qwen-Image_ComfyUI/split_files/text_encoders/qwen_2.5_vl_7b.safetensors,
+            'mradermacher/Qwen2.5-VL-7B-Instruct-GGUF:Q4_K_M']
+      vae: [Comfy-Org/z_image_turbo/split_files/vae/ae.safetensors]
+  mage-flow:
+    group: Mage-Flow
+    lora_group: mage-flow
+    names: ['mage[-_]?flow(?!.*(turbo|edit))']
+    repos: [Comfy-Org/Mage-Flow]
+    sources:
+      diffusion_model: [Comfy-Org/Mage-Flow]
+      llm: ['Qwen/Qwen3-VL-4B-Instruct-GGUF:Q4_K_M', Comfy-Org/Krea-2]
+      vae: [Comfy-Org/Mage-Flow]
+  mage-flow-turbo:
+    group: Mage-Flow
+    lora_group: mage-flow
+    names: ['mage[-_]?flow.*turbo']
+    sources:
+      diffusion_model: [Comfy-Org/Mage-Flow]
+      llm: ['Qwen/Qwen3-VL-4B-Instruct-GGUF:Q4_K_M', Comfy-Org/Krea-2]
+      vae: [Comfy-Org/Mage-Flow]
+  ming-image:
+    group: Ming-Image
+    lora_group: ming-image
+    names: ['ming[-_]?image']
+    repos: [inclusionAI/Ming-Image-0.1-Design, Comfy-Org/Ming-Image]
+    rgba: '{prompt}, transparent background'
+    sources:
+      diffusion_model: [Comfy-Org/Ming-Image]
+      llm: [Comfy-Org/Ming-Image]
+      tokenizer: [inclusionAI/Ming-Image-0.1-Design/mllm/tokenizer.json]
+      vae: [Comfy-Org/Ming-Image]
+  minit2i:
+    group: MiniT2I
+    lora_group: minit2i
+    names: ['minit2i']
+    repos: [MiniT2I/MiniT2I]
+    note: Pixel-space model, so it has no VAE.
+    sources:
+      diffusion_model: [MiniT2I/MiniT2I/minit2i-b-16/transformer]
+      t5xxl: [google/flan-t5-large/model.safetensors]
+  moss-image-base:
+    group: MOSS-Image
+    lora_group: moss-image
+    names: ['moss[-_]?image(?!.*sft)']
+    repos: [OpenMOSS-Team/MOSS-Image-Base, leejet/MOSS-Image-Base-GGUF]
+    sources:
+      diffusion_model: [Comfy-Org/MOSS-Image, leejet/MOSS-Image-Base-GGUF]
+      llm: ['unsloth/Qwen3.5-9B-GGUF:Q4_K_M']
+      tokenizer: [OpenMOSS-Team/MOSS-Image-Base/tokenizer/tokenizer.json]
+      vae: [Comfy-Org/MOSS-Image, Comfy-Org/flux2-klein-4B/split_files/vae/flux2-vae.safetensors]
+  moss-image-sft:
+    group: MOSS-Image
+    lora_group: moss-image
+    names: ['moss[-_]?image.*sft']
+    repos: [OpenMOSS-Team/MOSS-Image-SFT, leejet/MOSS-Image-SFT-GGUF]
+    sources:
+      diffusion_model: [Comfy-Org/MOSS-Image, leejet/MOSS-Image-SFT-GGUF]
+      llm: ['unsloth/Qwen3.5-9B-GGUF:Q4_K_M']
+      tokenizer: [OpenMOSS-Team/MOSS-Image-Base/tokenizer/tokenizer.json]
+      vae: [Comfy-Org/MOSS-Image, Comfy-Org/flux2-klein-4B/split_files/vae/flux2-vae.safetensors]
+  ovis-image:
+    group: Ovis-Image
+    lora_group: ovis-image
+    names: ['ovis[-_]?image']
+    repos: [AIDC-AI/Ovis-Image-7B, Comfy-Org/Ovis-Image, leejet/Ovis-Image-7B-GGUF]
+    sources:
+      diffusion_model: [Comfy-Org/Ovis-Image/split_files/diffusion_models, leejet/Ovis-Image-7B-GGUF]
+      llm: [Comfy-Org/Ovis-Image/split_files/text_encoders]
+      vae: [Comfy-Org/z_image_turbo/split_files/vae/ae.safetensors]
+  p-h3-image:
+    group: P-H3-Image
+    lora_group: p-h3-image
+    names: ['p[-_]?h3[-_]?image']
+    repos: [PrunaAI/P-H3-Image, PrunaAI/P-H3-Image-Comfy]
+    sources:
+      diffusion_model: [PrunaAI/P-H3-Image-Comfy]
+      llm: [PrunaAI/P-H3-Image-Comfy]
+      embeddings_connectors: [PrunaAI/P-H3-Image/text_connector/diffusion_pytorch_model.safetensors]
+      vae: [PrunaAI/P-H3-Image-Comfy]
+  pixart-sigma:
+    group: PixArt
+    lora_group: pixart-sigma
+    names: ['pixart[-_]?sigma']
+    repos: [PixArt-alpha/PixArt-Sigma-XL-2-1024-MS]
+    sources:
+      diffusion_model: [PixArt-alpha/PixArt-Sigma-XL-2-1024-MS/transformer]
+      t5xxl: [PixArt-alpha/PixArt-Sigma-XL-2-1024-MS/text_encoder,
+              comfyanonymous/flux_text_encoders/t5xxl_fp16.safetensors]
+      vae: [PixArt-alpha/PixArt-Sigma-XL-2-1024-MS/vae]
+  pixart-alpha-1024:
+    group: PixArt
+    lora_group: pixart-alpha
+    names: ['pixart[-_]?(alpha|xl[-_]?2[-_]?1024)']
+    repos: [PixArt-alpha/PixArt-XL-2-1024-MS]
+    sources:
+      diffusion_model: [PixArt-alpha/PixArt-XL-2-1024-MS/transformer]
+      t5xxl: [PixArt-alpha/PixArt-XL-2-1024-MS/text_encoder,
+              comfyanonymous/flux_text_encoders/t5xxl_fp16.safetensors]
+      vae: [PixArt-alpha/PixArt-XL-2-1024-MS/vae]
+  pixart-alpha-512:
+    group: PixArt
+    lora_group: pixart-alpha
+    names: ['pixart.*512']
+    repos: [PixArt-alpha/PixArt-XL-2-512x512]
+  sefi-image:
+    group: SeFi-Image
+    lora_group: sefi-image
+    names: ['sefi']
+    note: >-
+      Its weights must be converted first with stable-diffusion.cpp's scripts/convert_sefi.py
+      (and the text encoder with scripts/convert_qwen3_vl.py).
+  sensenova-u15:
+    group: SenseNova
+    lora_group: sensenova
+    names: ['sensenova']
+    repos: [sensenova/SenseNova-U1.5-8B-MoT]
+    native: [2048, 2048]
+    note: >-
+      The model is a whole folder: download the repo and point the model at the folder
+      (it holds model.safetensors.index.json, its shards and the tokenizer).

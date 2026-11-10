@@ -129,7 +129,7 @@ class JobManager:
             alpha=spec.alpha,
             backend=spec.backend.name,
             model=spec.backend.model,
-            params_json={"requested": spec.requested, "n": spec.n},
+            params_json={"requested": spec.requested, "n": spec.n, **_card_of(spec.backend)},
             seed=spec.seed,
             status=JobStatus.QUEUED,
             queued_at=utcnow(),
@@ -274,7 +274,12 @@ class JobManager:
                     emit,
                     status=JobStatus.SUCCEEDED,
                     finished_at=utcnow(),
-                    params_json={"requested": spec.requested, "n": spec.n, "resolved": resolved},
+                    params_json={
+                        "requested": spec.requested,
+                        "n": spec.n,
+                        "resolved": resolved,
+                        **_card_of(spec.backend),
+                    },
                     progress_json=await self._final_progress(job_id),
                 )
                 log.info("job.succeeded", job_id=job_id, outputs=len(outputs))
@@ -387,3 +392,9 @@ class JobManager:
         except NotFoundError:  # conversation deleted under us
             return
         await emit(EventType.JOB_UPDATE, JobUpdateEventData(job=job))
+
+
+def _card_of(backend: ImageBackend) -> dict[str, Any]:
+    """The model card the backend runs, recorded with the job (the model library's usage)."""
+    card = getattr(backend, "model_card", None)
+    return {"model_card": card} if isinstance(card, str) and card else {}

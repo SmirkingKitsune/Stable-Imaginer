@@ -391,3 +391,53 @@ async def test_events_stream_download_progress(profile: Path) -> None:
                         break
     assert states[-1] == "succeeded"
     assert "running" in states
+
+
+# --- model cards ------------------------------------------------------------------------
+
+
+async def test_a_download_fills_a_model_cards_slot(client: httpx.AsyncClient, models: Path) -> None:
+    created = await client.post("/v1/models", json={"family": "qwen-image-21", "name": "Image 2"})
+    assert created.status_code == 201, created.text
+    card = created.json()["id"]
+    repo = (await client.get("/v1/hub/repo", params={"ref": IMAGE_REPO, "model": card})).json()
+    assert (repo["model"], repo["engine"]) == (card, None)
+    roles = {r["key"]: r for r in repo["roles"]}
+    assert set(roles) == {"diffusion_model", "llm", "llm_vision", "vae", "tae"}  # its family's
+    assert roles["diffusion_model"]["suggested"] == "image-2-Q4_K.gguf"
+    job = await _download(
+        client, repo=IMAGE_REPO, variant="image-2-Q4_K.gguf", model=card, key="diffusion_model"
+    )
+    target = models / "acme" / "Image-2-GGUF" / "image-2-Q4_K.gguf"
+    assert (job["state"], job["assign"]) == ("succeeded", [f"model:{card}.diffusion_model"])
+    detail = (await client.get(f"/v1/models/{card}")).json()
+    main = next(c for c in detail["components"] if c["slot"] == "diffusion_model")
+    assert main["path"] == str(target)
+    assert main["source"] == {"repo": IMAGE_REPO, "revision": SHA, "path": "image-2-Q4_K.gguf"}
+    again = (await client.get("/v1/hub/repo", params={"ref": IMAGE_REPO, "model": card})).json()
+    variant = next(v for v in again["variants"] if v["id"] == "image-2-Q4_K.gguf")
+    assert f"model:{card}.diffusion_model" in variant["local"]["in_use"]
+    wrong = await client.post(
+        "/v1/hub/downloads",
+        json={"repo": IMAGE_REPO, "variant": "image-2-Q4_K.gguf", "model": card, "key": "nope"},
+    )
+    assert wrong.status_code == 422
+
+
+async def test_an_engine_running_a_card_downloads_into_the_card(
+    client: httpx.AsyncClient, profile: Path
+) -> None:
+    card = (await client.post("/v1/models", json={"family": "qwen-image-21"})).json()["id"]
+    used = await client.post(f"/v1/models/{card}/use", json={"engine": "sd", "start": False})
+    assert used.status_code == 200, used.text
+    job = await _download(
+        client, repo=IMAGE_REPO, variant="image-2-Q4_K.gguf", engine="sd", key="diffusion_model"
+    )
+    assert job["assign"] == [f"model:{card}.diffusion_model"]
+    saved = yaml.safe_load(local_overrides_path(profile).read_text(encoding="utf-8"))
+    # The engine's own launch block is left alone: the file is the card's.
+    assert "diffusion_model" not in (saved["backends"]["sd"].get("launch") or {})
+    engine = (await client.get("/v1/engines/sd")).json()
+    assert (
+        next(f for f in engine["files"] if f["key"] == "diffusion_model")["path"] == job["target"]
+    )

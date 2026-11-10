@@ -9,9 +9,13 @@ from starlette.requests import Request
 from starlette.responses import JSONResponse, Response, StreamingResponse
 from starlette.routing import Route
 
+from imaginer.backends.llamacpp import LlamaCppBackend
 from imaginer.backends.openai_http.transport import HttpTransport
+from imaginer.backends.sdcpp import SdCppBackend
 from imaginer.core.config import RetryConfig, TimeoutConfig
+from imaginer.domain.enums import BackendStatus
 from imaginer.domain.errors import EngineError, EngineTimeoutError, EngineUnavailableError
+from tests.conftest import llama_config, sd_config
 from tests.fakes.live import LiveServer, refusing_client
 
 
@@ -81,6 +85,53 @@ def _transport(
         api_key=api_key,
         client=client,
     )
+
+
+@pytest.mark.parametrize("method", ["GET", "POST"])
+@pytest.mark.parametrize("payload", [b"<html>proxy error</html>", b'{"id":', b"\xff"])
+async def test_invalid_json_is_a_typed_engine_error(method: str, payload: bytes) -> None:
+    requests: list[httpx.Request] = []
+
+    def reply(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(200, content=payload)
+
+    transport = _transport(
+        "http://engine",
+        client=httpx.AsyncClient(base_url="http://engine", transport=httpx.MockTransport(reply)),
+    )
+    try:
+        with pytest.raises(EngineError, match="engine returned invalid JSON for /r") as caught:
+            if method == "GET":
+                await transport.get_json("/r")
+            else:
+                await transport.post_json("/r", {})
+        assert caught.value.status == 502 and caught.value.extra["backend"] == "engine"
+        assert len(requests) == 1  # never replay a potentially accepted submission
+    finally:
+        await transport.aclose()
+
+
+@pytest.mark.parametrize("kind", ["llama", "sd"])
+async def test_invalid_json_marks_backend_down(kind: str) -> None:
+    transport = _transport(
+        "http://engine",
+        client=httpx.AsyncClient(
+            base_url="http://engine",
+            transport=httpx.MockTransport(lambda _: httpx.Response(200, text="not JSON")),
+        ),
+    )
+    backend = (
+        LlamaCppBackend("engine", llama_config("http://engine"), transport=transport)
+        if kind == "llama"
+        else SdCppBackend("engine", sd_config("http://engine"), transport=transport)
+    )
+    try:
+        health = await backend.health()
+        assert health.status is BackendStatus.DOWN
+        assert "invalid JSON" in (health.detail or "")
+    finally:
+        await backend.aclose()
 
 
 @pytest.fixture

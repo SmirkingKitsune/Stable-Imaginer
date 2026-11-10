@@ -1,0 +1,3922 @@
+{
+ "source": "https://github.com/leejet/stable-diffusion.cpp/tree/fc350be2ceeeb859bcc201ac435591ed7d46821d/examples/server/recipes",
+ "commit": "fc350be2ceeeb859bcc201ac435591ed7d46821d",
+ "fetched": "2026-11-09",
+ "recipes": [
+  {
+   "schema_version": 1,
+   "id": "anima-edit",
+   "name": "Anima Edit (LoRA)",
+   "description": "Requires a matching community editing LoRA. Apply it after loading and supply reference images; uses the cosmos_reference preset.",
+   "model_url": "https://huggingface.co/circlestone-labs/Anima",
+   "slots": [
+    {
+     "id": "diffusion_model",
+     "required": true
+    },
+    {
+     "id": "llm",
+     "required": true,
+     "label": "Qwen 3 0.6B Base Text Encoder"
+    },
+    {
+     "id": "vae",
+     "required": false
+    },
+    {
+     "id": "tae",
+     "required": false
+    }
+   ],
+   "required_any": [
+    [
+     "vae",
+     "tae"
+    ]
+   ],
+   "defaults": {
+    "sampling_method": "euler",
+    "scheduler": "discrete",
+    "cfg_scale": 4,
+    "steps": 20,
+    "width": 1024,
+    "height": 1024
+   },
+   "features": [
+    "flow_shift",
+    "ref_images"
+   ]
+  },
+  {
+   "schema_version": 1,
+   "id": "anima",
+   "name": "Anima",
+   "description": "Supports all Anima variants supported by sd.cpp. Use a compatible Qwen Image VAE or TAE; adjust generation settings for distilled variants.",
+   "model_url": "https://huggingface.co/circlestone-labs/Anima",
+   "slots": [
+    {
+     "id": "diffusion_model",
+     "required": true
+    },
+    {
+     "id": "llm",
+     "required": true,
+     "label": "Qwen 3 0.6B Base Text Encoder"
+    },
+    {
+     "id": "vae",
+     "required": false
+    },
+    {
+     "id": "tae",
+     "required": false
+    }
+   ],
+   "required_any": [
+    [
+     "vae",
+     "tae"
+    ]
+   ],
+   "defaults": {
+    "sampling_method": "euler",
+    "cfg_scale": 4,
+    "steps": 20,
+    "width": 1024,
+    "height": 1024
+   },
+   "features": [
+    "flow_shift"
+   ]
+  },
+  {
+   "schema_version": 1,
+   "id": "boogu-image-edit",
+   "name": "Boogu Image Edit",
+   "description": "Supply reference images. The separate vision projector is needed only when it is not bundled in the text encoder.",
+   "model_url": "https://huggingface.co/Boogu/Boogu-Image-0.1-Edit",
+   "slots": [
+    {
+     "id": "diffusion_model",
+     "required": true
+    },
+    {
+     "id": "llm",
+     "required": true,
+     "label": "Qwen 3 VL 8B Text Encoder"
+    },
+    {
+     "id": "llm_vision",
+     "required": false,
+     "label": "Vision projector (required for separate GGUF text encoders)"
+    },
+    {
+     "id": "vae",
+     "required": false
+    },
+    {
+     "id": "tae",
+     "required": false
+    }
+   ],
+   "required_any": [
+    [
+     "vae",
+     "tae"
+    ]
+   ],
+   "defaults": {
+    "cfg_scale": 5,
+    "steps": 20,
+    "width": 1024,
+    "height": 1024,
+    "img_cfg_scale": 1,
+    "sampling_method": "euler"
+   },
+   "features": [
+    "flow_shift",
+    "img_cfg",
+    "ref_images"
+   ]
+  },
+  {
+   "schema_version": 1,
+   "id": "boogu-image",
+   "name": "Boogu Image Base",
+   "model_url": "https://huggingface.co/Boogu/Boogu-Image-0.1-Base",
+   "slots": [
+    {
+     "id": "diffusion_model",
+     "required": true
+    },
+    {
+     "id": "llm",
+     "required": true,
+     "label": "Qwen 3 VL 8B Text Encoder"
+    },
+    {
+     "id": "vae",
+     "required": false
+    },
+    {
+     "id": "tae",
+     "required": false
+    }
+   ],
+   "required_any": [
+    [
+     "vae",
+     "tae"
+    ]
+   ],
+   "defaults": {
+    "cfg_scale": 4,
+    "steps": 20,
+    "width": 1024,
+    "height": 1024,
+    "sampling_method": "euler"
+   },
+   "features": [
+    "flow_shift"
+   ]
+  },
+  {
+   "schema_version": 1,
+   "id": "chroma-radiance",
+   "name": "Chroma Radiance",
+   "size_multiple": 1,
+   "description": "Pixel-space generation without a VAE. Also accepts the x0 and experimental patch-32 variants.",
+   "model_url": "https://huggingface.co/lodestones/Chroma1-Radiance",
+   "slots": [
+    {
+     "id": "diffusion_model",
+     "required": true
+    },
+    {
+     "id": "t5xxl",
+     "required": true
+    }
+   ],
+   "defaults": {
+    "sampling_method": "euler",
+    "cfg_scale": 3.5,
+    "steps": 20,
+    "width": 1024,
+    "height": 1024
+   },
+   "features": [
+    "flow_shift",
+    "slg"
+   ],
+   "disabled_features": [
+    "preview",
+    "vae_tiling"
+   ]
+  },
+  {
+   "schema_version": 1,
+   "id": "chroma",
+   "name": "Chroma",
+   "model_url": "https://huggingface.co/lodestones/Chroma1-HD",
+   "slots": [
+    {
+     "id": "diffusion_model",
+     "required": true
+    },
+    {
+     "id": "t5xxl",
+     "required": true
+    },
+    {
+     "id": "vae",
+     "required": false
+    },
+    {
+     "id": "tae",
+     "required": false
+    }
+   ],
+   "required_any": [
+    [
+     "vae",
+     "tae"
+    ]
+   ],
+   "defaults": {
+    "sampling_method": "euler",
+    "cfg_scale": 3,
+    "steps": 20,
+    "width": 1024,
+    "height": 1024
+   },
+   "features": [
+    "flow_shift",
+    "slg"
+   ]
+  },
+  {
+   "schema_version": 1,
+   "id": "cosxl-edit",
+   "name": "CosXL Edit",
+   "size_multiple": 64,
+   "description": "Supply the image to edit as a reference image.",
+   "model_url": "https://huggingface.co/stabilityai/cosxl",
+   "slots": [
+    {
+     "id": "model",
+     "required": true
+    },
+    {
+     "id": "vae",
+     "required": false
+    },
+    {
+     "id": "tae",
+     "required": false
+    }
+   ],
+   "defaults": {
+    "img_cfg_scale": 1.5,
+    "sampling_method": "euler_a",
+    "scheduler": "karras"
+   },
+   "features": [
+    "cache_unet",
+    "clip_skip",
+    "img_cfg",
+    "ref_images",
+    "shifted_timestep"
+   ],
+   "disabled_features": [
+    "cache_dit"
+   ]
+  },
+  {
+   "schema_version": 1,
+   "id": "ernie-image-turbo",
+   "name": "ERNIE Image Turbo",
+   "size_multiple": 16,
+   "model_url": "https://huggingface.co/baidu/ERNIE-Image-Turbo",
+   "slots": [
+    {
+     "id": "diffusion_model",
+     "required": true
+    },
+    {
+     "id": "llm",
+     "required": true,
+     "label": "Ministral 3 3B Text Encoder"
+    },
+    {
+     "id": "vae",
+     "required": false
+    },
+    {
+     "id": "tae",
+     "required": false
+    }
+   ],
+   "required_any": [
+    [
+     "vae",
+     "tae"
+    ]
+   ],
+   "defaults": {
+    "cfg_scale": 1,
+    "steps": 8,
+    "width": 1024,
+    "height": 1024,
+    "sampling_method": "euler"
+   },
+   "features": [
+    "flow_shift"
+   ]
+  },
+  {
+   "schema_version": 1,
+   "id": "ernie-image",
+   "name": "ERNIE Image",
+   "size_multiple": 16,
+   "model_url": "https://huggingface.co/baidu/ERNIE-Image",
+   "slots": [
+    {
+     "id": "diffusion_model",
+     "required": true
+    },
+    {
+     "id": "llm",
+     "required": true,
+     "label": "Ministral 3 3B Text Encoder"
+    },
+    {
+     "id": "vae",
+     "required": false
+    },
+    {
+     "id": "tae",
+     "required": false
+    }
+   ],
+   "required_any": [
+    [
+     "vae",
+     "tae"
+    ]
+   ],
+   "defaults": {
+    "cfg_scale": 4,
+    "steps": 20,
+    "width": 1024,
+    "height": 1024,
+    "sampling_method": "euler"
+   },
+   "features": [
+    "flow_shift"
+   ]
+  },
+  {
+   "schema_version": 1,
+   "id": "fibo2-dev",
+   "name": "Fibo 2.0 Dev",
+   "size_multiple": 16,
+   "description": "Text-to-image generation and native reference-image editing. Select a separate vision projector for editing when it is not bundled in the text encoder.",
+   "model_url": "https://huggingface.co/briaai/Fibo-2.0-dev",
+   "slots": [
+    {
+     "id": "diffusion_model",
+     "required": true
+    },
+    {
+     "id": "llm",
+     "required": true,
+     "label": "Qwen 3 VL 4B Text Encoder"
+    },
+    {
+     "id": "llm_vision",
+     "required": false,
+     "label": "Vision projector (required for separate GGUF text encoders)"
+    },
+    {
+     "id": "vae",
+     "required": true,
+     "label": "FLUX.2 VAE"
+    }
+   ],
+   "defaults": {
+    "sampling_method": "euler",
+    "cfg_scale": 5,
+    "steps": 20,
+    "width": 1024,
+    "height": 1024
+   },
+   "features": [
+    "flow_shift",
+    "ref_images"
+   ]
+  },
+  {
+   "schema_version": 1,
+   "id": "fibo2-edit-turbo",
+   "name": "Fibo 2.0 Edit Turbo",
+   "size_multiple": 16,
+   "description": "Dedicated reference-image editing checkpoint; supply reference images. Select a separate vision projector when it is not bundled in the text encoder.",
+   "model_url": "https://huggingface.co/briaai/Fibo-2.0-edit-turbo",
+   "slots": [
+    {
+     "id": "diffusion_model",
+     "required": true
+    },
+    {
+     "id": "llm",
+     "required": true,
+     "label": "Qwen 3 VL 4B Text Encoder"
+    },
+    {
+     "id": "llm_vision",
+     "required": false,
+     "label": "Vision projector (required for separate GGUF text encoders)"
+    },
+    {
+     "id": "vae",
+     "required": true,
+     "label": "FLUX.2 VAE"
+    }
+   ],
+   "defaults": {
+    "sampling_method": "euler",
+    "cfg_scale": 1,
+    "steps": 4,
+    "width": 1024,
+    "height": 1024
+   },
+   "features": [
+    "flow_shift",
+    "ref_images"
+   ]
+  },
+  {
+   "schema_version": 1,
+   "id": "flex2",
+   "name": "Flex.2 Preview",
+   "model_url": "https://huggingface.co/ostris/Flex.2-preview",
+   "slots": [
+    {
+     "id": "diffusion_model",
+     "required": true
+    },
+    {
+     "id": "clip_l",
+     "required": true
+    },
+    {
+     "id": "t5xxl",
+     "required": true
+    },
+    {
+     "id": "vae",
+     "required": false
+    },
+    {
+     "id": "tae",
+     "required": false
+    }
+   ],
+   "required_any": [
+    [
+     "vae",
+     "tae"
+    ]
+   ],
+   "defaults": {
+    "sampling_method": "euler",
+    "cfg_scale": 1,
+    "steps": 20,
+    "width": 1024,
+    "height": 1024,
+    "distilled_guidance": 3.5
+   },
+   "features": [
+    "clip_skip",
+    "distilled_guidance",
+    "flow_shift",
+    "slg"
+   ]
+  },
+  {
+   "schema_version": 1,
+   "id": "flux1-canny",
+   "name": "FLUX.1 Canny dev",
+   "description": "Select Canny weights and supply a precomputed edge map as Control Image. Edge detection is not performed by this recipe.",
+   "model_url": "https://huggingface.co/black-forest-labs/FLUX.1-Canny-dev",
+   "slots": [
+    {
+     "id": "diffusion_model",
+     "required": true
+    },
+    {
+     "id": "clip_l",
+     "required": true
+    },
+    {
+     "id": "t5xxl",
+     "required": true
+    },
+    {
+     "id": "vae",
+     "required": false
+    },
+    {
+     "id": "tae",
+     "required": false
+    }
+   ],
+   "required_any": [
+    [
+     "vae",
+     "tae"
+    ]
+   ],
+   "defaults": {
+    "sampling_method": "euler",
+    "cfg_scale": 1,
+    "steps": 20,
+    "width": 1024,
+    "height": 1024,
+    "distilled_guidance": 30
+   },
+   "features": [
+    "clip_skip",
+    "distilled_guidance",
+    "flow_shift",
+    "slg",
+    "control_image"
+   ],
+   "disabled_features": [
+    "mask_image"
+   ]
+  },
+  {
+   "schema_version": 1,
+   "id": "flux1-depth",
+   "name": "FLUX.1 Depth dev",
+   "description": "Select Depth weights and supply a precomputed depth map as Control Image. Depth estimation is not performed by this recipe.",
+   "model_url": "https://huggingface.co/black-forest-labs/FLUX.1-Depth-dev",
+   "slots": [
+    {
+     "id": "diffusion_model",
+     "required": true
+    },
+    {
+     "id": "clip_l",
+     "required": true
+    },
+    {
+     "id": "t5xxl",
+     "required": true
+    },
+    {
+     "id": "vae",
+     "required": false
+    },
+    {
+     "id": "tae",
+     "required": false
+    }
+   ],
+   "required_any": [
+    [
+     "vae",
+     "tae"
+    ]
+   ],
+   "defaults": {
+    "sampling_method": "euler",
+    "distilled_guidance": 10,
+    "scheduler": "flux",
+    "cfg_scale": 1,
+    "steps": 20,
+    "width": 1024,
+    "height": 1024
+   },
+   "features": [
+    "clip_skip",
+    "distilled_guidance",
+    "flow_shift",
+    "slg",
+    "control_image"
+   ],
+   "disabled_features": [
+    "mask_image"
+   ]
+  },
+  {
+   "schema_version": 1,
+   "id": "flux1-dev",
+   "name": "FLUX.1 dev",
+   "description": "Supports FLUX.1 dev and compatible layer-count variants such as FLUX.1 Lite. Select the transformer with matching CLIP-L, T5XXL and FLUX.1 VAE.",
+   "model_url": "https://huggingface.co/black-forest-labs/FLUX.1-dev",
+   "slots": [
+    {
+     "id": "diffusion_model",
+     "required": true
+    },
+    {
+     "id": "clip_l",
+     "required": true
+    },
+    {
+     "id": "t5xxl",
+     "required": true
+    },
+    {
+     "id": "vae",
+     "required": false
+    },
+    {
+     "id": "tae",
+     "required": false
+    }
+   ],
+   "required_any": [
+    [
+     "vae",
+     "tae"
+    ]
+   ],
+   "defaults": {
+    "sampling_method": "euler",
+    "cfg_scale": 1,
+    "steps": 20,
+    "width": 1024,
+    "height": 1024,
+    "distilled_guidance": 3.5
+   },
+   "features": [
+    "clip_skip",
+    "distilled_guidance",
+    "flow_shift",
+    "slg"
+   ]
+  },
+  {
+   "schema_version": 1,
+   "id": "flux1-fill",
+   "name": "FLUX.1 Fill dev",
+   "description": "Select Fill weights and supply Init Image plus Mask Image for inpainting. Denoising strength defaults to 1 for a full denoising schedule.",
+   "model_url": "https://huggingface.co/black-forest-labs/FLUX.1-Fill-dev",
+   "slots": [
+    {
+     "id": "diffusion_model",
+     "required": true
+    },
+    {
+     "id": "clip_l",
+     "required": true
+    },
+    {
+     "id": "t5xxl",
+     "required": true
+    },
+    {
+     "id": "vae",
+     "required": false
+    },
+    {
+     "id": "tae",
+     "required": false
+    }
+   ],
+   "required_any": [
+    [
+     "vae",
+     "tae"
+    ]
+   ],
+   "defaults": {
+    "sampling_method": "euler",
+    "distilled_guidance": 30,
+    "strength": 1.0,
+    "scheduler": "flux",
+    "cfg_scale": 1,
+    "steps": 20,
+    "width": 1024,
+    "height": 1024
+   },
+   "features": [
+    "clip_skip",
+    "distilled_guidance",
+    "flow_shift",
+    "slg",
+    "img_cfg"
+   ]
+  },
+  {
+   "schema_version": 1,
+   "id": "flux1-kontext",
+   "name": "FLUX.1 Kontext dev",
+   "description": "Select FLUX.1 Kontext weights. Supports text-to-image and native reference-image editing; an editing LoRA is not required.",
+   "model_url": "https://huggingface.co/black-forest-labs/FLUX.1-Kontext-dev",
+   "slots": [
+    {
+     "id": "diffusion_model",
+     "required": true
+    },
+    {
+     "id": "clip_l",
+     "required": true
+    },
+    {
+     "id": "t5xxl",
+     "required": true
+    },
+    {
+     "id": "vae",
+     "required": false
+    },
+    {
+     "id": "tae",
+     "required": false
+    }
+   ],
+   "required_any": [
+    [
+     "vae",
+     "tae"
+    ]
+   ],
+   "defaults": {
+    "sampling_method": "euler",
+    "cfg_scale": 1,
+    "steps": 20,
+    "distilled_guidance": 2.5
+   },
+   "features": [
+    "clip_skip",
+    "distilled_guidance",
+    "flow_shift",
+    "img_cfg",
+    "ref_images",
+    "slg"
+   ]
+  },
+  {
+   "schema_version": 1,
+   "id": "flux1-pulid",
+   "name": "FLUX.1 dev PuLID",
+   "description": "Supply a precomputed PuLID identity embedding with the generation request.",
+   "model_url": "https://huggingface.co/guozinan/PuLID",
+   "slots": [
+    {
+     "id": "diffusion_model",
+     "required": true
+    },
+    {
+     "id": "clip_l",
+     "required": true
+    },
+    {
+     "id": "t5xxl",
+     "required": true
+    },
+    {
+     "id": "pulid_weights",
+     "required": true
+    },
+    {
+     "id": "vae",
+     "required": false
+    },
+    {
+     "id": "tae",
+     "required": false
+    }
+   ],
+   "required_any": [
+    [
+     "vae",
+     "tae"
+    ]
+   ],
+   "defaults": {
+    "sampling_method": "euler",
+    "cfg_scale": 1,
+    "steps": 20,
+    "width": 1024,
+    "height": 1024,
+    "distilled_guidance": 3.5
+   },
+   "features": [
+    "clip_skip",
+    "distilled_guidance",
+    "flow_shift",
+    "slg"
+   ],
+   "disabled_features": [
+    "slg"
+   ]
+  },
+  {
+   "schema_version": 1,
+   "id": "flux1-schnell",
+   "name": "FLUX.1 schnell",
+   "model_url": "https://huggingface.co/black-forest-labs/FLUX.1-schnell",
+   "slots": [
+    {
+     "id": "diffusion_model",
+     "required": true
+    },
+    {
+     "id": "clip_l",
+     "required": true
+    },
+    {
+     "id": "t5xxl",
+     "required": true
+    },
+    {
+     "id": "vae",
+     "required": false
+    },
+    {
+     "id": "tae",
+     "required": false
+    }
+   ],
+   "required_any": [
+    [
+     "vae",
+     "tae"
+    ]
+   ],
+   "defaults": {
+    "sampling_method": "euler",
+    "cfg_scale": 1,
+    "steps": 4,
+    "width": 1024,
+    "height": 1024
+   },
+   "features": [
+    "clip_skip",
+    "flow_shift",
+    "slg"
+   ]
+  },
+  {
+   "schema_version": 1,
+   "id": "flux2-dev",
+   "name": "FLUX.2 dev",
+   "size_multiple": 16,
+   "description": "Supports text-to-image and reference-image editing.",
+   "model_url": "https://huggingface.co/black-forest-labs/FLUX.2-dev",
+   "slots": [
+    {
+     "id": "diffusion_model",
+     "required": true
+    },
+    {
+     "id": "llm",
+     "required": true,
+     "label": "Mistral Small 3.2 24B Text Encoder"
+    },
+    {
+     "id": "vae",
+     "required": false
+    },
+    {
+     "id": "tae",
+     "required": false
+    }
+   ],
+   "required_any": [
+    [
+     "vae",
+     "tae"
+    ]
+   ],
+   "defaults": {
+    "distilled_guidance": 4,
+    "sampling_method": "euler",
+    "cfg_scale": 1,
+    "steps": 20,
+    "width": 1024,
+    "height": 1024
+   },
+   "features": [
+    "distilled_guidance",
+    "flow_shift",
+    "img_cfg",
+    "ref_images",
+    "slg"
+   ]
+  },
+  {
+   "schema_version": 1,
+   "id": "flux2-klein-4b",
+   "name": "FLUX.2 Klein 4B",
+   "size_multiple": 16,
+   "description": "Supports reference-image editing. The FLUX.2 small decoder is an alternative VAE.",
+   "model_url": "https://huggingface.co/black-forest-labs/FLUX.2-klein-4B",
+   "slots": [
+    {
+     "id": "diffusion_model",
+     "required": true
+    },
+    {
+     "id": "llm",
+     "required": true,
+     "label": "Qwen 3 4B Text Encoder"
+    },
+    {
+     "id": "vae",
+     "required": false
+    },
+    {
+     "id": "tae",
+     "required": false
+    }
+   ],
+   "required_any": [
+    [
+     "vae",
+     "tae"
+    ]
+   ],
+   "defaults": {
+    "cfg_scale": 1,
+    "steps": 4,
+    "width": 1024,
+    "height": 1024,
+    "sampling_method": "euler"
+   },
+   "features": [
+    "flow_shift",
+    "img_cfg",
+    "ref_images",
+    "slg"
+   ]
+  },
+  {
+   "schema_version": 1,
+   "id": "flux2-klein-9b",
+   "name": "FLUX.2 Klein 9B",
+   "size_multiple": 16,
+   "description": "Supports text-to-image and reference-image editing.",
+   "model_url": "https://huggingface.co/black-forest-labs/FLUX.2-klein-9B",
+   "slots": [
+    {
+     "id": "diffusion_model",
+     "required": true
+    },
+    {
+     "id": "llm",
+     "required": true,
+     "label": "Qwen 3 8B Text Encoder"
+    },
+    {
+     "id": "vae",
+     "required": false
+    },
+    {
+     "id": "tae",
+     "required": false
+    }
+   ],
+   "required_any": [
+    [
+     "vae",
+     "tae"
+    ]
+   ],
+   "defaults": {
+    "cfg_scale": 1,
+    "steps": 4,
+    "width": 1024,
+    "height": 1024,
+    "sampling_method": "euler"
+   },
+   "features": [
+    "flow_shift",
+    "img_cfg",
+    "ref_images",
+    "slg"
+   ]
+  },
+  {
+   "schema_version": 1,
+   "id": "flux2-klein-base-4b",
+   "name": "FLUX.2 Klein Base 4B",
+   "size_multiple": 16,
+   "description": "Supports text-to-image and reference-image editing.",
+   "model_url": "https://huggingface.co/black-forest-labs/FLUX.2-klein-base-4B",
+   "slots": [
+    {
+     "id": "diffusion_model",
+     "required": true
+    },
+    {
+     "id": "llm",
+     "required": true,
+     "label": "Qwen 3 4B Text Encoder"
+    },
+    {
+     "id": "vae",
+     "required": false
+    },
+    {
+     "id": "tae",
+     "required": false
+    }
+   ],
+   "required_any": [
+    [
+     "vae",
+     "tae"
+    ]
+   ],
+   "defaults": {
+    "sampling_method": "euler",
+    "cfg_scale": 4,
+    "steps": 20,
+    "width": 1024,
+    "height": 1024
+   },
+   "features": [
+    "flow_shift",
+    "img_cfg",
+    "ref_images",
+    "slg"
+   ]
+  },
+  {
+   "schema_version": 1,
+   "id": "flux2-klein-base-9b",
+   "name": "FLUX.2 Klein Base 9B",
+   "size_multiple": 16,
+   "description": "Use the 9B base transformer with Qwen 3 8B. Supports reference-image editing.",
+   "model_url": "https://huggingface.co/black-forest-labs/FLUX.2-klein-base-9B",
+   "slots": [
+    {
+     "id": "diffusion_model",
+     "required": true
+    },
+    {
+     "id": "llm",
+     "required": true,
+     "label": "Qwen 3 8B Text Encoder"
+    },
+    {
+     "id": "vae",
+     "required": false
+    },
+    {
+     "id": "tae",
+     "required": false
+    }
+   ],
+   "required_any": [
+    [
+     "vae",
+     "tae"
+    ]
+   ],
+   "defaults": {
+    "cfg_scale": 4,
+    "steps": 20,
+    "width": 1024,
+    "height": 1024,
+    "sampling_method": "euler"
+   },
+   "features": [
+    "flow_shift",
+    "img_cfg",
+    "ref_images",
+    "slg"
+   ]
+  },
+  {
+   "schema_version": 1,
+   "id": "flux3-klein-base",
+   "name": "FLUX.3 Image Klein Base",
+   "size_multiple": 16,
+   "model_url": "https://huggingface.co/black-forest-labs/flux-3-image-klein-base",
+   "slots": [
+    {
+     "id": "diffusion_model",
+     "required": true
+    },
+    {
+     "id": "llm",
+     "required": true,
+     "label": "Qwen 3 VL 4B Text Encoder"
+    },
+    {
+     "id": "vae",
+     "required": false
+    },
+    {
+     "id": "tae",
+     "required": false
+    }
+   ],
+   "required_any": [
+    [
+     "vae",
+     "tae"
+    ]
+   ],
+   "defaults": {
+    "sampling_method": "euler",
+    "cfg_scale": 4,
+    "steps": 20,
+    "width": 1024,
+    "height": 1024
+   },
+   "features": [
+    "flow_shift",
+    "ref_images"
+   ]
+  },
+  {
+   "schema_version": 1,
+   "id": "flux3-klein",
+   "name": "FLUX.3 Image Klein",
+   "size_multiple": 16,
+   "description": "Supports text-to-image and reference-image editing.",
+   "model_url": "https://huggingface.co/black-forest-labs/flux-3-image-klein",
+   "slots": [
+    {
+     "id": "diffusion_model",
+     "required": true
+    },
+    {
+     "id": "llm",
+     "required": true,
+     "label": "Qwen 3 VL 4B Text Encoder"
+    },
+    {
+     "id": "vae",
+     "required": false
+    },
+    {
+     "id": "tae",
+     "required": false
+    }
+   ],
+   "required_any": [
+    [
+     "vae",
+     "tae"
+    ]
+   ],
+   "defaults": {
+    "sampling_method": "euler",
+    "cfg_scale": 1,
+    "steps": 16,
+    "width": 1024,
+    "height": 1024
+   },
+   "features": [
+    "flow_shift",
+    "ref_images"
+   ]
+  },
+  {
+   "schema_version": 1,
+   "id": "hidream-o1-dev",
+   "name": "HiDream O1 Image dev",
+   "size_multiple": 1,
+   "description": "Bundled checkpoint; also supports reference-image editing.",
+   "model_url": "https://huggingface.co/HiDream-ai/HiDream-O1-Image-Dev",
+   "slots": [
+    {
+     "id": "model",
+     "required": true
+    }
+   ],
+   "defaults": {
+    "cfg_scale": 1,
+    "steps": 20,
+    "width": 1024,
+    "height": 1024,
+    "sampling_method": "euler"
+   },
+   "features": [
+    "flow_shift",
+    "ref_images"
+   ]
+  },
+  {
+   "schema_version": 1,
+   "id": "ideogram4",
+   "name": "Ideogram 4",
+   "size_multiple": 16,
+   "description": "Select the matching unconditional transformer for classifier-free guidance.",
+   "model_url": "https://huggingface.co/ideogram-ai/ideogram-4-fp8",
+   "slots": [
+    {
+     "id": "diffusion_model",
+     "required": true
+    },
+    {
+     "id": "uncond_diffusion_model",
+     "required": true
+    },
+    {
+     "id": "llm",
+     "required": true,
+     "label": "Qwen 3 VL 8B Text Encoder"
+    },
+    {
+     "id": "vae",
+     "required": false
+    },
+    {
+     "id": "tae",
+     "required": false
+    }
+   ],
+   "required_any": [
+    [
+     "vae",
+     "tae"
+    ]
+   ],
+   "defaults": {
+    "cfg_scale": 7,
+    "steps": 20,
+    "width": 1024,
+    "height": 1024,
+    "sampling_method": "euler"
+   },
+   "features": [
+    "flow_shift"
+   ]
+  },
+  {
+   "schema_version": 1,
+   "id": "instruct-pix2pix",
+   "name": "Instruct-Pix2Pix",
+   "size_multiple": 64,
+   "description": "Supply the image to edit as a reference image.",
+   "model_url": "https://huggingface.co/timbrooks/instruct-pix2pix",
+   "slots": [
+    {
+     "id": "model",
+     "required": true
+    },
+    {
+     "id": "vae",
+     "required": false
+    },
+    {
+     "id": "tae",
+     "required": false
+    }
+   ],
+   "defaults": {
+    "img_cfg_scale": 1,
+    "sampling_method": "euler_a",
+    "scheduler": "karras",
+    "steps": 10
+   },
+   "features": [
+    "cache_unet",
+    "clip_skip",
+    "img_cfg",
+    "ref_images"
+   ],
+   "disabled_features": [
+    "cache_dit"
+   ]
+  },
+  {
+   "schema_version": 1,
+   "id": "iris-3b",
+   "name": "Iris 3B",
+   "size_multiple": 16,
+   "description": "Pixel-space model; no VAE is required.",
+   "model_url": "https://huggingface.co/speridlabs/iris-3b",
+   "slots": [
+    {
+     "id": "diffusion_model",
+     "required": true
+    },
+    {
+     "id": "llm",
+     "required": true,
+     "label": "Qwen 3 VL 4B Text Encoder"
+    }
+   ],
+   "defaults": {
+    "cfg_scale": 3,
+    "steps": 20,
+    "width": 1024,
+    "height": 1024,
+    "sampling_method": "euler"
+   },
+   "features": [
+    "flow_shift"
+   ],
+   "disabled_features": [
+    "preview",
+    "vae_tiling"
+   ]
+  },
+  {
+   "schema_version": 1,
+   "id": "krea2-raw-edit",
+   "name": "Krea 2 Raw Edit (LoRA)",
+   "description": "Requires a matching Ostris-compatible community editing LoRA. Apply it after loading and supply reference images; uses the krea2_ostris_edit preset. Select a separate vision projector when it is not bundled in the text encoder.",
+   "model_url": "https://huggingface.co/krea/Krea-2-Raw",
+   "slots": [
+    {
+     "id": "diffusion_model",
+     "required": true
+    },
+    {
+     "id": "llm",
+     "required": true,
+     "label": "Qwen 3 VL 4B Text Encoder"
+    },
+    {
+     "id": "llm_vision",
+     "required": false,
+     "label": "Vision projector (required for separate GGUF text encoders)"
+    },
+    {
+     "id": "vae",
+     "required": false
+    },
+    {
+     "id": "tae",
+     "required": false
+    }
+   ],
+   "required_any": [
+    [
+     "vae",
+     "tae"
+    ]
+   ],
+   "defaults": {
+    "scheduler": "discrete",
+    "sampling_method": "euler",
+    "cfg_scale": 3.5,
+    "steps": 20,
+    "width": 1024,
+    "height": 1024
+   },
+   "features": [
+    "flow_shift",
+    "ref_images"
+   ]
+  },
+  {
+   "schema_version": 1,
+   "id": "krea2-raw",
+   "name": "Krea 2 Raw",
+   "description": "For reference-image editing with a community LoRA, use the corresponding Krea 2 Edit recipe.",
+   "model_url": "https://huggingface.co/krea/Krea-2-Raw",
+   "slots": [
+    {
+     "id": "diffusion_model",
+     "required": true
+    },
+    {
+     "id": "llm",
+     "required": true,
+     "label": "Qwen 3 VL 4B Text Encoder"
+    },
+    {
+     "id": "vae",
+     "required": false
+    },
+    {
+     "id": "tae",
+     "required": false
+    }
+   ],
+   "required_any": [
+    [
+     "vae",
+     "tae"
+    ]
+   ],
+   "defaults": {
+    "cfg_scale": 3.5,
+    "steps": 20,
+    "width": 1024,
+    "height": 1024,
+    "sampling_method": "euler"
+   },
+   "features": [
+    "flow_shift"
+   ]
+  },
+  {
+   "schema_version": 1,
+   "id": "krea2-turbo-edit",
+   "name": "Krea 2 Turbo Edit (LoRA)",
+   "description": "Requires a matching Ostris-compatible community editing LoRA. Apply it after loading and supply reference images; uses the krea2_ostris_edit preset. Select a separate vision projector when it is not bundled in the text encoder.",
+   "model_url": "https://huggingface.co/krea/Krea-2-Turbo",
+   "slots": [
+    {
+     "id": "diffusion_model",
+     "required": true
+    },
+    {
+     "id": "llm",
+     "required": true,
+     "label": "Qwen 3 VL 4B Text Encoder"
+    },
+    {
+     "id": "llm_vision",
+     "required": false,
+     "label": "Vision projector (required for separate GGUF text encoders)"
+    },
+    {
+     "id": "vae",
+     "required": false
+    },
+    {
+     "id": "tae",
+     "required": false
+    }
+   ],
+   "required_any": [
+    [
+     "vae",
+     "tae"
+    ]
+   ],
+   "defaults": {
+    "scheduler": "discrete",
+    "sampling_method": "euler",
+    "cfg_scale": 1,
+    "steps": 8,
+    "width": 1024,
+    "height": 1024
+   },
+   "features": [
+    "flow_shift",
+    "ref_images"
+   ]
+  },
+  {
+   "schema_version": 1,
+   "id": "krea2-turbo",
+   "name": "Krea 2 Turbo",
+   "description": "For reference-image editing with a community LoRA, use the corresponding Krea 2 Edit recipe.",
+   "model_url": "https://huggingface.co/krea/Krea-2-Turbo",
+   "slots": [
+    {
+     "id": "diffusion_model",
+     "required": true
+    },
+    {
+     "id": "llm",
+     "required": true,
+     "label": "Qwen 3 VL 4B Text Encoder"
+    },
+    {
+     "id": "vae",
+     "required": false
+    },
+    {
+     "id": "tae",
+     "required": false
+    }
+   ],
+   "required_any": [
+    [
+     "vae",
+     "tae"
+    ]
+   ],
+   "defaults": {
+    "cfg_scale": 1,
+    "steps": 8,
+    "width": 1024,
+    "height": 1024,
+    "sampling_method": "euler"
+   },
+   "features": [
+    "flow_shift"
+   ]
+  },
+  {
+   "schema_version": 1,
+   "id": "lens-turbo",
+   "name": "LENS Turbo",
+   "size_multiple": 16,
+   "model_url": "https://huggingface.co/microsoft/Lens-Turbo",
+   "slots": [
+    {
+     "id": "diffusion_model",
+     "required": true
+    },
+    {
+     "id": "llm",
+     "required": true,
+     "label": "GPT-OSS 20B Text Encoder"
+    },
+    {
+     "id": "tokenizer",
+     "required": true,
+     "label": "GPT-OSS tokenizer.json"
+    },
+    {
+     "id": "vae",
+     "required": false
+    },
+    {
+     "id": "tae",
+     "required": false
+    }
+   ],
+   "required_any": [
+    [
+     "vae",
+     "tae"
+    ]
+   ],
+   "defaults": {
+    "cfg_scale": 1,
+    "steps": 4,
+    "width": 1024,
+    "height": 1024,
+    "sampling_method": "euler"
+   },
+   "features": [
+    "flow_shift"
+   ]
+  },
+  {
+   "schema_version": 1,
+   "id": "lens",
+   "name": "LENS",
+   "size_multiple": 16,
+   "model_url": "https://huggingface.co/microsoft/Lens",
+   "slots": [
+    {
+     "id": "diffusion_model",
+     "required": true
+    },
+    {
+     "id": "llm",
+     "required": true,
+     "label": "GPT-OSS 20B Text Encoder"
+    },
+    {
+     "id": "tokenizer",
+     "required": true,
+     "label": "GPT-OSS tokenizer.json"
+    },
+    {
+     "id": "vae",
+     "required": false
+    },
+    {
+     "id": "tae",
+     "required": false
+    }
+   ],
+   "required_any": [
+    [
+     "vae",
+     "tae"
+    ]
+   ],
+   "defaults": {
+    "cfg_scale": 5,
+    "steps": 20,
+    "width": 1024,
+    "height": 1024,
+    "sampling_method": "euler"
+   },
+   "features": [
+    "flow_shift"
+   ]
+  },
+  {
+   "schema_version": 1,
+   "id": "llada-image-turbo",
+   "name": "LLaDA Image Turbo",
+   "size_multiple": 16,
+   "description": "Use matching turbo text encoder and connectors. Editing needs connectors that include the SigVQ encoder.",
+   "model_url": "https://huggingface.co/inclusionAI/LLaDA-Image-Turbo",
+   "slots": [
+    {
+     "id": "diffusion_model",
+     "required": true
+    },
+    {
+     "id": "llm",
+     "required": true,
+     "label": "LLaDA-Image Text Encoder"
+    },
+    {
+     "id": "tokenizer",
+     "required": true,
+     "label": "LLaDA tokenizer.json"
+    },
+    {
+     "id": "embeddings_connectors",
+     "required": true,
+     "label": "LLaDA Turbo Connectors"
+    },
+    {
+     "id": "vae",
+     "required": false
+    },
+    {
+     "id": "tae",
+     "required": false
+    }
+   ],
+   "required_any": [
+    [
+     "vae",
+     "tae"
+    ]
+   ],
+   "defaults": {
+    "cfg_scale": 1,
+    "steps": 4,
+    "width": 1024,
+    "height": 1024,
+    "sampling_method": "euler"
+   },
+   "features": [
+    "ref_images"
+   ]
+  },
+  {
+   "schema_version": 1,
+   "id": "llada-image",
+   "name": "LLaDA Image (base)",
+   "size_multiple": 16,
+   "description": "Use matching base transformer, text encoder and connectors; do not mix them with Turbo components. Editing needs connectors with SigVQ and 1024x1024 output.",
+   "model_url": "https://huggingface.co/inclusionAI/LLaDA-Image",
+   "slots": [
+    {
+     "id": "diffusion_model",
+     "required": true
+    },
+    {
+     "id": "llm",
+     "required": true,
+     "label": "LLaDA-Image Base Text Encoder"
+    },
+    {
+     "id": "tokenizer",
+     "required": true,
+     "label": "LLaDA tokenizer.json"
+    },
+    {
+     "id": "embeddings_connectors",
+     "required": true,
+     "label": "LLaDA Base Connectors"
+    },
+    {
+     "id": "vae",
+     "required": false
+    },
+    {
+     "id": "tae",
+     "required": false
+    }
+   ],
+   "required_any": [
+    [
+     "vae",
+     "tae"
+    ]
+   ],
+   "defaults": {
+    "sampling_method": "euler",
+    "scheduler": "llada_image",
+    "cfg_scale": 5,
+    "steps": 20,
+    "width": 1024,
+    "height": 1024
+   },
+   "features": [
+    "ref_images"
+   ]
+  },
+  {
+   "schema_version": 1,
+   "id": "longcat-image-edit",
+   "name": "LongCat Image Edit",
+   "description": "Supply reference images for editing.",
+   "model_url": "https://huggingface.co/meituan-longcat/LongCat-Image-Edit",
+   "slots": [
+    {
+     "id": "diffusion_model",
+     "required": true
+    },
+    {
+     "id": "llm",
+     "required": true,
+     "label": "Qwen 2.5 VL 7B Text Encoder"
+    },
+    {
+     "id": "vae",
+     "required": false
+    },
+    {
+     "id": "tae",
+     "required": false
+    }
+   ],
+   "required_any": [
+    [
+     "vae",
+     "tae"
+    ]
+   ],
+   "defaults": {
+    "cfg_scale": 4.5,
+    "steps": 20,
+    "sampling_method": "euler"
+   },
+   "features": [
+    "flow_shift",
+    "img_cfg",
+    "ref_images",
+    "slg"
+   ]
+  },
+  {
+   "schema_version": 1,
+   "id": "longcat-image",
+   "name": "LongCat Image",
+   "model_url": "https://huggingface.co/meituan-longcat/LongCat-Image",
+   "slots": [
+    {
+     "id": "diffusion_model",
+     "required": true
+    },
+    {
+     "id": "llm",
+     "required": true,
+     "label": "Qwen 2.5 VL 7B Text Encoder"
+    },
+    {
+     "id": "vae",
+     "required": false
+    },
+    {
+     "id": "tae",
+     "required": false
+    }
+   ],
+   "required_any": [
+    [
+     "vae",
+     "tae"
+    ]
+   ],
+   "defaults": {
+    "cfg_scale": 4,
+    "steps": 20,
+    "width": 1344,
+    "height": 768,
+    "sampling_method": "euler"
+   },
+   "features": [
+    "flow_shift",
+    "slg"
+   ]
+  },
+  {
+   "schema_version": 1,
+   "id": "mage-flow-edit",
+   "name": "Mage Flow Edit",
+   "size_multiple": 16,
+   "description": "Supply reference images. Select a separate vision projector when it is not bundled in the text encoder.",
+   "model_url": "https://huggingface.co/microsoft/Mage-Flow-Edit",
+   "slots": [
+    {
+     "id": "diffusion_model",
+     "required": true
+    },
+    {
+     "id": "llm",
+     "required": true,
+     "label": "Qwen 3 VL 4B Text Encoder"
+    },
+    {
+     "id": "vae",
+     "required": true
+    },
+    {
+     "id": "llm_vision",
+     "required": false,
+     "label": "Vision projector (required for separate GGUF text encoders)"
+    }
+   ],
+   "defaults": {
+    "sampling_method": "euler",
+    "cfg_scale": 5,
+    "steps": 20,
+    "width": 1024,
+    "height": 1024
+   },
+   "features": [
+    "flow_shift",
+    "img_cfg",
+    "ref_images"
+   ]
+  },
+  {
+   "schema_version": 1,
+   "id": "mage-flow-turbo",
+   "name": "Mage Flow Turbo",
+   "size_multiple": 16,
+   "model_url": "https://huggingface.co/microsoft/Mage-Flow-Turbo",
+   "slots": [
+    {
+     "id": "diffusion_model",
+     "required": true
+    },
+    {
+     "id": "llm",
+     "required": true,
+     "label": "Qwen 3 VL 4B Text Encoder"
+    },
+    {
+     "id": "vae",
+     "required": true
+    }
+   ],
+   "defaults": {
+    "cfg_scale": 1,
+    "steps": 4,
+    "width": 1024,
+    "height": 1024,
+    "sampling_method": "euler"
+   },
+   "features": [
+    "flow_shift"
+   ]
+  },
+  {
+   "schema_version": 1,
+   "id": "mage-flow",
+   "name": "Mage Flow",
+   "size_multiple": 16,
+   "model_url": "https://huggingface.co/microsoft/Mage-Flow",
+   "slots": [
+    {
+     "id": "diffusion_model",
+     "required": true
+    },
+    {
+     "id": "llm",
+     "required": true,
+     "label": "Qwen 3 VL 4B Text Encoder"
+    },
+    {
+     "id": "vae",
+     "required": true
+    }
+   ],
+   "defaults": {
+    "cfg_scale": 5,
+    "steps": 20,
+    "width": 1024,
+    "height": 1024,
+    "sampling_method": "euler"
+   },
+   "features": [
+    "flow_shift"
+   ]
+  },
+  {
+   "schema_version": 1,
+   "id": "ming-image",
+   "name": "Ming Image 0.1",
+   "size_multiple": 16,
+   "model_url": "https://huggingface.co/inclusionAI/Ming-Image-0.1-Design",
+   "slots": [
+    {
+     "id": "diffusion_model",
+     "required": true
+    },
+    {
+     "id": "llm",
+     "required": true,
+     "label": "Ling Mini 2.0 Text Encoder"
+    },
+    {
+     "id": "tokenizer",
+     "required": true,
+     "label": "Ling tokenizer.json"
+    },
+    {
+     "id": "vae",
+     "required": false
+    },
+    {
+     "id": "tae",
+     "required": false
+    }
+   ],
+   "required_any": [
+    [
+     "vae",
+     "tae"
+    ]
+   ],
+   "defaults": {
+    "cfg_scale": 1,
+    "steps": 12,
+    "width": 1024,
+    "height": 1024,
+    "sampling_method": "euler"
+   },
+   "features": [
+    "flow_shift"
+   ]
+  },
+  {
+   "schema_version": 1,
+   "id": "minit2i",
+   "name": "MiniT2I",
+   "size_multiple": 1,
+   "description": "Pixel-space model; no VAE is required.",
+   "model_url": "https://huggingface.co/MiniT2I/MiniT2I",
+   "slots": [
+    {
+     "id": "diffusion_model",
+     "required": true
+    },
+    {
+     "id": "t5xxl",
+     "required": true,
+     "label": "FLAN-T5 Large"
+    }
+   ],
+   "defaults": {
+    "cfg_scale": 2.5,
+    "steps": 20,
+    "width": 512,
+    "height": 512,
+    "sampling_method": "euler"
+   },
+   "disabled_features": [
+    "preview",
+    "vae_tiling"
+   ]
+  },
+  {
+   "schema_version": 1,
+   "id": "moss-image-base",
+   "name": "MOSS Image Base",
+   "size_multiple": 16,
+   "description": "Select the MOSS-Image-Base transformer with its matching text encoder and FLUX.2 VAE or TAE.",
+   "model_url": "https://huggingface.co/OpenMOSS-Team/MOSS-Image-Base",
+   "slots": [
+    {
+     "id": "diffusion_model",
+     "required": true
+    },
+    {
+     "id": "llm",
+     "required": true,
+     "label": "Qwen 3.5 9B Text Encoder"
+    },
+    {
+     "id": "tokenizer",
+     "required": true,
+     "label": "Qwen 3.5 tokenizer.json"
+    },
+    {
+     "id": "vae",
+     "required": false
+    },
+    {
+     "id": "tae",
+     "required": false
+    }
+   ],
+   "required_any": [
+    [
+     "vae",
+     "tae"
+    ]
+   ],
+   "defaults": {
+    "cfg_scale": 3,
+    "steps": 20,
+    "width": 1024,
+    "height": 1024,
+    "flow_shift": 5,
+    "sampling_method": "euler"
+   },
+   "features": [
+    "flow_shift",
+    "slg"
+   ]
+  },
+  {
+   "schema_version": 1,
+   "id": "moss-image-sft",
+   "name": "MOSS Image SFT",
+   "size_multiple": 16,
+   "description": "Select the MOSS-Image-SFT transformer with its matching text encoder and FLUX.2 VAE or TAE.",
+   "model_url": "https://huggingface.co/OpenMOSS-Team/MOSS-Image-SFT",
+   "slots": [
+    {
+     "id": "diffusion_model",
+     "required": true
+    },
+    {
+     "id": "llm",
+     "required": true,
+     "label": "Qwen 3.5 9B Text Encoder"
+    },
+    {
+     "id": "tokenizer",
+     "required": true,
+     "label": "Qwen 3.5 tokenizer.json"
+    },
+    {
+     "id": "vae",
+     "required": false
+    },
+    {
+     "id": "tae",
+     "required": false
+    }
+   ],
+   "required_any": [
+    [
+     "vae",
+     "tae"
+    ]
+   ],
+   "defaults": {
+    "cfg_scale": 3,
+    "steps": 20,
+    "width": 1024,
+    "height": 1024,
+    "flow_shift": 5,
+    "sampling_method": "euler"
+   },
+   "features": [
+    "flow_shift",
+    "slg"
+   ]
+  },
+  {
+   "schema_version": 1,
+   "id": "nitrosd-realism",
+   "name": "NitroSD Realism",
+   "size_multiple": 64,
+   "model_url": "https://huggingface.co/ChenDY/NitroFusion",
+   "slots": [
+    {
+     "id": "model",
+     "required": true
+    },
+    {
+     "id": "vae",
+     "required": false
+    },
+    {
+     "id": "tae",
+     "required": false
+    }
+   ],
+   "defaults": {
+    "scheduler": "sgm_uniform",
+    "shifted_timestep": 250,
+    "cfg_scale": 1,
+    "steps": 1,
+    "width": 1024,
+    "height": 1024
+   },
+   "features": [
+    "cache_unet",
+    "clip_skip",
+    "shifted_timestep"
+   ],
+   "disabled_features": [
+    "cache_dit"
+   ]
+  },
+  {
+   "schema_version": 1,
+   "id": "ovis-image",
+   "name": "Ovis Image",
+   "model_url": "https://huggingface.co/ATH-MaaS/Ovis-Image-7B",
+   "slots": [
+    {
+     "id": "diffusion_model",
+     "required": true
+    },
+    {
+     "id": "llm",
+     "required": true,
+     "label": "Ovis 2.5 Text Encoder"
+    },
+    {
+     "id": "vae",
+     "required": false
+    },
+    {
+     "id": "tae",
+     "required": false
+    }
+   ],
+   "required_any": [
+    [
+     "vae",
+     "tae"
+    ]
+   ],
+   "defaults": {
+    "cfg_scale": 5,
+    "steps": 20,
+    "width": 1024,
+    "height": 1024,
+    "sampling_method": "euler"
+   },
+   "features": [
+    "flow_shift",
+    "slg"
+   ]
+  },
+  {
+   "schema_version": 1,
+   "id": "p-h3-image",
+   "name": "P-H3-Image",
+   "size_multiple": 32,
+   "description": "Supports text-to-image and reference-image editing with the fixed 8-step schedule. Use the P-H3 single-frame VAE and Qwen3-VL-4B with its vision tower. Supply the P-H3 text connector separately unless it is included in the text encoder.",
+   "model_url": "https://huggingface.co/PrunaAI/P-H3-Image",
+   "slots": [
+    {
+     "id": "diffusion_model",
+     "required": true
+    },
+    {
+     "id": "llm",
+     "required": true,
+     "label": "Qwen 3 VL 4B Text Encoder"
+    },
+    {
+     "id": "llm_vision",
+     "required": false,
+     "label": "Vision projector (required when not included in the text encoder)"
+    },
+    {
+     "id": "embeddings_connectors",
+     "required": false,
+     "label": "P-H3 Text Connector (required when not included in the text encoder)"
+    },
+    {
+     "id": "vae",
+     "required": true,
+     "label": "P-H3 Image VAE"
+    }
+   ],
+   "defaults": {
+    "sampling_method": "euler",
+    "cfg_scale": 1,
+    "steps": 8,
+    "width": 1024,
+    "height": 1024,
+    "custom_sigmas": [
+     1.0,
+     0.984753,
+     0.967905,
+     0.951688,
+     0.925372,
+     0.881923,
+     0.810083,
+     0.528718,
+     0.0
+    ]
+   },
+   "features": [
+    "ref_images"
+   ]
+  },
+  {
+   "schema_version": 1,
+   "id": "pid-15-flux2",
+   "name": "PiD 1.5 (Flux.2 VAE)",
+   "size_multiple": 1,
+   "description": "Supply a reference image; the first image is used as the source latent. Select a matching Flux.2 PiD checkpoint and VAE.",
+   "model_url": "https://huggingface.co/nvidia/PiD",
+   "slots": [
+    {
+     "id": "diffusion_model",
+     "required": true
+    },
+    {
+     "id": "llm",
+     "required": true,
+     "label": "Gemma 2 2B ELM Text Encoder"
+    },
+    {
+     "id": "tokenizer",
+     "required": true,
+     "label": "Gemma 2 tokenizer.json"
+    },
+    {
+     "id": "vae",
+     "required": true
+    }
+   ],
+   "context": {
+    "vae_format": "flux2"
+   },
+   "defaults": {
+    "sampling_method": "lcm",
+    "scheduler": "lcm",
+    "cfg_scale": 1,
+    "steps": 4,
+    "width": 2048,
+    "height": 2048
+   },
+   "features": [
+    "flow_shift",
+    "ref_images"
+   ],
+   "disabled_features": [
+    "img2img",
+    "mask_image",
+    "preview"
+   ]
+  },
+  {
+   "schema_version": 1,
+   "id": "pid-15-qwen-image",
+   "name": "PiD 1.5 (Qwen Image VAE)",
+   "size_multiple": 1,
+   "description": "Supply a reference image; the first image is used as the source latent. Select a matching Qwen Image PiD checkpoint and VAE. Use the Qwen Image 2D VAE.",
+   "model_url": "https://huggingface.co/nvidia/PiD",
+   "slots": [
+    {
+     "id": "diffusion_model",
+     "required": true
+    },
+    {
+     "id": "llm",
+     "required": true,
+     "label": "Gemma 2 2B ELM Text Encoder"
+    },
+    {
+     "id": "tokenizer",
+     "required": true,
+     "label": "Gemma 2 tokenizer.json"
+    },
+    {
+     "id": "vae",
+     "required": true
+    }
+   ],
+   "context": {
+    "vae_format": "wan"
+   },
+   "defaults": {
+    "sampling_method": "lcm",
+    "scheduler": "lcm",
+    "cfg_scale": 1,
+    "steps": 4,
+    "width": 2048,
+    "height": 2048
+   },
+   "features": [
+    "flow_shift",
+    "ref_images"
+   ],
+   "disabled_features": [
+    "img2img",
+    "mask_image",
+    "preview"
+   ]
+  },
+  {
+   "schema_version": 1,
+   "id": "pid-15-sd3",
+   "name": "PiD 1.5 (SD3 VAE)",
+   "size_multiple": 1,
+   "description": "Supply a reference image; the first image is used as the source latent. Select a matching SD3 PiD checkpoint and VAE.",
+   "model_url": "https://huggingface.co/nvidia/PiD",
+   "slots": [
+    {
+     "id": "diffusion_model",
+     "required": true
+    },
+    {
+     "id": "llm",
+     "required": true,
+     "label": "Gemma 2 2B ELM Text Encoder"
+    },
+    {
+     "id": "tokenizer",
+     "required": true,
+     "label": "Gemma 2 tokenizer.json"
+    },
+    {
+     "id": "vae",
+     "required": true
+    }
+   ],
+   "context": {
+    "vae_format": "sd3"
+   },
+   "defaults": {
+    "sampling_method": "lcm",
+    "scheduler": "lcm",
+    "cfg_scale": 1,
+    "steps": 4,
+    "width": 2048,
+    "height": 2048
+   },
+   "features": [
+    "flow_shift",
+    "ref_images"
+   ],
+   "disabled_features": [
+    "img2img",
+    "mask_image",
+    "preview"
+   ]
+  },
+  {
+   "schema_version": 1,
+   "id": "pid-15",
+   "name": "PiD 1.5 (Flux / Z-Image VAE)",
+   "size_multiple": 1,
+   "description": "Supply a reference image; the first image is used as the source latent. Select a Flux/Z-Image PiD checkpoint and matching Flux VAE.",
+   "model_url": "https://huggingface.co/nvidia/PiD",
+   "slots": [
+    {
+     "id": "diffusion_model",
+     "required": true
+    },
+    {
+     "id": "llm",
+     "required": true,
+     "label": "Gemma 2 2B ELM Text Encoder"
+    },
+    {
+     "id": "tokenizer",
+     "required": true,
+     "label": "Gemma 2 tokenizer.json"
+    },
+    {
+     "id": "vae",
+     "required": true
+    }
+   ],
+   "context": {
+    "vae_format": "flux"
+   },
+   "defaults": {
+    "sampling_method": "lcm",
+    "scheduler": "lcm",
+    "cfg_scale": 1,
+    "steps": 4,
+    "width": 2048,
+    "height": 2048
+   },
+   "features": [
+    "flow_shift",
+    "ref_images"
+   ],
+   "disabled_features": [
+    "img2img",
+    "mask_image",
+    "preview"
+   ]
+  },
+  {
+   "schema_version": 1,
+   "id": "pid-flux2",
+   "name": "PiD (Flux.2 VAE)",
+   "size_multiple": 1,
+   "description": "Supply a reference image; the first image is used as the source latent. Select a matching Flux.2 PiD checkpoint and VAE.",
+   "model_url": "https://huggingface.co/nvidia/PiD",
+   "slots": [
+    {
+     "id": "diffusion_model",
+     "required": true
+    },
+    {
+     "id": "llm",
+     "required": true,
+     "label": "Gemma 2 2B ELM Text Encoder"
+    },
+    {
+     "id": "tokenizer",
+     "required": true,
+     "label": "Gemma 2 tokenizer.json"
+    },
+    {
+     "id": "vae",
+     "required": true
+    }
+   ],
+   "context": {
+    "vae_format": "flux2"
+   },
+   "defaults": {
+    "sampling_method": "lcm",
+    "scheduler": "lcm",
+    "cfg_scale": 1,
+    "steps": 4,
+    "width": 2048,
+    "height": 2048
+   },
+   "features": [
+    "flow_shift",
+    "ref_images"
+   ],
+   "disabled_features": [
+    "img2img",
+    "mask_image",
+    "preview"
+   ]
+  },
+  {
+   "schema_version": 1,
+   "id": "pid-qwen-image",
+   "name": "PiD (Qwen Image VAE)",
+   "size_multiple": 1,
+   "description": "Supply a reference image; the first image is used as the source latent. Select a matching Qwen Image PiD checkpoint and VAE. Use the Qwen Image 2D VAE.",
+   "model_url": "https://huggingface.co/nvidia/PiD",
+   "slots": [
+    {
+     "id": "diffusion_model",
+     "required": true
+    },
+    {
+     "id": "llm",
+     "required": true,
+     "label": "Gemma 2 2B ELM Text Encoder"
+    },
+    {
+     "id": "tokenizer",
+     "required": true,
+     "label": "Gemma 2 tokenizer.json"
+    },
+    {
+     "id": "vae",
+     "required": true
+    }
+   ],
+   "context": {
+    "vae_format": "wan"
+   },
+   "defaults": {
+    "sampling_method": "lcm",
+    "scheduler": "lcm",
+    "cfg_scale": 1,
+    "steps": 4,
+    "width": 2048,
+    "height": 2048
+   },
+   "features": [
+    "flow_shift",
+    "ref_images"
+   ],
+   "disabled_features": [
+    "img2img",
+    "mask_image",
+    "preview"
+   ]
+  },
+  {
+   "schema_version": 1,
+   "id": "pid-sd3",
+   "name": "PiD (SD3 VAE)",
+   "size_multiple": 1,
+   "description": "Supply a reference image; the first image is used as the source latent. Select a matching SD3 PiD checkpoint and VAE.",
+   "model_url": "https://huggingface.co/nvidia/PiD",
+   "slots": [
+    {
+     "id": "diffusion_model",
+     "required": true
+    },
+    {
+     "id": "llm",
+     "required": true,
+     "label": "Gemma 2 2B ELM Text Encoder"
+    },
+    {
+     "id": "tokenizer",
+     "required": true,
+     "label": "Gemma 2 tokenizer.json"
+    },
+    {
+     "id": "vae",
+     "required": true
+    }
+   ],
+   "context": {
+    "vae_format": "sd3"
+   },
+   "defaults": {
+    "sampling_method": "lcm",
+    "scheduler": "lcm",
+    "cfg_scale": 1,
+    "steps": 4,
+    "width": 2048,
+    "height": 2048
+   },
+   "features": [
+    "flow_shift",
+    "ref_images"
+   ],
+   "disabled_features": [
+    "img2img",
+    "mask_image",
+    "preview"
+   ]
+  },
+  {
+   "schema_version": 1,
+   "id": "pid",
+   "name": "PiD (Flux / Z-Image VAE)",
+   "size_multiple": 1,
+   "description": "Supply a reference image; the first image is used as the source latent. Select a Flux/Z-Image PiD checkpoint and matching Flux VAE.",
+   "model_url": "https://huggingface.co/nvidia/PiD",
+   "slots": [
+    {
+     "id": "diffusion_model",
+     "required": true
+    },
+    {
+     "id": "llm",
+     "required": true,
+     "label": "Gemma 2 2B ELM Text Encoder"
+    },
+    {
+     "id": "tokenizer",
+     "required": true,
+     "label": "Gemma 2 tokenizer.json"
+    },
+    {
+     "id": "vae",
+     "required": true
+    }
+   ],
+   "context": {
+    "vae_format": "flux"
+   },
+   "defaults": {
+    "sampling_method": "lcm",
+    "scheduler": "lcm",
+    "cfg_scale": 1,
+    "steps": 4,
+    "width": 2048,
+    "height": 2048
+   },
+   "features": [
+    "flow_shift",
+    "ref_images"
+   ],
+   "disabled_features": [
+    "img2img",
+    "mask_image",
+    "preview"
+   ]
+  },
+  {
+   "schema_version": 1,
+   "id": "pixart-alpha-1024",
+   "name": "PixArt Alpha XL 1024",
+   "size_multiple": 16,
+   "description": "Use the matching PixArt Alpha transformer and SD 1.x-style VAE. Resolution/aspect-ratio micro-conditioning is not currently applied by the runtime.",
+   "model_url": "https://huggingface.co/PixArt-alpha/PixArt-XL-2-1024-MS",
+   "slots": [
+    {
+     "id": "diffusion_model",
+     "required": true
+    },
+    {
+     "id": "t5xxl",
+     "required": true
+    },
+    {
+     "id": "vae",
+     "required": false
+    },
+    {
+     "id": "tae",
+     "required": false
+    }
+   ],
+   "required_any": [
+    [
+     "vae",
+     "tae"
+    ]
+   ],
+   "context": {
+    "model_args": "pixart_vae_scale_factor=0.18215"
+   },
+   "defaults": {
+    "scheduler": "discrete",
+    "sampling_method": "euler",
+    "cfg_scale": 4.5,
+    "steps": 20,
+    "width": 1024,
+    "height": 1024
+   }
+  },
+  {
+   "schema_version": 1,
+   "id": "pixart-alpha-512",
+   "name": "PixArt Alpha XL 512",
+   "size_multiple": 16,
+   "description": "Use the matching PixArt Alpha transformer and SD 1.x-style VAE. Resolution/aspect-ratio micro-conditioning is not currently applied by the runtime.",
+   "model_url": "https://huggingface.co/PixArt-alpha/PixArt-XL-2-512x512",
+   "slots": [
+    {
+     "id": "diffusion_model",
+     "required": true
+    },
+    {
+     "id": "t5xxl",
+     "required": true
+    },
+    {
+     "id": "vae",
+     "required": false
+    },
+    {
+     "id": "tae",
+     "required": false
+    }
+   ],
+   "required_any": [
+    [
+     "vae",
+     "tae"
+    ]
+   ],
+   "context": {
+    "model_args": "pixart_vae_scale_factor=0.18215,pixart_pos_embed_base_size=32,pixart_interpolation_scale=1"
+   },
+   "defaults": {
+    "scheduler": "discrete",
+    "sampling_method": "euler",
+    "cfg_scale": 4.5,
+    "steps": 20,
+    "width": 512,
+    "height": 512
+   }
+  },
+  {
+   "schema_version": 1,
+   "id": "pixart-sigma",
+   "name": "PixArt Sigma XL 1024",
+   "size_multiple": 16,
+   "model_url": "https://huggingface.co/PixArt-alpha/PixArt-Sigma-XL-2-1024-MS",
+   "slots": [
+    {
+     "id": "diffusion_model",
+     "required": true
+    },
+    {
+     "id": "t5xxl",
+     "required": true
+    },
+    {
+     "id": "vae",
+     "required": false
+    },
+    {
+     "id": "tae",
+     "required": false
+    }
+   ],
+   "required_any": [
+    [
+     "vae",
+     "tae"
+    ]
+   ],
+   "defaults": {
+    "cfg_scale": 4.5,
+    "steps": 20,
+    "width": 1024,
+    "height": 1024,
+    "sampling_method": "euler"
+   }
+  },
+  {
+   "schema_version": 1,
+   "id": "qwen-image-21-turbo",
+   "name": "Qwen Image 2.1 Turbo",
+   "size_multiple": 32,
+   "description": "Use the standalone Turbo diffusion weights for generation and editing with the fixed 8-step schedule. Select the Qwen Image 2.1 VAE or TAEQI2.1, and supply a vision projector when needed.",
+   "model_url": "https://huggingface.co/Qwen/Qwen-Image-2.1-Turbo",
+   "slots": [
+    {
+     "id": "diffusion_model",
+     "required": true
+    },
+    {
+     "id": "llm",
+     "required": true,
+     "label": "Qwen 3 VL 8B Text Encoder"
+    },
+    {
+     "id": "llm_vision",
+     "required": false,
+     "label": "Vision projector (required for separate GGUF text encoders)"
+    },
+    {
+     "id": "vae",
+     "required": false,
+     "label": "Qwen Image 2.1 VAE"
+    },
+    {
+     "id": "tae",
+     "required": false,
+     "label": "TAEQI2.1"
+    }
+   ],
+   "required_any": [
+    [
+     "vae",
+     "tae"
+    ]
+   ],
+   "defaults": {
+    "sampling_method": "euler",
+    "cfg_scale": 1,
+    "steps": 8,
+    "width": 1024,
+    "height": 1024,
+    "custom_sigmas": [
+     1.0,
+     0.978453,
+     0.95418,
+     0.926626,
+     0.89508,
+     0.845148,
+     0.704534,
+     0.414568,
+     0.0
+    ]
+   },
+   "features": [
+    "ref_images"
+   ]
+  },
+  {
+   "schema_version": 1,
+   "id": "qwen-image-21",
+   "name": "Qwen Image 2.1",
+   "size_multiple": 32,
+   "description": "Supports generation and editing. Select the full Qwen Image 2.1 VAE or TAEQI2.1. Supply a separate vision projector when needed. Select acceleration LoRAs and adjust their settings separately.",
+   "model_url": "https://huggingface.co/Qwen/Qwen-Image-2.1",
+   "slots": [
+    {
+     "id": "diffusion_model",
+     "required": true
+    },
+    {
+     "id": "llm",
+     "required": true,
+     "label": "Qwen 3 VL 8B Text Encoder"
+    },
+    {
+     "id": "llm_vision",
+     "required": false,
+     "label": "Vision projector (required for separate GGUF text encoders)"
+    },
+    {
+     "id": "vae",
+     "required": false,
+     "label": "Qwen Image 2.1 VAE"
+    },
+    {
+     "id": "tae",
+     "required": false,
+     "label": "TAEQI2.1"
+    }
+   ],
+   "required_any": [
+    [
+     "vae",
+     "tae"
+    ]
+   ],
+   "defaults": {
+    "sampling_method": "euler",
+    "cfg_scale": 1,
+    "steps": 20,
+    "width": 1024,
+    "height": 1024
+   },
+   "features": [
+    "flow_shift",
+    "ref_images"
+   ]
+  },
+  {
+   "schema_version": 1,
+   "id": "qwen-image-edit-2509",
+   "name": "Qwen Image Edit 2509",
+   "description": "Supply reference images. Select a vision projector for GGUF text encoders; omit it if vision weights are included in the text encoder.",
+   "model_url": "https://huggingface.co/Qwen/Qwen-Image-Edit-2509",
+   "slots": [
+    {
+     "id": "diffusion_model",
+     "required": true
+    },
+    {
+     "id": "llm",
+     "required": true,
+     "label": "Qwen 2.5 VL 7B Text Encoder"
+    },
+    {
+     "id": "llm_vision",
+     "required": false,
+     "label": "Vision projector (required for separate GGUF text encoders)"
+    },
+    {
+     "id": "vae",
+     "required": false,
+     "label": "Qwen Image VAE"
+    },
+    {
+     "id": "tae",
+     "required": false
+    }
+   ],
+   "required_any": [
+    [
+     "vae",
+     "tae"
+    ]
+   ],
+   "defaults": {
+    "sampling_method": "euler",
+    "flow_shift": 3.0,
+    "cfg_scale": 4,
+    "steps": 20
+   },
+   "features": [
+    "flow_shift",
+    "img_cfg",
+    "ref_images"
+   ]
+  },
+  {
+   "schema_version": 1,
+   "id": "qwen-image-edit-2511",
+   "name": "Qwen Image Edit 2511",
+   "description": "Supply reference images. Select a vision projector for GGUF text encoders; omit it if vision weights are included in the text encoder.",
+   "model_url": "https://huggingface.co/Qwen/Qwen-Image-Edit-2511",
+   "slots": [
+    {
+     "id": "diffusion_model",
+     "required": true
+    },
+    {
+     "id": "llm",
+     "required": true,
+     "label": "Qwen 2.5 VL 7B Text Encoder"
+    },
+    {
+     "id": "llm_vision",
+     "required": false,
+     "label": "Vision projector (required for separate GGUF text encoders)"
+    },
+    {
+     "id": "vae",
+     "required": false,
+     "label": "Qwen Image VAE"
+    },
+    {
+     "id": "tae",
+     "required": false
+    }
+   ],
+   "required_any": [
+    [
+     "vae",
+     "tae"
+    ]
+   ],
+   "context": {
+    "model_args": "qwen_image_zero_cond_t=true"
+   },
+   "defaults": {
+    "sampling_method": "euler",
+    "flow_shift": 3.0,
+    "cfg_scale": 4,
+    "steps": 20
+   },
+   "features": [
+    "flow_shift",
+    "img_cfg",
+    "ref_images"
+   ]
+  },
+  {
+   "schema_version": 1,
+   "id": "qwen-image-edit",
+   "name": "Qwen Image Edit",
+   "description": "Supply reference images. Select a vision projector for GGUF text encoders; omit it if vision weights are included in the text encoder.",
+   "model_url": "https://huggingface.co/Qwen/Qwen-Image-Edit",
+   "slots": [
+    {
+     "id": "diffusion_model",
+     "required": true
+    },
+    {
+     "id": "llm",
+     "required": true,
+     "label": "Qwen 2.5 VL 7B Text Encoder"
+    },
+    {
+     "id": "llm_vision",
+     "required": false,
+     "label": "Vision projector (required for separate GGUF text encoders)"
+    },
+    {
+     "id": "vae",
+     "required": false,
+     "label": "Qwen Image VAE"
+    },
+    {
+     "id": "tae",
+     "required": false
+    }
+   ],
+   "required_any": [
+    [
+     "vae",
+     "tae"
+    ]
+   ],
+   "defaults": {
+    "sampling_method": "euler",
+    "flow_shift": 3.0,
+    "cfg_scale": 4,
+    "steps": 20
+   },
+   "features": [
+    "flow_shift",
+    "img_cfg",
+    "ref_images"
+   ]
+  },
+  {
+   "schema_version": 1,
+   "id": "qwen-image-layered",
+   "name": "Qwen Image Layered",
+   "description": "Supply a reference image and use the dedicated layered VAE.",
+   "model_url": "https://huggingface.co/Qwen/Qwen-Image-Layered",
+   "slots": [
+    {
+     "id": "diffusion_model",
+     "required": true
+    },
+    {
+     "id": "llm",
+     "required": true,
+     "label": "Qwen 2.5 VL 7B Text Encoder"
+    },
+    {
+     "id": "vae",
+     "required": true,
+     "label": "Qwen Image Layered VAE"
+    }
+   ],
+   "defaults": {
+    "sampling_method": "euler",
+    "flow_shift": 3.0,
+    "cfg_scale": 4,
+    "steps": 20,
+    "width": 640,
+    "height": 640
+   },
+   "features": [
+    "flow_shift",
+    "img_cfg",
+    "ref_images"
+   ]
+  },
+  {
+   "schema_version": 1,
+   "id": "qwen-image",
+   "name": "Qwen Image",
+   "description": "Supports text-to-image and image-to-image; pruned transformer variants use the same components.",
+   "model_url": "https://huggingface.co/Qwen/Qwen-Image",
+   "slots": [
+    {
+     "id": "diffusion_model",
+     "required": true
+    },
+    {
+     "id": "llm",
+     "required": true,
+     "label": "Qwen 2.5 VL 7B Text Encoder"
+    },
+    {
+     "id": "vae",
+     "required": false,
+     "label": "Qwen Image VAE"
+    },
+    {
+     "id": "tae",
+     "required": false
+    }
+   ],
+   "required_any": [
+    [
+     "vae",
+     "tae"
+    ]
+   ],
+   "defaults": {
+    "sampling_method": "euler",
+    "flow_shift": 3.0,
+    "cfg_scale": 4,
+    "steps": 20,
+    "width": 1024,
+    "height": 1024
+   },
+   "features": [
+    "flow_shift"
+   ]
+  },
+  {
+   "schema_version": 1,
+   "id": "sd-turbo",
+   "name": "SD Turbo",
+   "size_multiple": 64,
+   "description": "Select a single-file SD-Turbo checkpoint. Uses one step with CFG disabled (scale 1 in sd.cpp); use more steps for partial image-to-image denoising.",
+   "model_url": "https://huggingface.co/stabilityai/sd-turbo",
+   "slots": [
+    {
+     "id": "model",
+     "required": true
+    },
+    {
+     "id": "vae",
+     "required": false
+    },
+    {
+     "id": "tae",
+     "required": false
+    }
+   ],
+   "defaults": {
+    "sampling_method": "euler",
+    "scheduler": "discrete",
+    "cfg_scale": 1,
+    "steps": 1,
+    "width": 512,
+    "height": 512
+   },
+   "features": [
+    "cache_unet",
+    "clip_skip"
+   ],
+   "disabled_features": [
+    "cache_dit"
+   ]
+  },
+  {
+   "schema_version": 1,
+   "id": "sd1-checkpoint",
+   "name": "SD 1.x",
+   "size_multiple": 64,
+   "description": "Supports SD 1.x, compatible LCM checkpoints and layer-count variants. For LCM weights, select LCM sampling and adjust steps/CFG. Tiny SD Diffusers directories must first be converted into a single-file checkpoint.",
+   "model_url": "https://huggingface.co/CompVis/stable-diffusion-v1-4",
+   "slots": [
+    {
+     "id": "model",
+     "required": true
+    },
+    {
+     "id": "vae",
+     "label": "VAE override",
+     "required": false
+    },
+    {
+     "id": "tae",
+     "required": false
+    }
+   ],
+   "defaults": {
+    "cfg_scale": 7.5,
+    "steps": 20,
+    "width": 512,
+    "height": 512
+   },
+   "features": [
+    "cache_unet",
+    "clip_skip"
+   ],
+   "disabled_features": [
+    "cache_dit"
+   ]
+  },
+  {
+   "schema_version": 1,
+   "id": "sd1-controlnet",
+   "name": "SD 1.5 ControlNet",
+   "size_multiple": 64,
+   "description": "Supply a control image; input image and mask are optional for image-to-image or inpainting.",
+   "model_url": "https://huggingface.co/lllyasviel/control_v11p_sd15_canny",
+   "slots": [
+    {
+     "id": "model",
+     "required": true
+    },
+    {
+     "id": "control_net",
+     "required": true
+    },
+    {
+     "id": "vae",
+     "required": false
+    },
+    {
+     "id": "tae",
+     "required": false
+    }
+   ],
+   "defaults": {
+    "cfg_scale": 7.5,
+    "steps": 20,
+    "width": 512,
+    "height": 512
+   },
+   "features": [
+    "cache_unet",
+    "clip_skip"
+   ],
+   "disabled_features": [
+    "cache_dit"
+   ]
+  },
+  {
+   "schema_version": 1,
+   "id": "sd1-inpainting",
+   "name": "SD 1.5 Inpainting",
+   "size_multiple": 64,
+   "description": "Select an inpainting checkpoint, then supply an input image and mask.",
+   "slots": [
+    {
+     "id": "model",
+     "required": true
+    },
+    {
+     "id": "vae",
+     "required": false
+    },
+    {
+     "id": "tae",
+     "required": false
+    }
+   ],
+   "defaults": {
+    "cfg_scale": 7.5,
+    "steps": 20,
+    "width": 512,
+    "height": 512
+   },
+   "features": [
+    "cache_unet",
+    "clip_skip",
+    "img_cfg"
+   ],
+   "disabled_features": [
+    "cache_dit"
+   ]
+  },
+  {
+   "schema_version": 1,
+   "id": "sd1-ip-adapter",
+   "name": "SD 1.5 IP-Adapter / Plus",
+   "size_multiple": 64,
+   "description": "Select matching SD 1.5 IP-Adapter or Plus weights and CLIP Vision H, then supply an IP-Adapter image.",
+   "model_url": "https://huggingface.co/h94/IP-Adapter",
+   "slots": [
+    {
+     "id": "model",
+     "required": true
+    },
+    {
+     "id": "clip_vision",
+     "required": true,
+     "label": "CLIP Vision H"
+    },
+    {
+     "id": "ip_adapter",
+     "required": true
+    },
+    {
+     "id": "vae",
+     "required": false
+    },
+    {
+     "id": "tae",
+     "required": false
+    }
+   ],
+   "defaults": {
+    "cfg_scale": 7.5,
+    "steps": 20,
+    "width": 512,
+    "height": 512
+   },
+   "features": [
+    "cache_unet",
+    "clip_skip"
+   ],
+   "disabled_features": [
+    "cache_dit"
+   ]
+  },
+  {
+   "schema_version": 1,
+   "id": "sd2-512-checkpoint",
+   "name": "SD 2.1 512",
+   "size_multiple": 64,
+   "description": "Supports SD 2.x 512 and compatible layer-count variants. Tiny SD2 Diffusers directories must first be converted into a single-file checkpoint.",
+   "slots": [
+    {
+     "id": "model",
+     "required": true
+    },
+    {
+     "id": "vae",
+     "required": false
+    },
+    {
+     "id": "tae",
+     "required": false
+    }
+   ],
+   "defaults": {
+    "cfg_scale": 7.5,
+    "steps": 20,
+    "width": 512,
+    "height": 512
+   },
+   "features": [
+    "cache_unet",
+    "clip_skip"
+   ],
+   "disabled_features": [
+    "cache_dit"
+   ]
+  },
+  {
+   "schema_version": 1,
+   "id": "sd2-768-checkpoint",
+   "name": "SD 2.1 768",
+   "size_multiple": 64,
+   "slots": [
+    {
+     "id": "model",
+     "required": true
+    },
+    {
+     "id": "vae",
+     "required": false
+    },
+    {
+     "id": "tae",
+     "required": false
+    }
+   ],
+   "defaults": {
+    "cfg_scale": 7.5,
+    "steps": 20,
+    "width": 768,
+    "height": 768
+   },
+   "features": [
+    "cache_unet",
+    "clip_skip"
+   ],
+   "disabled_features": [
+    "cache_dit"
+   ]
+  },
+  {
+   "schema_version": 1,
+   "id": "sd2-inpainting",
+   "name": "SD 2 Inpainting",
+   "size_multiple": 64,
+   "description": "Select an inpainting checkpoint, then supply Init Image and Mask Image.",
+   "slots": [
+    {
+     "id": "model",
+     "required": true
+    },
+    {
+     "id": "vae",
+     "required": false
+    },
+    {
+     "id": "tae",
+     "required": false
+    }
+   ],
+   "defaults": {
+    "scheduler": "discrete",
+    "sampling_method": "euler_a",
+    "cfg_scale": 7.5,
+    "steps": 20,
+    "width": 512,
+    "height": 512
+   },
+   "features": [
+    "cache_unet",
+    "clip_skip",
+    "img_cfg"
+   ],
+   "disabled_features": [
+    "cache_dit"
+   ]
+  },
+  {
+   "schema_version": 1,
+   "id": "sd3-medium",
+   "name": "SD 3 Medium",
+   "description": "Checkpoint with CLIP-L, CLIP-G and T5 included.",
+   "model_url": "https://huggingface.co/stabilityai/stable-diffusion-3-medium-diffusers",
+   "slots": [
+    {
+     "id": "model",
+     "required": true
+    },
+    {
+     "id": "vae",
+     "required": false
+    },
+    {
+     "id": "tae",
+     "required": false
+    }
+   ],
+   "defaults": {
+    "sampling_method": "euler",
+    "cfg_scale": 7,
+    "steps": 20,
+    "width": 1024,
+    "height": 1024
+   },
+   "features": [
+    "clip_skip",
+    "flow_shift",
+    "slg"
+   ]
+  },
+  {
+   "schema_version": 1,
+   "id": "sd35-large",
+   "name": "SD 3.5 Large",
+   "model_url": "https://huggingface.co/stabilityai/stable-diffusion-3.5-large",
+   "slots": [
+    {
+     "id": "model",
+     "required": true
+    },
+    {
+     "id": "clip_l",
+     "required": true
+    },
+    {
+     "id": "clip_g",
+     "required": true
+    },
+    {
+     "id": "t5xxl",
+     "required": true
+    },
+    {
+     "id": "vae",
+     "required": false
+    },
+    {
+     "id": "tae",
+     "required": false
+    }
+   ],
+   "defaults": {
+    "sampling_method": "euler",
+    "cfg_scale": 3.5,
+    "steps": 20,
+    "width": 1024,
+    "height": 1024
+   },
+   "features": [
+    "clip_skip",
+    "flow_shift",
+    "slg"
+   ]
+  },
+  {
+   "schema_version": 1,
+   "id": "sd35-medium",
+   "name": "SD 3.5 Medium",
+   "model_url": "https://huggingface.co/stabilityai/stable-diffusion-3.5-medium",
+   "slots": [
+    {
+     "id": "model",
+     "required": true
+    },
+    {
+     "id": "clip_l",
+     "required": true
+    },
+    {
+     "id": "clip_g",
+     "required": true
+    },
+    {
+     "id": "t5xxl",
+     "required": true
+    },
+    {
+     "id": "vae",
+     "required": false
+    },
+    {
+     "id": "tae",
+     "required": false
+    }
+   ],
+   "defaults": {
+    "sampling_method": "euler",
+    "cfg_scale": 4.5,
+    "steps": 20,
+    "width": 1024,
+    "height": 1024
+   },
+   "features": [
+    "clip_skip",
+    "flow_shift",
+    "slg"
+   ]
+  },
+  {
+   "schema_version": 1,
+   "id": "sdxl-checkpoint",
+   "name": "SDXL",
+   "size_multiple": 64,
+   "description": "Supports SDXL and compatible reduced-depth checkpoints such as SSD-1B and Segmind Vega.",
+   "model_url": "https://huggingface.co/stabilityai/stable-diffusion-xl-base-1.0",
+   "slots": [
+    {
+     "id": "model",
+     "required": true
+    },
+    {
+     "id": "vae",
+     "label": "VAE override",
+     "required": false
+    },
+    {
+     "id": "tae",
+     "required": false
+    }
+   ],
+   "defaults": {
+    "cfg_scale": 5,
+    "steps": 20,
+    "width": 1024,
+    "height": 1024
+   },
+   "features": [
+    "cache_unet",
+    "clip_skip",
+    "shifted_timestep"
+   ],
+   "disabled_features": [
+    "cache_dit"
+   ]
+  },
+  {
+   "schema_version": 1,
+   "id": "sdxl-controlnet",
+   "name": "SDXL ControlNet",
+   "size_multiple": 64,
+   "description": "Select a compatible SDXL ControlNet and supply a preprocessed control image. Input image and mask are optional for image-to-image or inpainting.",
+   "model_url": "https://huggingface.co/diffusers/controlnet-canny-sdxl-1.0",
+   "slots": [
+    {
+     "id": "model",
+     "required": true
+    },
+    {
+     "id": "control_net",
+     "required": true
+    },
+    {
+     "id": "vae",
+     "required": false
+    },
+    {
+     "id": "tae",
+     "required": false
+    }
+   ],
+   "defaults": {
+    "scheduler": "discrete",
+    "sampling_method": "euler_a",
+    "cfg_scale": 5,
+    "steps": 20,
+    "width": 1024,
+    "height": 1024
+   },
+   "features": [
+    "cache_unet",
+    "clip_skip",
+    "shifted_timestep"
+   ],
+   "disabled_features": [
+    "cache_dit"
+   ]
+  },
+  {
+   "schema_version": 1,
+   "id": "sdxl-inpainting",
+   "name": "SDXL Inpainting",
+   "size_multiple": 64,
+   "description": "Select an inpainting checkpoint, then supply Init Image and Mask Image.",
+   "model_url": "https://huggingface.co/diffusers/stable-diffusion-xl-1.0-inpainting-0.1",
+   "slots": [
+    {
+     "id": "model",
+     "required": true
+    },
+    {
+     "id": "vae",
+     "label": "VAE override",
+     "required": false
+    },
+    {
+     "id": "tae",
+     "required": false
+    }
+   ],
+   "defaults": {
+    "scheduler": "discrete",
+    "sampling_method": "euler_a",
+    "cfg_scale": 8,
+    "steps": 20,
+    "width": 1024,
+    "height": 1024
+   },
+   "features": [
+    "cache_unet",
+    "clip_skip",
+    "shifted_timestep",
+    "img_cfg"
+   ],
+   "disabled_features": [
+    "cache_dit"
+   ]
+  },
+  {
+   "schema_version": 1,
+   "id": "sdxl-ip-adapter",
+   "name": "SDXL IP-Adapter / Plus",
+   "size_multiple": 64,
+   "description": "Select matching SDXL ViT-H IP-Adapter or Plus weights and CLIP Vision H, then supply an IP-Adapter image.",
+   "model_url": "https://huggingface.co/h94/IP-Adapter",
+   "slots": [
+    {
+     "id": "model",
+     "required": true
+    },
+    {
+     "id": "clip_vision",
+     "required": true,
+     "label": "CLIP Vision H"
+    },
+    {
+     "id": "ip_adapter",
+     "required": true
+    },
+    {
+     "id": "vae",
+     "required": false
+    },
+    {
+     "id": "tae",
+     "required": false
+    }
+   ],
+   "defaults": {
+    "scheduler": "discrete",
+    "sampling_method": "dpm++2m",
+    "cfg_scale": 5,
+    "steps": 20,
+    "width": 1024,
+    "height": 1024
+   },
+   "features": [
+    "cache_unet",
+    "clip_skip",
+    "shifted_timestep"
+   ],
+   "disabled_features": [
+    "cache_dit"
+   ]
+  },
+  {
+   "schema_version": 1,
+   "id": "sdxl-photomaker",
+   "name": "SDXL PhotoMaker",
+   "size_multiple": 64,
+   "description": "Select PhotoMaker v1 and supply identity images. Include the img trigger in the prompt.",
+   "model_url": "https://huggingface.co/TencentARC/PhotoMaker",
+   "slots": [
+    {
+     "id": "model",
+     "required": true
+    },
+    {
+     "id": "photo_maker",
+     "required": true
+    },
+    {
+     "id": "vae",
+     "required": false
+    },
+    {
+     "id": "tae",
+     "required": false
+    }
+   ],
+   "defaults": {
+    "width": 1024,
+    "height": 1024
+   },
+   "features": [
+    "cache_unet",
+    "clip_skip",
+    "shifted_timestep"
+   ],
+   "disabled_features": [
+    "cache_dit"
+   ]
+  },
+  {
+   "schema_version": 1,
+   "id": "sdxl-turbo",
+   "name": "SDXL Turbo",
+   "size_multiple": 64,
+   "model_url": "https://huggingface.co/stabilityai/sdxl-turbo",
+   "slots": [
+    {
+     "id": "model",
+     "required": true
+    },
+    {
+     "id": "vae",
+     "required": false
+    },
+    {
+     "id": "tae",
+     "required": false
+    }
+   ],
+   "defaults": {
+    "cfg_scale": 1,
+    "steps": 1,
+    "width": 512,
+    "height": 512
+   },
+   "features": [
+    "cache_unet",
+    "clip_skip",
+    "shifted_timestep"
+   ],
+   "disabled_features": [
+    "cache_dit"
+   ]
+  },
+  {
+   "schema_version": 1,
+   "id": "sdxs",
+   "name": "SDXS",
+   "size_multiple": 64,
+   "model_url": "https://huggingface.co/IDKiro/sdxs-512-dreamshaper",
+   "slots": [
+    {
+     "id": "model",
+     "required": true
+    },
+    {
+     "id": "vae",
+     "required": false
+    }
+   ],
+   "defaults": {
+    "cfg_scale": 1,
+    "steps": 1,
+    "width": 512,
+    "height": 512
+   },
+   "features": [
+    "cache_unet",
+    "clip_skip"
+   ],
+   "disabled_features": [
+    "cache_dit"
+   ]
+  },
+  {
+   "schema_version": 1,
+   "id": "sefi-image",
+   "name": "SeFi Image 5B RL",
+   "size_multiple": 16,
+   "model_url": "https://huggingface.co/SeFi-Image/SeFi-Image-5B-Base",
+   "slots": [
+    {
+     "id": "diffusion_model",
+     "required": true
+    },
+    {
+     "id": "llm",
+     "required": true,
+     "label": "Qwen 3 VL 4B Text Encoder"
+    },
+    {
+     "id": "vae",
+     "required": false
+    },
+    {
+     "id": "tae",
+     "required": false
+    }
+   ],
+   "required_any": [
+    [
+     "vae",
+     "tae"
+    ]
+   ],
+   "defaults": {
+    "cfg_scale": 4,
+    "steps": 20,
+    "sampling_method": "euler"
+   },
+   "features": [
+    "slg"
+   ]
+  },
+  {
+   "schema_version": 1,
+   "id": "sensenova-u15",
+   "name": "SenseNova U1.5",
+   "size_multiple": 32,
+   "description": "Bundled MoT checkpoint.",
+   "model_url": "https://huggingface.co/sensenova/SenseNova-U1.5-8B-MoT",
+   "slots": [
+    {
+     "id": "model",
+     "required": true
+    }
+   ],
+   "defaults": {
+    "flow_shift": 3.0,
+    "cfg_scale": 4,
+    "steps": 20,
+    "width": 1024,
+    "height": 1024,
+    "sampling_method": "euler"
+   },
+   "features": [
+    "flow_shift"
+   ]
+  },
+  {
+   "schema_version": 1,
+   "id": "z-image-l2p",
+   "name": "Z-Image L2P",
+   "size_multiple": 16,
+   "description": "Pixel-space L2P checkpoint with Qwen 3 4B; no VAE is needed. Use dimensions divisible by 16.",
+   "model_url": "https://huggingface.co/zhen-nan/L2P",
+   "slots": [
+    {
+     "id": "diffusion_model",
+     "required": true
+    },
+    {
+     "id": "llm",
+     "required": true,
+     "label": "Qwen 3 4B Text Encoder"
+    }
+   ],
+   "defaults": {
+    "sampling_method": "euler",
+    "scheduler": "discrete"
+   },
+   "features": [
+    "flow_shift"
+   ],
+   "disabled_features": [
+    "vae_tiling",
+    "preview"
+   ]
+  },
+  {
+   "schema_version": 1,
+   "id": "z-image-turbo",
+   "name": "Z-Image Turbo",
+   "model_url": "https://huggingface.co/Tongyi-MAI/Z-Image-Turbo",
+   "slots": [
+    {
+     "id": "diffusion_model",
+     "required": true
+    },
+    {
+     "id": "llm",
+     "required": true,
+     "label": "Qwen 3 Text Encoder"
+    },
+    {
+     "id": "vae",
+     "required": false
+    },
+    {
+     "id": "tae",
+     "required": false
+    }
+   ],
+   "required_any": [
+    [
+     "vae",
+     "tae"
+    ]
+   ],
+   "defaults": {
+    "sampling_method": "euler",
+    "cfg_scale": 1,
+    "steps": 9,
+    "width": 1024,
+    "height": 1024
+   },
+   "features": [
+    "flow_shift"
+   ]
+  },
+  {
+   "schema_version": 1,
+   "id": "z-image",
+   "name": "Z-Image",
+   "model_url": "https://huggingface.co/Tongyi-MAI/Z-Image",
+   "slots": [
+    {
+     "id": "diffusion_model",
+     "required": true
+    },
+    {
+     "id": "llm",
+     "required": true,
+     "label": "Qwen 3 Text Encoder"
+    },
+    {
+     "id": "vae",
+     "required": false
+    },
+    {
+     "id": "tae",
+     "required": false
+    }
+   ],
+   "required_any": [
+    [
+     "vae",
+     "tae"
+    ]
+   ],
+   "defaults": {
+    "cfg_scale": 4,
+    "steps": 20,
+    "width": 720,
+    "height": 1280,
+    "sampling_method": "euler"
+   },
+   "features": [
+    "flow_shift"
+   ]
+  }
+ ]
+}

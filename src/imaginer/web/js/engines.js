@@ -11,7 +11,7 @@ import { announce, connectionStrip, modal, statusLine, toast } from './chrome.js
 import { append, corners, h, icon, iconButton, clear } from './dom.js';
 import { clock, plural } from './format.js';
 import { hubDialog, looksLikeRef } from './hub.js';
-import { loadBackends } from './store.js';
+import { lastPlace, loadBackends, loadModels, modelLibrary } from './store.js';
 
 const POLL_MS = 5000;
 const TITLES = {
@@ -82,7 +82,7 @@ export function enginesScreen({ name: wanted = null, navigate }) {
   const status = statusLine();
   const meta = h('span.topbar-meta');
   const header = h('header.topbar.sub',
-    iconButton('back', 'Back', () => (history.length > 1 ? history.back() : navigate('#/'))),
+    iconButton('back', 'Back', () => navigate(lastPlace())),
     h('div.topbar-heading', h('span.topbar-title', 'Engines'), meta),
     h('span.spacer'),
     h('div.only-wide', status.el),
@@ -223,6 +223,7 @@ export function enginesScreen({ name: wanted = null, navigate }) {
     const left = h('div.engine-cells');
     if (e.runtime) left.append(runtimeCell(e));
     if (e.type === 'diffusers') left.append(modelCell(e));
+    if (e.type === 'sdcpp') left.append(cardCell(e));
     if (e.launchable) left.append(filesCell(e));
     else if (e.files.length) left.append(remoteCell(e));
     if (e.loras) left.append(lorasCell(e));
@@ -257,31 +258,33 @@ export function enginesScreen({ name: wanted = null, navigate }) {
     const grid = h('div.files-grid');
     for (const f of e.files) {
       const input = h('input.seed-input.path-input', {
-        type: 'text', value: f.path ?? '', placeholder: f.what, spellcheck: false, 'aria-label': `${f.flag} (${f.what})`,
+        type: 'text', value: f.path ?? '', placeholder: f.label ?? f.what, spellcheck: false, 'aria-label': `${f.flag} (${f.what})`,
         title: 'A path on this machine, or a Hugging Face URL or repo:QUANT to pick from',
         onchange: () => {
           const value = input.value.trim();
           if (looksLikeRef(value)) {
             input.value = f.path ?? '';
             hubDialog(e, { ref: value, onChange: refresh });
-          } else save(e, { launch: { files: { [f.key]: value || null } } });
+          } else if (e.model_card) saveCard(e, { components: { [f.key]: value || null } });
+          else save(e, { launch: { files: { [f.key]: value || null } } });
         },
         onkeydown: (ev) => { if (ev.key === 'Enter') input.blur(); },
       });
       const bad = !!(f.path && f.problem);
       const job = downloads.find((d) => d.assign.includes(`${e.name}.${f.key}`));
       grid.append(
-        h('span.mono-meta', { class: bad ? 'strong' : '' }, f.flag),
+        h('span.mono-meta', { class: bad ? 'strong' : '', title: f.label ?? f.what }, f.flag, f.required && !f.path ? h('span.accent', ' *') : null),
         h('label.seed-field', { class: bad ? 'bad' : '' }, icon('folder', 13), input),
         job ? h('span.mono-meta.accent', { title: `downloading ${job.label}` }, downloaded(job)) : h('span.mono-meta', size(f.size_bytes)),
         h('span.file-mark', { class: bad ? 'bad' : f.path ? 'ok' : '', title: f.problem ?? (f.path ? f.format : 'not set') },
           f.path ? icon(bad ? 'alert' : 'check', 15) : null));
       if (bad) grid.append(h('span'), h('span.file-problem', `${f.problem}.`));
     }
-    const needsVision = e.type === 'sdcpp' && !e.files.find((f) => f.key === 'llm_vision')?.path;
+    const vision = e.files.find((f) => f.key === 'llm_vision');
+    const needsVision = e.type === 'sdcpp' && vision && !vision.path;
     return h('div.tray-cell',
-      h('div.cell-head', h('span.eyebrow', 'Model files'), h('span.spacer'),
-        h('span.tray-hint.only-wide', 'paths on this machine · checked on save'),
+      h('div.cell-head', h('span.eyebrow', e.model_card ? 'Model files · its card\u2019s' : 'Model files'), h('span.spacer'),
+        h('span.tray-hint.only-wide', e.model_card ? 'saved to the card' : 'paths on this machine · checked on save'),
         h('button.mini', { type: 'button', onclick: () => hubDialog(e, { onChange: refresh }) }, icon('search', 12), 'Hugging Face')),
       grid,
       needsVision && h('span.tray-hint', 'Without --llm_vision, sd-server can only do t2i: drop edit and multi_ref below.'));
@@ -341,6 +344,69 @@ export function enginesScreen({ name: wanted = null, navigate }) {
     if (/[%$~]/.test(e.loras.path)) return false; // expanded on launch: can't compare
     const key = (p) => p.replace(/\\/g, '/').replace(/\/+$/, '').toLowerCase();
     return key(cmd[at + 1] ?? '') !== key(e.loras.path);
+  }
+
+  /** An sd-server engine's model card: which one it runs, and switching to another (which
+   *  restarts one launched here). */
+  function cardCell(e) {
+    const lib = modelLibrary();
+    if (!lib) loadModels().then((loaded) => { if (loaded) render(); });
+    const cards = lib?.items ?? [];
+    const card = cards.find((c) => c.id === e.model_card);
+    const running = e.process?.state === 'running' || e.process?.state === 'starting';
+    const pick = h('select.seed-input', {
+      'aria-label': 'Model card',
+      onchange: async () => {
+        const id = pick.value;
+        if (!id || id === e.model_card) return;
+        const chosen = cards.find((c) => c.id === id);
+        if (running && !window.confirm(`Restart ${EXE.sdcpp} with ${chosen?.name ?? id}?`)) {
+          pick.value = '';
+          return;
+        }
+        try {
+          await api.useModel(id, { engine: e.name, start: running });
+          toast(`${e.name} runs ${chosen?.name ?? id}${running ? ' · restarting' : ''}`);
+          loadModels();
+          loadBackends();
+          refresh();
+        } catch (err) {
+          toast(err.message, { error: true });
+          pick.value = '';
+        }
+      },
+    }, h('option', { value: '' }, card ? 'Switch to…' : cards.length ? 'Pick a model card…' : 'No model cards yet'),
+    cards.filter((c) => c.id !== e.model_card).map((c) => h('option', { value: c.id, disabled: e.launchable && !c.ready },
+      `${c.name}${c.family_name ? ` · ${c.family_name}` : ''}${c.ready ? '' : ' (not ready)'}`)));
+    const use = card?.engines.find((u) => u.engine === e.name);
+    const restart = use?.needs_restart && h('button.mini', {
+      type: 'button', onclick: () => act(async () => { await api.stopEngine(e.name); return api.startEngine(e.name); }, 'Restarting'),
+    }, icon('play', 12), 'Restart to load its files');
+    return h('div.tray-cell',
+      h('div.cell-head', h('span.eyebrow', 'Model'), h('span.spacer'),
+        h('a.mini', { href: '#/models' }, icon('layers', 12), 'Library')),
+      card
+        ? h('div.size-row',
+          h('a.cell-big', { href: `#/models/${card.id}` }, card.name),
+          h('span.mono-meta', [card.family_name, card.ready ? 'ready' : `needs ${card.missing.join(', ')}`].filter(Boolean).join(' · ')))
+        : h('span.cell-big', e.model_card ? 'its model card is gone' : 'set up by hand'),
+      h('label.seed-field', icon('layers', 13), pick),
+      restart,
+      h('span.tray-hint.wrap', card
+        ? `Its files, defaults and presets are the card's.${e.launchable ? ` Switching restarts ${EXE.sdcpp}.` : ' It says what this engine runs: switch models where it runs.'}`
+        : 'Without a card, the files below are used as they are set.'));
+  }
+
+  async function saveCard(e, patch) {
+    try {
+      await api.updateModel(e.model_card, patch);
+      loadModels();
+      refresh();
+      toast('Saved to its model card');
+    } catch (err) {
+      toast(err.message, { error: true });
+      render();
+    }
   }
 
   /** A Diffusers backend's model: a Hub repo id, or a local Diffusers folder. */
@@ -416,8 +482,10 @@ export function enginesScreen({ name: wanted = null, navigate }) {
       if (next.has(cap)) next.delete(cap); else next.add(cap);
       save(e, { declared_capabilities: [...next] });
     };
+    const vision = e.files.find((f) => f.key === 'llm_vision');
     const hint = e.type === 'sdcpp'
-      ? [e.files.find((f) => f.key === 'llm_vision')?.path ? 'edit and multi_ref need --llm_vision ✓' : 'edit and multi_ref need --llm_vision',
+      ? [vision && (vision.path ? 'edit and multi_ref need --llm_vision ✓' : 'edit and multi_ref need --llm_vision'),
+        e.family_name && `${e.family_name} sets what it can do`,
         e.loras && (e.loras.path ? 'lora needs a LoRA folder ✓' : 'lora needs a LoRA folder')].filter(Boolean).join(' · ')
       : [e.status === 'ok' ? `the engine reports ${e.capabilities.join(', ') || 'none'}` : 'checked against the engine when it is up',
         e.loras && (e.loras.path ? 'lora needs a LoRA folder ✓' : 'lora needs a LoRA folder')].filter(Boolean).join(' · ');
@@ -831,6 +899,8 @@ export async function enginePopover(anchor) {
   rows.length ? rows : h('div.pop-engine', h('span.tray-hint', 'No default engines are configured.')),
   h('button.menu-item.pop-settings', { type: 'button', onclick: () => go('#/engines') },
     icon('sliders', 15), 'Engine settings', h('span.spacer'), icon('arrowRight', 15)),
+  h('button.menu-item.pop-settings', { type: 'button', onclick: () => go('#/models') },
+    icon('layers', 15), 'Model library', h('span.spacer'), icon('arrowRight', 15)),
   h('button.menu-item.pop-settings', { type: 'button', onclick: () => go('#/loras') },
     icon('puzzle', 15), 'LoRA library', h('span.spacer'), icon('arrowRight', 15)),
   h('button.menu-item.pop-settings', { type: 'button', onclick: () => go('#/links') },

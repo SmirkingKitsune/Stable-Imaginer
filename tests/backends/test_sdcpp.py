@@ -5,14 +5,16 @@ import threading
 from pathlib import Path
 from typing import Any
 
+import httpx
 import pytest
 
 from imaginer.backends.base import EditRequest, GenProgress, GenRequest, ImageInput
 from imaginer.backends.common import lora_matches
+from imaginer.backends.openai_http.transport import HttpTransport
 from imaginer.backends.sdcpp import SdCppBackend
 from imaginer.core.config import LoraRef
 from imaginer.domain.enums import BackendStatus, Capability
-from imaginer.domain.errors import EngineError, InvalidRequestError
+from imaginer.domain.errors import EngineError, EngineTimeoutError, InvalidRequestError
 from imaginer.services.media import inspect_image_bytes
 from tests.conftest import sd_config
 from tests.fakes.fake_sdcpp import RGBA_MARKER, FakeSdCpp
@@ -191,6 +193,7 @@ async def test_engine_failure(fake_sd: FakeSdCpp) -> None:
     backend = await _backend(fake_sd.url)
     with pytest.raises(EngineError, match="CUDA out of memory"):
         await backend.generate(GenRequest(prompt="x", seed=1))
+    assert fake_sd.cancels == []  # already terminal: do not send a redundant cancellation
     await backend.aclose()
 
 
@@ -231,6 +234,39 @@ async def test_cancel_during_submit_still_cancels_the_engine_job(fake_sd: FakeSd
         await task
     assert fake_sd.cancels == list(fake_sd.jobs)  # the late-arriving job id was cancelled
     await backend.aclose()
+
+
+@pytest.mark.parametrize("cancel_fails", [False, True])
+async def test_poll_failure_cancels_remote_job_and_preserves_error(cancel_fails: bool) -> None:
+    calls: list[tuple[str, str]] = []
+
+    def reply(request: httpx.Request) -> httpx.Response:
+        calls.append((request.method, request.url.path))
+        if request.url.path.endswith("/img_gen"):
+            return httpx.Response(202, json={"id": "job1"})
+        if request.url.path.endswith("/cancel"):
+            return httpx.Response(500 if cancel_fails else 200, json={})
+        raise httpx.ReadTimeout("lost poll", request=request)
+
+    config = sd_config("http://engine", retry={"attempts": 1})
+    transport = HttpTransport(
+        name="sd",
+        base_url=config.base_url,
+        timeouts=config.timeouts,
+        retry=config.retry,
+        client=httpx.AsyncClient(base_url=config.base_url, transport=httpx.MockTransport(reply)),
+    )
+    backend = SdCppBackend("sd", config, transport=transport)
+    try:
+        with pytest.raises(EngineTimeoutError, match="lost poll"):
+            await backend.generate(GenRequest(prompt="x", seed=1))
+        assert calls == [
+            ("POST", "/sdcpp/v1/img_gen"),
+            ("GET", "/sdcpp/v1/jobs/job1"),
+            ("POST", "/sdcpp/v1/jobs/job1/cancel"),
+        ]
+    finally:
+        await backend.aclose()
 
 
 async def test_edit_size_follows_first_image_and_refs_are_fitted(fake_sd: FakeSdCpp) -> None:
@@ -324,6 +360,34 @@ async def test_preset_steps_replace_a_default_sigma_schedule(fake_sd: FakeSdCpp)
     await backend.generate(GenRequest(prompt="x", seed=1, preset="turbo"))
     assert "custom_sigmas" in fake_sd.requests[-1]["sample_params"]
     await backend.aclose()
+
+
+@pytest.mark.parametrize("preset", [None, "turbo"])
+@pytest.mark.parametrize("explicit_sigmas", [False, True])
+async def test_request_steps_replace_only_inherited_sigmas(
+    fake_sd: FakeSdCpp, preset: str | None, explicit_sigmas: bool
+) -> None:
+    backend = await _backend(
+        fake_sd.url,
+        defaults=_defaults(sigmas="qwen-image-2.1-turbo"),
+        presets={"turbo": {"sigmas": "qwen-image-2.1-turbo"}},
+    )
+    params: dict[str, Any] = {"steps": 5}
+    if explicit_sigmas:
+        params["sigmas"] = [1.0, 0.5, 0.0]
+    try:
+        (result,) = await backend.generate(
+            GenRequest(prompt="x", seed=1, preset=preset, params=params)
+        )
+        sample = fake_sd.requests[-1]["sample_params"]
+        assert sample["sample_steps"] == 5
+        if explicit_sigmas:
+            assert sample["custom_sigmas"] == params["sigmas"]
+        else:
+            assert "custom_sigmas" not in sample
+            assert "sigmas" not in result.params
+    finally:
+        await backend.aclose()
 
 
 async def test_default_loras_apply_unless_a_preset_drops_them(fake_sd: FakeSdCpp) -> None:

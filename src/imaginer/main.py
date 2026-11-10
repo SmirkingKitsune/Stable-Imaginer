@@ -17,6 +17,7 @@ from imaginer.api import (
     conversations,
     engines,
     hub,
+    image_models,
     jobs,
     links,
     loras,
@@ -82,6 +83,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     own.include_router(engines.router)
     own.include_router(hub.router)
     own.include_router(loras.router)
+    own.include_router(image_models.router)
     own.include_router(links.router)
     own.include_router(links.gallery_router)
     app.include_router(own)

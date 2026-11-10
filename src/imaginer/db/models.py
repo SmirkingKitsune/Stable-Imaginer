@@ -272,3 +272,33 @@ class LoraFile(Base):
     # {"repo", "revision", "words", "images", "base_models"} from the Hub's model card.
     source: Mapped[dict[str, Any] | None] = mapped_column(JSONType)
     hashed_at: Mapped[datetime | None] = mapped_column(UTCDateTime)
+
+
+# --- the model library ------------------------------------------------------------------
+
+
+class ImageModelRecord(Base):
+    """A model card: one image model the user imported, as the components sd-server loads
+    (by its recipe's slot names) and the settings that go with it. An sd-server engine runs
+    the card its ``model_card`` names."""
+
+    __tablename__ = "image_model"
+
+    id: Mapped[str] = mapped_column(sa.String(64), primary_key=True)
+    name: Mapped[str] = mapped_column(sa.Text)
+    family: Mapped[str | None] = mapped_column(sa.String(64))  # an sd-server recipe id
+    # {slot: path}, e.g. {"diffusion_model": "D:/m/flux1-dev-Q8_0.gguf", "vae": ...}
+    components: Mapped[dict[str, Any]] = mapped_column(JSONType)
+    # {slot: {"repo", "revision", "path"}}: where the Hub installed a component from.
+    sources: Mapped[dict[str, Any] | None] = mapped_column(JSONType)
+    # {"vae_format", "model_args", "extra_args"}
+    launch: Mapped[dict[str, Any] | None] = mapped_column(JSONType)
+    defaults: Mapped[dict[str, Any] | None] = mapped_column(JSONType)  # ImageDefaults
+    presets: Mapped[dict[str, Any] | None] = mapped_column(JSONType)  # {name: ImagePreset}
+    prompt_hint: Mapped[str | None] = mapped_column(sa.Text)  # None: the family's
+    notes: Mapped[str | None] = mapped_column(sa.Text)
+    tags: Mapped[list[str] | None] = mapped_column(JSONType)
+    pinned: Mapped[bool] = mapped_column(sa.Boolean, default=False, server_default=sa.false())
+    cover: Mapped[dict[str, Any] | None] = mapped_column(JSONType)
+    created_at: Mapped[datetime] = mapped_column(UTCDateTime)
+    updated_at: Mapped[datetime] = mapped_column(UTCDateTime)

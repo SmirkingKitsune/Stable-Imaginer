@@ -9,7 +9,9 @@ from imaginer.hub.layout import RepoFile
 from tests.fakes.fake_hub import FakeHub, FakeRepo, gguf, weights
 from tests.fakes.live import LiveServer
 
-LISTINGS = Path(__file__).with_name("listings.json")  # real Hub listings, captured 2026-10-30
+LISTINGS = Path(__file__).with_name(
+    "listings.json"
+)  # real Hub listings, captured 2026-10-30 and 2026-11-08
 
 
 @pytest.fixture(autouse=True)

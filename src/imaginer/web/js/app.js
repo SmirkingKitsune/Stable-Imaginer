@@ -7,6 +7,7 @@
 //   #/engines          engine settings    #/engines/sdcpp      on one backend
 //   #/links            linked instances
 //   #/loras            the LoRA library   #/loras/<id>         one LoRA
+//   #/models           the model library  #/models/<id>        one model card
 //   #/l/<link>/c/...   the same conversation routes, for one that lives on a linked instance
 
 import { setToken, whenUnauthorized } from './api.js';
@@ -18,6 +19,7 @@ import { galleryScreen } from './gallery.js';
 import { linksScreen } from './links.js';
 import { loraScreen, lorasScreen } from './loras.js';
 import { maskScreen } from './mask.js';
+import { modelScreen, modelsScreen } from './models.js';
 import { baseOf, place } from './origin.js';
 import { backendsFrom, loadBackends, notePlace } from './store.js';
 import { viewerScreen } from './viewer.js';
@@ -47,6 +49,7 @@ function parse(hash) {
   if (parts[0] === 'engines') return { name: 'engines', engine: parts[1] ?? null };
   if (parts[0] === 'links') return { name: 'links' };
   if (parts[0] === 'loras') return parts[1] ? { name: 'lora', id: parts[1] } : { name: 'loras' };
+  if (parts[0] === 'models') return parts[1] ? { name: 'model', id: parts[1] } : { name: 'models' };
   if (parts[0] === 'c' && parts[1]) {
     if (parts[2] === 'chat') return { name: 'conversation', id: parts[1], link };
     if (parts[2] === 'mask' && parts[3]) return { name: 'mask', id: parts[1], label: parts[3], link };
@@ -70,7 +73,7 @@ function route() {
   pendingFocus = false;
   screen?.destroy();
   root.replaceChildren();
-  const conv = r.name !== 'lora' && r.id;
+  const conv = r.name !== 'lora' && r.name !== 'model' && r.id;
   if (conv) place(r.id, r.link);
   backendsFrom(conv ? baseOf(r.id) : '');
   if (r.name === 'conversation') screen = conversationScreen({ id: r.id, navigate, focusBar });
@@ -79,6 +82,8 @@ function route() {
   else if (r.name === 'links') screen = linksScreen({ navigate });
   else if (r.name === 'loras') screen = lorasScreen({ navigate });
   else if (r.name === 'lora') screen = loraScreen({ id: r.id, navigate });
+  else if (r.name === 'models') screen = modelsScreen({ navigate });
+  else if (r.name === 'model') screen = modelScreen({ id: r.id, navigate });
   else if (r.name === 'viewer') screen = viewerScreen({ id: r.id, label: r.label, navigate });
   else screen = galleryScreen({ archived: r.archived, navigate });
   mounted = r;
@@ -94,7 +99,8 @@ let dragDepth = 0;
 const hasFiles = (e) => [...(e.dataTransfer?.types ?? [])].includes('Files');
 
 window.addEventListener('dragenter', (e) => {
-  if (!hasFiles(e)) return;
+  // Only a screen with a prompt bar takes images; others (the model import) have their own.
+  if (!hasFiles(e) || !screen?.bar) return;
   dragDepth += 1;
   dropHint.hidden = false;
 });

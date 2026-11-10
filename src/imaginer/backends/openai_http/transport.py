@@ -108,10 +108,18 @@ class HttpTransport:
         raise AssertionError("unreachable")  # pragma: no cover
 
     async def get_json(self, path: str, **kwargs: Any) -> Any:
-        return (await self.request("GET", path, **kwargs)).json()
+        return self._json(await self.request("GET", path, **kwargs), path)
 
     async def post_json(self, path: str, body: Any, **kwargs: Any) -> Any:
-        return (await self.request("POST", path, json=body, **kwargs)).json()
+        return self._json(await self.request("POST", path, json=body, **kwargs), path)
+
+    def _json(self, response: httpx.Response, path: str) -> Any:
+        try:
+            return response.json()
+        except ValueError as exc:
+            raise EngineError(
+                f"{self.name} returned invalid JSON for {path}", backend=self.name
+            ) from exc
 
     @asynccontextmanager
     async def stream(

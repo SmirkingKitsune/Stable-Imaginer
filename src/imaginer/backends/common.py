@@ -23,7 +23,9 @@ SIGMA_PRESETS: dict[str, list[float]] = {
         1.0, 0.978453, 0.95418, 0.926626, 0.89508, 0.845148, 0.704534, 0.414568, 0.0,
     ],
 }  # fmt: skip
-PARAM_KEYS = ("steps", "cfg_scale", "sampler", "scheduler", "flow_shift", "sigmas")
+PARAM_KEYS = (
+    "steps", "cfg_scale", "sampler", "scheduler", "flow_shift", "sigmas", "guidance", "clip_skip",
+)  # fmt: skip
 LORAS_SHOWN = 12  # in an error about a LoRA the engine doesn't have
 LORA_SCAN_LIMIT = 5000  # folder entries looked at before a LoRA folder's listing stops
 
@@ -106,12 +108,16 @@ def resolve_params(
         "scheduler": defaults.scheduler,
         "flow_shift": defaults.flow_shift,
         "sigmas": defaults.sigmas,
+        "guidance": defaults.guidance,
+        "clip_skip": defaults.clip_skip,
     }
     if preset is not None:
         params.update({k: getattr(preset, k) for k in PARAM_KEYS if getattr(preset, k) is not None})
         if preset.steps is not None and preset.sigmas is None:
             params["sigmas"] = None  # a default sigma schedule would decide the steps instead
         params["preset"] = req.preset
+    if req.params.get("steps") is not None and "sigmas" not in req.params:
+        params["sigmas"] = None  # explicit steps replace an inherited schedule
     params.update({k: v for k, v in req.params.items() if k in PARAM_KEYS})
     params["negative_prompt"] = (
         req.negative_prompt if req.negative_prompt is not None else defaults.negative_prompt
@@ -363,7 +369,8 @@ def scan_loras(folder: Path, extensions: frozenset[str]) -> dict[str, dict[str, 
 
 
 def styled_prompt(req: GenRequest, rgba_template: str) -> str:
-    """Qwen-Image-2.1 decides transparency from the prompt, using its official phrasing."""
+    """Transparency is prompt-driven (Qwen-Image-2.1's official phrasing, or the model
+    family's own template)."""
     if req.alpha:
         return rgba_template.format(prompt=req.prompt.strip().rstrip("."))
     return req.prompt

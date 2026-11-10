@@ -19,7 +19,7 @@ import asyncio
 import contextlib
 import os
 from collections import defaultdict
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Iterable
 from pathlib import Path, PurePosixPath
 from typing import Any, Literal
 
@@ -62,8 +62,10 @@ from imaginer.hub.layout import (
 )
 from imaginer.hub.local import LocalCopy, find_copy, partial_bytes, repo_dir, safe_relpath
 from imaginer.hub.refs import HubRef, RefError, parse_ref
+from imaginer.image_models import recipes
 
 MODEL_ID = "model_id"  # the "launch setting" of a Diffusers backend
+MODEL_CARD = "model:"  # what a download for a model card's slot is assigned to: model:<id>
 LORA = "lora"  # the role of an engine's LoRAs: installed into its LoRA folder
 # The setting a LoRA install sets when the engine has no LoRA folder yet, by engine type.
 LORA_FOLDERS = {"sdcpp": "lora_model_dir", "diffusers": "lora_dir"}
@@ -90,6 +92,15 @@ class HubService:
         self.downloads = DownloadManager(self.client, on_success=self._assign)
         # Told where a LoRA from the Hub goes, and what its card says (the LoRA library).
         self.on_lora_install: Callable[[Path, dict[str, Any]], Awaitable[None]] | None = None
+        # Told a model card's component is downloaded: card id, slot, file, where it came
+        # from (the model library).
+        self.on_model_install: (
+            Callable[[str, str, Path, dict[str, Any]], Awaitable[None]] | None
+        ) = None
+        # A model card as an engine config (its family and files), to match a repo to its
+        # slots; and every card's (card id, slot, path), to say which files are in use.
+        self.model_config: Callable[[str], SdCppBackendConfig] | None = None
+        self.model_components: Callable[[], Iterable[tuple[str, str, str]]] | None = None
 
     def _token(self) -> str | None:
         return find_token(self._settings.hub.token_env).token
@@ -179,12 +190,33 @@ class HubService:
 
     # --- one repo ---------------------------------------------------------------------------
 
-    async def repo(self, reference: str, *, engine: str | None = None) -> dto.HubRepo:
+    async def repo(
+        self, reference: str, *, engine: str | None = None, model: str | None = None
+    ) -> dto.HubRepo:
         self._require_enabled()
         ref = _parse(reference)
-        config = self._engine_config(engine) if engine else None
+        if model:
+            config: BackendConfig | None = self._model_config(model)
+        else:
+            config = self._engine_config(engine) if engine else None
         info, layout = await self._load(ref)
-        return await asyncio.to_thread(self._repo_view, ref, info, layout, engine, config)
+        view = await asyncio.to_thread(
+            self._repo_view, ref, info, layout, None if model else engine, config, bool(model)
+        )
+        return view.model_copy(update={"model": model}) if model else view
+
+    def _model_config(self, card_id: str) -> SdCppBackendConfig:
+        if self.model_config is None:
+            raise InvalidRequestError("there is no model library here")
+        return self.model_config(card_id)
+
+    async def inspect(self, reference: str) -> tuple[HubRef, RepoInfo, RepoLayout]:
+        """A repo's listing and what its files are, for a reference (the model library
+        guesses a model's family from them)."""
+        self._require_enabled()
+        ref = _parse(reference)
+        info, layout = await self._load(ref)
+        return ref, info, layout
 
     async def _load(self, ref: HubRef) -> tuple[RepoInfo, RepoLayout]:
         info = await self.client.repo(ref.repo_id, ref.revision)
@@ -211,9 +243,10 @@ class HubService:
         layout: RepoLayout,
         engine: str | None,
         config: BackendConfig | None,
+        card: bool = False,
     ) -> dto.HubRepo:
         in_use = self._in_use()
-        lora_dir = self._lora_dir(config)
+        lora_dir = None if card else self._lora_dir(config)
         variants = [
             self._lora_variant(ref.repo_id, v, lora_dir, f"{engine}.{LORA}")
             if lora_dir is not None and v.component == "lora"
@@ -225,7 +258,7 @@ class HubService:
             if layout.pipeline is not None
             else None
         )
-        roles = self._roles(ref, layout, config) if config is not None else []
+        roles = self._roles(ref, layout, config, card=card) if config is not None else []
         notes = list(layout.notes)
         # (A transformers checkpoint's own note already says what to look for instead.)
         nothing = not any(r.candidates for r in roles) and layout.kind != "transformers"
@@ -264,6 +297,8 @@ class HubService:
             name=v.name,
             component=v.component,
             format=v.format,
+            encoder=v.encoder,
+            tiny=v.tiny,
             quant=v.quant,
             size_bytes=v.size,
             shards=len(v.files) - v.indexed,
@@ -321,7 +356,9 @@ class HubService:
             else partial_bytes(repo_id, p.files, models_dir=self.models_dir),
         )
 
-    def _roles(self, ref: HubRef, layout: RepoLayout, config: BackendConfig) -> list[dto.HubRole]:
+    def _roles(
+        self, ref: HubRef, layout: RepoLayout, config: BackendConfig, *, card: bool = False
+    ) -> list[dto.HubRole]:
         if isinstance(config, DiffusersBackendConfig):
             pipeline = dto.HubRole(key=MODEL_ID, what="Diffusers pipeline", current=config.model_id)
             return [pipeline, self._lora_role(layout, config)]
@@ -346,7 +383,7 @@ class HubService:
                     suggested=pick.id if pick else None,
                 )
             )
-        if isinstance(config, SdCppBackendConfig) and config.launch is not None:
+        if isinstance(config, SdCppBackendConfig) and config.launch is not None and not card:
             roles.append(self._lora_role(layout, config))
         return roles
 
@@ -372,6 +409,9 @@ class HubService:
             for check in launch.check_files(config) if launch.file_specs(config) else []:
                 if check.path is not None:
                     found[_key(check.path)].append(f"{name}.{check.key}")
+        if self.model_components is not None:
+            for card, slot, path in self.model_components():
+                found[_key(path)].append(f"{MODEL_CARD}{card}.{slot}")
         return found
 
     def _engine_config(self, name: str) -> BackendConfig:
@@ -391,12 +431,26 @@ class HubService:
             ref = HubRef(ref.repo_id, body.revision, ref.path, ref.quant)
         assign: tuple[str, str] | None = None
         source: Path | None = None  # a copy on this machine to copy instead of downloading
-        config = None
+        config: BackendConfig | None = None
+        if body.model is not None:
+            if body.engine is not None:
+                raise InvalidRequestError("say one thing to set: engine, or model")
+            if body.key not in recipes.SLOT_IDS:
+                raise InvalidRequestError(f"say which of the model's slots to set: {body.key!r}")
+            if self.on_model_install is None:
+                raise InvalidRequestError("there is no model library here")
+            config = self._model_config(body.model)
+            assign = (f"{MODEL_CARD}{body.model}", body.key)
         if body.engine is not None:
             config = self._engine_config(body.engine)
             if body.key is None:
                 raise InvalidRequestError("say which setting to set: key")
-            assign = (body.engine, body.key)
+            card = getattr(config, "model_card", None)
+            # An engine that runs a model card loads the card's files: the download is it.
+            if card and body.key in recipes.SLOT_IDS and self.on_model_install is not None:
+                assign = (f"{MODEL_CARD}{card}", body.key)
+            else:
+                assign = (body.engine, body.key)
         info, layout = await self._load(ref)
         commit = info.sha or ref.revision
         root = repo_dir(self.models_dir, ref.repo_id)
@@ -494,6 +548,19 @@ class HubService:
         engine was removed meanwhile) doesn't stop the others."""
         failed = []
         for engine, key in job.assign:
+            if engine.startswith(MODEL_CARD):
+                card = engine.removeprefix(MODEL_CARD)
+                where = {
+                    "repo": job.repo_id,
+                    "revision": job.revision,
+                    "path": job.target.relative_to(job.root).as_posix(),
+                }
+                try:
+                    assert self.on_model_install is not None
+                    await self.on_model_install(card, key, job.target, where)
+                except ImaginerError as exc:
+                    failed.append(f"{card}.{key}: {exc.detail}")
+                continue
             if key == MODEL_ID:
                 update = dto.EngineUpdate(model_id=str(job.target))
             elif key in LORA_FOLDERS.values():

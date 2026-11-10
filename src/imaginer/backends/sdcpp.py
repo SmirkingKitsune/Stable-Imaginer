@@ -58,10 +58,16 @@ from imaginer.backends.common import (
 )
 from imaginer.backends.openai_http.transport import HttpTransport
 from imaginer.core.clock import utcnow
-from imaginer.core.config import BackendConfig, SdCppBackendConfig
+from imaginer.core.config import (
+    DEFAULT_MASK_INSTRUCTION,
+    DEFAULT_RGBA_PROMPT_TEMPLATE,
+    BackendConfig,
+    SdCppBackendConfig,
+)
 from imaginer.core.logging import get_logger
 from imaginer.domain.enums import BackendStatus, Capability
 from imaginer.domain.errors import EngineError, ImaginerError, InvalidRequestError
+from imaginer.image_models import recipes
 from imaginer.services.media import inspect_image_bytes
 
 log = get_logger(__name__)
@@ -73,17 +79,36 @@ SUPPORTED: frozenset[Capability] = frozenset(
 )
 UNLISTED = "start sd-server with --lora-model-dir, launch.lora_model_dir here"
 LIVE_FIELDS = frozenset({"presets", "defaults"})  # read per request: no new adapter
+LEGACY_SIZE_MULTIPLE = 32  # Qwen-Image-2.1's, for an engine with no family
 
 
 def _lora_dir_of(config: SdCppBackendConfig) -> object:
     return config.launch.lora_model_dir if config.launch is not None else None
 
 
+def family_capabilities(config: SdCppBackendConfig) -> frozenset[Capability]:
+    """What the engine's model family can do at most (all of it, without a family)."""
+    family = recipes.family(config.family)
+    return SUPPORTED & family.capabilities() if family is not None else SUPPORTED
+
+
 def expected_capabilities(config: SdCppBackendConfig) -> set[Capability]:
     """What a started sd-server will report once loaded, before it can be probed: what a
-    command-line launch reports, narrowed by ``declared_capabilities``."""
+    command-line launch reports for its model's family, narrowed by
+    ``declared_capabilities``."""
     declared = config.declared_capabilities
-    return set(SUPPORTED & declared if declared is not None else SUPPORTED)
+    supported = family_capabilities(config)
+    return set(supported & declared if declared is not None else supported)
+
+
+def size_multiple(config: SdCppBackendConfig | None) -> int:
+    """What sizes snap to: the config's, else its model family's, else Qwen-Image-2.1's."""
+    if config is None:
+        return LEGACY_SIZE_MULTIPLE
+    if config.size_multiple is not None:
+        return config.size_multiple
+    family = recipes.family(config.family)
+    return family.size_multiple if family is not None else LEGACY_SIZE_MULTIPLE
 
 
 class SdCppBackend:
@@ -105,14 +130,43 @@ class SdCppBackend:
             retry=config.retry,
             api_key=config.api_key(),
         )
-        declared = config.declared_capabilities
-        self._declared = SUPPORTED & declared if declared is not None else SUPPORTED
+        self._family = recipes.family(config.family)
+        self._declared = frozenset(expected_capabilities(config))
         self._probed: set[Capability] = set()
         self._model = "unknown"
         self._max_side = 4096
         self._preview_modes: set[str] = set()
         self._loras: dict[str, dict[str, Any]] | None = None  # path -> entry; None: not listed
+        self._recipes_read = False
         check_sigmas(config.defaults, config.presets)
+
+    @property
+    def size_multiple(self) -> int:
+        return size_multiple(self._config)
+
+    @property
+    def family(self) -> str | None:
+        return self._family.id if self._family is not None else None
+
+    @property
+    def model_card(self) -> str | None:
+        """The model card the engine runs, if it runs one (recorded with each image)."""
+        return self._config.model_card
+
+    def _rgba_template(self) -> str:
+        if self._config.rgba_prompt_template is not None:
+            return self._config.rgba_prompt_template
+        if self._family is not None and self._family.rgba:
+            return self._family.rgba
+        return DEFAULT_RGBA_PROMPT_TEMPLATE
+
+    def _mask_instruction(self) -> str | None:
+        """How a mask is explained to the model; None when its family takes no mask."""
+        if self._config.mask_instruction is not None:
+            return self._config.mask_instruction
+        if self._family is None:
+            return DEFAULT_MASK_INSTRUCTION
+        return self._family.mask
 
     def update_config(self, config: BackendConfig) -> bool:
         """Take new presets or defaults as they are: requests read them. False when
@@ -185,16 +239,37 @@ class SdCppBackend:
         limits = caps.get("limits") or {}
         self._max_side = int(min(limits.get("max_width", 4096), limits.get("max_height", 4096)))
         self._preview_modes = set(caps.get("preview_modes") or [])
+        if not self._recipes_read:
+            await self._read_recipes()
         detail = f"model {self._model}"
         if self._config.declared_capabilities is None:
             detail += "; edit/rgba support assumed (set declared_capabilities to restrict)"
         return self._health(BackendStatus.OK, started, detail)
+
+    async def _read_recipes(self) -> None:
+        """The engine's own recipes, which describe its build's families better than the
+        bundled snapshot. Builds before the recipe API have none; that's fine."""
+        self._recipes_read = True
+        with contextlib.suppress(ImaginerError):
+            listed = await self._transport.get_json(
+                "/sdcpp/v1/recipes", timeout_s=HEALTH_TIMEOUT_S, attempts=1
+            )
+            if isinstance(listed, dict):
+                taken = recipes.catalog().take_engine_recipes(listed.get("recipes"))
+                log.debug("sdcpp.recipes", backend=self.name, recipes=taken)
 
     async def generate(self, req: GenRequest) -> list[ImageResult]:
         return await self._run(req, [])
 
     async def edit(self, req: EditRequest) -> list[ImageResult]:
         # Qwen-Image-2.1 takes "separate masks" as one more reference image, said in the prompt.
+        instruction = self._mask_instruction()
+        if req.mask is not None and instruction is None:
+            name = self._family.name if self._family is not None else "its model"
+            raise InvalidRequestError(
+                f"{self.name} can't edit with a mask: {name} takes reference images only",
+                backend=self.name,
+            )
         fitted = await prepare_inputs(
             self.name,
             req.images,
@@ -202,8 +277,8 @@ class SdCppBackend:
             max_inputs=self._config.max_ref_images,
             max_pixels=default_max_ref_pixels(self._config.defaults, self._config.max_ref_pixels),
         )
-        if req.mask is not None:
-            req = replace(req, prompt=mask_prompt(req.prompt, self._config.mask_instruction))
+        if req.mask is not None and instruction is not None:
+            req = replace(req, prompt=mask_prompt(req.prompt, instruction))
         base = (fitted[0].width, fitted[0].height)
         refs = [_data_url(f.data, f.mime) for f in fitted]
         return await self._run(req, refs, base_size=base)
@@ -219,7 +294,7 @@ class SdCppBackend:
         return resolve_params(
             req,
             self._config.defaults,
-            size_multiple=self._config.size_multiple,
+            size_multiple=self.size_multiple,
             max_side=self._max_side,
             base_size=base_size,
             preset=find_preset(self.name, self._config.presets, req.preset),
@@ -238,8 +313,11 @@ class SdCppBackend:
         return merge_loras(matched)
 
     def _body(self, req: GenRequest, params: dict[str, Any], refs: list[str]) -> dict[str, Any]:
-        prompt = styled_prompt(req, self._config.rgba_prompt_template)
-        sample: dict[str, Any] = {}
+        prompt = styled_prompt(req, self._rgba_template())
+        extra = dict(self._config.defaults.extra)
+        sample: dict[str, Any] = _merged(
+            extra.pop("sample_params", None) or {}, self._config.defaults.extra_sample
+        )
         if "steps" in params:
             sample["sample_steps"] = params["steps"]
         if "sampler" in params:
@@ -250,13 +328,20 @@ class SdCppBackend:
             sample["flow_shift"] = params["flow_shift"]
         if (schedule := sigmas(params.get("sigmas"))) is not None:
             sample["custom_sigmas"] = schedule
+        guidance: dict[str, Any] = dict(sample.get("guidance") or {})
         if "cfg_scale" in params:
-            sample["guidance"] = {"txt_cfg": params["cfg_scale"]}
+            guidance["txt_cfg"] = params["cfg_scale"]
+        if "guidance" in params:
+            guidance["distilled_guidance"] = params["guidance"]
+        if guidance:
+            sample["guidance"] = guidance
         preview = self._config.preview
         if self._preview_modes and preview not in self._preview_modes:
             preview = "none"
+        if self._family is not None and not self._family.previews:
+            preview = "none"  # pixel-space models make no previews
         body: dict[str, Any] = {
-            **self._config.defaults.extra,
+            **extra,
             "prompt": prompt,
             "negative_prompt": params.get("negative_prompt", ""),
             "width": params["width"],
@@ -267,6 +352,8 @@ class SdCppBackend:
             "preview": preview,
             "preview_interval": self._config.preview_interval,
         }
+        if "clip_skip" in params:
+            body["clip_skip"] = params["clip_skip"]
         if sample:
             body["sample_params"] = sample
         if refs:
@@ -309,6 +396,7 @@ class SdCppBackend:
         job_id = await self._submit(body)
         log.info("sdcpp.submitted", backend=self.name, engine_job_id=job_id, seed=req.seed)
         last_step = -1
+        terminal = False
         try:
             if req.on_submitted is not None:
                 await req.on_submitted(job_id)
@@ -316,6 +404,7 @@ class SdCppBackend:
                 await asyncio.sleep(self._config.poll_interval_s)
                 job = await self._transport.get_json(f"/sdcpp/v1/jobs/{job_id}")
                 status = job.get("status")
+                terminal = status in ("completed", "failed", "cancelled")
                 preview = job.get("preview") or {}
                 step = preview.get("step")
                 if req.on_progress is not None and isinstance(step, int) and step != last_step:
@@ -333,9 +422,12 @@ class SdCppBackend:
                         backend=self.name,
                         engine_job_id=job_id,
                     )
-        except asyncio.CancelledError:
-            # Free the GPU: the engine would otherwise finish an image nobody wants.
-            await asyncio.shield(self._cancel_remote(job_id))
+        except (Exception, asyncio.CancelledError):
+            # Abandoning polling must free the GPU too. Preserve the original failure
+            # if the best-effort cancellation cannot reach the engine.
+            if not terminal:
+                with contextlib.suppress(Exception):
+                    await asyncio.shield(self._cancel_remote(job_id))
             raise
 
     async def _submit(self, body: dict[str, Any]) -> str:
@@ -395,6 +487,17 @@ class SdCppBackend:
             detail=detail,
             probed_at=utcnow(),
         )
+
+
+def _merged(base: dict[str, Any], over: dict[str, Any]) -> dict[str, Any]:
+    """``over`` on ``base``, nested mappings merged too."""
+    out = dict(base)
+    for key, value in over.items():
+        if isinstance(value, dict) and isinstance(out.get(key), dict):
+            out[key] = _merged(out[key], value)
+        else:
+            out[key] = value
+    return out
 
 
 def _data_url(data: bytes, mime: str) -> str:

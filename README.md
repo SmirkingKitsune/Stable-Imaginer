@@ -4,7 +4,9 @@ Backend for a local, single-user multimodal chat app. A FastAPI orchestrator own
 conversations and their artifacts, and talks to separate inference engines over HTTP:
 
 - **Chat LLM:** `llama.cpp`'s `llama-server`. The reference model is Qwen3-VL-8B-Instruct, with vision and tool calling.
-- **Images:** `stable-diffusion.cpp`'s `sd-server` running Qwen-Image-2.1, reached through its native `/sdcpp/v1` API.
+- **Images:** `stable-diffusion.cpp`'s `sd-server`, reached through its native `/sdcpp/v1` API. It runs
+  any image family sd-server supports (SD 1.x/SDXL, SD3, FLUX.1/2/3, Chroma, Qwen Image, Z-Image…),
+  each one a model card in the [model library](docs/models.md). The reference model is Qwen-Image-2.1.
 - **Optional:** an in-process Hugging Face Diffusers backend, used as the reference implementation.
 
 Every artifact (upload, generated image, edit) belongs to exactly one conversation. It is
@@ -88,14 +90,18 @@ for nesting, for example `IMAGINER_SERVER__PORT=9000` or `IMAGINER_DATA_ROOT=D:/
 - Hugging Face token, for gated repos: `HF_TOKEN`, or log in once with `hf auth login`. The
   server reads it the way the `hf` CLI does (see [docs/huggingface.md](docs/huggingface.md)).
 
-Sampler defaults (steps, CFG, sampler, sigmas, size) are **per backend**, because engines
-disagree. For Qwen-Image-2.1, the sd.cpp docs use CFG 6.0 with euler, while Diffusers samples
-without guidance (CFG 1.0) at 40 steps.
+Sampler defaults (steps, CFG, sampler, sigmas, size) belong to the **model**. For sd-server
+they are the engine's model card's, seeded from its family's recipe
+([docs/models.md](docs/models.md)), and the card's presets come with them. Otherwise they are
+per backend, because engines disagree. For Qwen-Image-2.1, the sd.cpp docs use CFG 6.0 with
+euler, while Diffusers samples without guidance (CFG 1.0) at 40 steps.
 
 More image settings:
 
-- **Sizes** default to 2048x2048, Qwen-Image-2.1's native 2K. They are rounded to
-  `size_multiple` (default 32, which Qwen-Image-2.1 requires). An `aspect_ratio` keeps the
+- **Sizes** default to the model's native size: 2048x2048 for Qwen-Image-2.1, 1024x1024 for
+  most others. They are rounded to its family's size multiple: 32 for Qwen-Image-2.1, 64 for SD
+  1.x/SDXL, 16 or 8 for most others. A backend's `size_multiple` overrides it. An
+  `aspect_ratio` keeps the
   default image's pixel area. A 2K image is about four times the work of a 1K one; if
   sd-server runs out of VRAM decoding it, add `--vae-tiling` to `launch.extra_args`.
 - **Sigmas:** `defaults.sigmas` accepts a list of numbers or the preset
@@ -273,6 +279,10 @@ conversation stays hidden and a background sweep finishes the delete later.
 | `PATCH`, `DELETE` | `/v1/loras/{id}` | display name, default weight, trigger words, notes, tags, pin, lineage, your call per model; `DELETE` deletes its file and takes it out of presets |
 | `POST` | `/v1/loras/{id}/move`, `/v1/loras/{id}/presets` | move its file to another folder (presets follow); put it in, or take it out of, an engine's preset, or make one |
 | `GET`, `PUT`, `DELETE` | `/v1/loras/{id}/cover` | its cover: from a conversation's image (`artifact_id`) or its Hub card (`hub`), kept as a 768 px WebP |
+| `GET`, `POST` | `/v1/models`, `/v1/models/{id}` | the model library: a card per image model (family, component files, launch arguments, defaults, presets), each checked on disk; `POST` makes one from a file (`path`), a Hub reference (`ref`) or a `family` |
+| `PATCH`, `DELETE` | `/v1/models/{id}` | name, family, components, launch, defaults, presets, prompt note, notes, tags, pin; `DELETE` forgets the card (not while an engine runs it) |
+| `POST` | `/v1/models/{id}/use`, `/v1/models/detect` | run it on an sd-server engine (restarting one that runs); guess a file's or repo's family |
+| `GET` | `/v1/models/families`, `/v1/models/families/{id}` | the families sd-server runs: each recipe's slots, defaults, features and Hugging Face sources |
 | `GET` | `/v1/gallery?limit=&cursor=&include_archived=` | this instance's conversations and every linked instance's, newest activity first; each item has an `origin` (`base_path` reaches a remote one), each page `sources` with their status |
 | `GET`, `POST` | `/v1/links`, `/v1/links/discovered` | the Links screen: this instance, its links and what each shares (with VRAM fit); `POST {url, code, name?}` pairs |
 | `POST` | `/v1/links/pairing-code` | a code another instance can pair with (10 minutes, single use) |
@@ -510,6 +520,14 @@ It follows the "Imaginer Main Interface" design, which is built on the Industry 
   with your call (Auto, Works, Doesn't) and lineage; picks a cover from the images made with
   it, any conversation's or its Hub card's; and lists the conversations that used it. "Use in
   next prompt" goes back to where you were and puts the LoRA in the prompt as a mention.
+- **Model library** (`#/models`, from the status line's menu or the Engines Model cell): a card
+  per image model imported for sd-server, with its family, whether every file it needs is
+  here, and the engines running it; and every component file on disk with the cards that use
+  it. **Import a model** detects a file's family from its weights, name or Hub repo. A card's
+  page (`#/models/<id>`) fills each slot of its family by path, by reusing another card's
+  file, or from Hugging Face (curated sources first), and edits its launch arguments,
+  defaults, presets, prompt note, notes, tags and cover. **Use on an engine** points an
+  sd-server at it, restarting one that is running. See [docs/models.md](docs/models.md).
 - **Connection:** when the server can't be reached, a strip under the header counts down
   retries (1, 2, 4, 8, 16 s), running jobs dim to their last known step, and drafts are kept.
   Once back, running turns pick up from their last event.
@@ -523,6 +541,12 @@ It follows the "Imaginer Main Interface" design, which is built on the Industry 
 
 ```bash
 uv run pytest
+```
+
+The browser argument editor's regression tests use Node.js 22 (no npm dependencies):
+
+```bash
+node --test tests/web/argv.test.mjs
 ```
 
 ```bash
@@ -700,7 +724,10 @@ replaces an existing runtime. Models are downloaded separately, and you launch t
 `sd-server` executable with the arguments below. Source builds disable the bundled frontend.
 See [docs/sdcpp-provisioning.md](docs/sdcpp-provisioning.md) for options and prerequisites.
 
-The model is Qwen-Image-2.1 with three parts. Put them in one folder:
+Every family sd-server supports is set up the same way: import its model file into the
+[model library](docs/models.md) (`#/models`), fill the slots its card lists (with curated
+Hugging Face sources for each), and use the card on the engine. The reference model is
+Qwen-Image-2.1, with three parts. Put them in one folder:
 
 - **Diffusion model:** `qwen_image_2.1-Q4_K.gguf` (4.2 GB), or Q6_K/Q8_0 for more quality,
   from [leejet/Qwen-Image-2.1-GGUF](https://huggingface.co/leejet/Qwen-Image-2.1-GGUF).

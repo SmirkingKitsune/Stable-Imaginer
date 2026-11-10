@@ -18,6 +18,7 @@ import asyncio
 import contextlib
 import os
 import tempfile
+from collections.abc import Awaitable, Callable
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlsplit, urlunsplit
@@ -51,16 +52,41 @@ from imaginer.engines.installer import (
 )
 from imaginer.engines.installer import plan as install_plan
 from imaginer.engines.supervisor import EngineProcess, Supervisor
+from imaginer.image_models import recipes
 
 log = get_logger(__name__)
 
 _CONFIG = TypeAdapter[BackendConfig](BackendConfig)
+# A backend's config as it runs: for an sd-server with a model card, the card's files and
+# settings over its own (ModelLibrary.effective).
+ConfigView = Callable[[str, BackendConfig], BackendConfig]
+# Where an engine's presets and default LoRAs go while it runs a model card: the card.
+CardSettings = Callable[
+    [str, dict[str, dict[str, Any]] | None, list[dict[str, Any]] | None], Awaitable[None]
+]
 
 
 class EngineService:
-    def __init__(self, settings: Settings, registry: BackendRegistry) -> None:
+    """``settings.backends`` holds each backend's config as it runs (the registry's); this
+    keeps an sd-server's own config too (``raw``), which changes are made to and saved
+    from, so a model card's files and settings never end up in the profile."""
+
+    def __init__(
+        self,
+        settings: Settings,
+        registry: BackendRegistry,
+        *,
+        raw: dict[str, BackendConfig] | None = None,
+        view: ConfigView | None = None,
+    ) -> None:
         self._settings = settings
         self._registry = registry
+        source = raw if raw is not None else settings.backends
+        self._raw: dict[str, BackendConfig] = {
+            n: c for n, c in source.items() if isinstance(c, SdCppBackendConfig)
+        }
+        self._view: ConfigView = view or (lambda _name, config: config)
+        self.on_card_settings: CardSettings | None = None
         self.supervisor = Supervisor(settings.data_root / "engines" / "logs")
         self.installer = Installer()
         self._tasks: set[asyncio.Task[None]] = set()
@@ -73,10 +99,51 @@ class EngineService:
         return list(self._settings.backends)
 
     def _require(self, name: str) -> BackendConfig:
+        """The backend's own config, as set in the profile and on this screen."""
         config = self._settings.backends.get(name)
         if config is None:
             raise NotFoundError(f"no backend named {name!r}")
-        return config
+        return self._raw.get(name, config)
+
+    def own_config(self, name: str) -> BackendConfig:
+        return self._require(name)
+
+    def effective(self, name: str) -> BackendConfig:
+        """The backend's config as it runs: its model card's files and settings over its
+        own."""
+        self._require(name)
+        return self._settings.backends[name]
+
+    def running(self, name: str) -> bool:
+        return self.supervisor.get(name).alive
+
+    def running_command(self, name: str) -> list[str] | None:
+        proc = self.supervisor.peek(name)
+        if proc is None or not proc.alive or proc.run is None:
+            return None
+        return list(proc.run.argv)
+
+    def command(self, name: str) -> list[str] | None:
+        """The command line the engine would start with now, if it can start."""
+        config = self.effective(name)
+        exe = self._executable(config)
+        if exe is None or getattr(config, "launch", None) is None:
+            return None
+        try:
+            return launch.command(config, exe)
+        except launch.LaunchError:
+            return None
+
+    def refresh(self, name: str) -> None:
+        """Apply the view again (a model card changed): the registry takes the new config
+        as it runs. A running engine keeps its files until it is restarted."""
+        raw = self._require(name)
+        if self._registry.reconfigure(name, self._view(name, raw)):
+            self._spawn(self._probe_soon(name, delays=(0,)))
+
+    def busy(self, name: str) -> bool:
+        """Whether work holds the engine's adapter (a turn or an image job)."""
+        return self._registry.leased(name)
 
     def _lock(self, engine_type: str) -> asyncio.Lock:
         return self._lifecycle.setdefault(engine_type, asyncio.Lock())
@@ -86,11 +153,13 @@ class EngineService:
 
     async def get(self, name: str) -> dto.EngineInfo:
         config = self._require(name)
+        running = self.effective(name)
         info = await self._registry.describe_one(name)
         host, port = launch.endpoint(config) if hasattr(config, "base_url") else (None, None)
         launch_cfg = getattr(config, "launch", None)
         declared = getattr(config, "declared_capabilities", None)
         exe = self._executable(config)
+        family = recipes.family(getattr(running, "family", None))
         return dto.EngineInfo(
             name=name,
             type=config.type,
@@ -99,6 +168,9 @@ class EngineService:
             status=info.status,
             detail=info.detail,
             model=info.model,
+            model_card=getattr(config, "model_card", None),
+            family=family.id if family is not None else getattr(running, "family", None),
+            family_name=family.name if family is not None else None,
             capabilities=info.capabilities,
             declared_capabilities=sorted(declared) if declared is not None else None,
             default_for=info.default_for,
@@ -108,10 +180,10 @@ class EngineService:
             api_key_env=getattr(config, "api_key_env", None),
             loopback=host is not None and launch.is_loopback(host),
             launchable=launch_cfg is not None,
-            files=[dto.EngineFile(**vars_of(c)) for c in launch.check_files(config)]
-            if launch.file_specs(config)
+            files=_files(family, await asyncio.to_thread(launch.check_files, running))
+            if launch.file_specs(running)
             else [],
-            loras=await asyncio.to_thread(self._loras, config),
+            loras=await asyncio.to_thread(self._loras, running),
             model_id=config.model_id if isinstance(config, DiffusersBackendConfig) else None,
             extra_args=list(launch_cfg.extra_args) if launch_cfg is not None else [],
             autostart=bool(launch_cfg and launch_cfg.autostart),
@@ -208,7 +280,7 @@ class EngineService:
                     f"no {config.type} executable: install the runtime or set launch.executable"
                 )
             try:
-                argv = launch.command(config, exe)
+                argv = launch.command(self.effective(name), exe)
             except launch.LaunchError as exc:
                 raise InvalidRequestError(str(exc)) from exc
             try:
@@ -312,6 +384,12 @@ class EngineService:
                 block["executable"] = body.launch.executable.strip() or None
             block |= await _lora_settings(config, body.launch)
             patch["launch"] = block
+        if body.model_card is not None:
+            if not isinstance(config, SdCppBackendConfig):
+                raise InvalidRequestError(
+                    f"{name} is not an sd-server engine; it runs no model card"
+                )
+            patch["model_card"] = body.model_card.strip() or None
         if body.model_id is not None:
             if not isinstance(config, DiffusersBackendConfig):
                 raise InvalidRequestError(f"{name} is not a Diffusers backend; it has no model_id")
@@ -329,11 +407,20 @@ class EngineService:
         if body.presets is not None or body.default_loras is not None:
             if not isinstance(config, SdCppBackendConfig | DiffusersBackendConfig):
                 raise InvalidRequestError(f"{name} has no presets or default LoRAs")
-            if body.presets is not None:
-                patch["presets"] = body.presets
-            if body.default_loras is not None:
-                loras = [lora.model_dump() for lora in body.default_loras]
-                patch["defaults"] = {"loras": loras}
+            loras = (
+                [lora.model_dump() for lora in body.default_loras]
+                if body.default_loras is not None
+                else None
+            )
+            card = getattr(config, "model_card", None)
+            if card and self.on_card_settings is not None:
+                # They belong to the model the engine runs, not to the engine.
+                await self.on_card_settings(card, body.presets, loras)
+            else:
+                if body.presets is not None:
+                    patch["presets"] = body.presets
+                if loras is not None:
+                    patch["defaults"] = {"loras": loras}
         if not patch:
             return
 
@@ -347,8 +434,10 @@ class EngineService:
         path = self._overrides_path()
         if path is not None:
             await asyncio.to_thread(_save_overrides, path, name, patch)
+        if isinstance(updated, SdCppBackendConfig):
+            self._raw[name] = updated
         # Turns and jobs already using the old adapter keep it until they end.
-        if self._registry.reconfigure(name, updated):
+        if self._registry.reconfigure(name, self._view(name, updated)):
             self._spawn(self._probe_soon(name, delays=(0,)))
         log.info("engine.updated", engine=name, fields=sorted(patch), saved_to=str(path))
 
@@ -566,6 +655,23 @@ def _install(job: InstallJob | None) -> dto.EngineInstall | None:
         log_path=job.log_path,
         output=list(job.output)[-40:],
     )
+
+
+def _files(family: recipes.Family | None, checks: list[launch.FileCheck]) -> list[dto.EngineFile]:
+    """The engine's files, each with whether its model family still needs it (a slot of a
+    group, like a VAE or a tiny autoencoder, once none of the group is set) and its name."""
+    filled = {c.key for c in checks if c.path is not None}
+    out = []
+    for check in checks:
+        extra: dict[str, Any] = {}
+        slot = family.slot(check.key) if family is not None else None
+        if family is not None and slot is not None:
+            open_group = any(
+                check.key in group and not filled & set(group) for group in family.required_any
+            )
+            extra = {"required": slot.required or open_group, "label": slot.label}
+        out.append(dto.EngineFile(**vars_of(check), **extra))
+    return out
 
 
 def vars_of(check: launch.FileCheck) -> dict[str, Any]:

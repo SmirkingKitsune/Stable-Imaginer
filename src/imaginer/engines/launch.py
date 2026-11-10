@@ -25,16 +25,13 @@ from imaginer.core.config import (
     SdCppLaunch,
     Settings,
 )
+from imaginer.image_models import recipes
 
-FileFormat = Literal["gguf", "safetensors", "unknown"]
+FileFormat = Literal["gguf", "safetensors", "json", "unknown"]
 
-# (config field, command-line flag, what it is) in launch order.
-SDCPP_FILES: tuple[tuple[str, str, str], ...] = (
-    ("diffusion_model", "--diffusion-model", "diffusion model"),
-    ("vae", "--vae", "VAE"),
-    ("llm", "--llm", "text encoder"),
-    ("llm_vision", "--llm_vision", "vision projector"),
-)
+# (config field, command-line flag, what it is) in launch order: every component slot an
+# image family can have (recipes.SLOTS). An engine lists the ones its family uses.
+SDCPP_FILES: tuple[tuple[str, str, str], ...] = recipes.SLOTS
 LLAMA_FILES: tuple[tuple[str, str, str], ...] = (
     ("model", "-m", "model"),
     ("mmproj", "--mmproj", "vision projector"),
@@ -88,14 +85,43 @@ def file_specs(config: BackendConfig) -> tuple[tuple[str, str, str], ...]:
     return ()
 
 
-def check_files(config: BackendConfig) -> list[FileCheck]:
-    """Every model file the launch block names (or leaves empty), checked on disk."""
+def shown_slots(config: BackendConfig) -> set[str]:
+    """The sd-server slots an engine lists: its family's (all four of Qwen-Image-2.1's
+    shape without one), and any other one that is set."""
     launch = getattr(config, "launch", None)
+    family = recipes.family(getattr(config, "family", None))
+    shown = set(family.slot_ids) if family is not None else set(recipes.LEGACY_SLOTS)
+    if launch is not None:
+        shown |= {key for key, _, _ in SDCPP_FILES if getattr(launch, key, None) is not None}
+    return shown
+
+
+def check_files(config: BackendConfig) -> list[FileCheck]:
+    """Every model file the launch block names (or leaves empty), checked on disk. For
+    sd-server, the slots its model's family has, and any other one that is set."""
+    launch = getattr(config, "launch", None)
+    shown = shown_slots(config) if isinstance(config, SdCppBackendConfig) else None
     checks = []
     for key, flag, what in file_specs(config):
+        if shown is not None and key not in shown:
+            continue
         raw = getattr(launch, key, None) if launch is not None else None
         checks.append(check_file(key, flag, what, Path(raw) if raw else None, engine=config.type))
     return checks
+
+
+def missing_files(config: SdCppBackendConfig) -> list[str]:
+    """What an sd-server engine needs before it can start: its family's required slots
+    (and one of each group, like a VAE or a tiny autoencoder), else a checkpoint or a
+    diffusion model."""
+    launch = config.launch
+    filled = {
+        key for key, _, _ in SDCPP_FILES if launch is not None and getattr(launch, key) is not None
+    }
+    family = recipes.family(config.family)
+    if family is not None:
+        return family.missing(filled)
+    return [] if filled & set(recipes.MAIN_SLOTS) else ["model or diffusion_model"]
 
 
 @dataclass(frozen=True, slots=True)
@@ -179,6 +205,8 @@ def check_file(
         return FileCheck(key, flag, what, None)
     expanded = Path(os.path.expandvars(path)).expanduser()
     shown = str(path)
+    if key == "tokenizer":
+        return _check_tokenizer(key, flag, what, shown, expanded)
     if expanded.is_dir():
         index = expanded / ROOT_INDEX
         if engine == "sdcpp" and index.is_file() and not (expanded / "model_index.json").exists():
@@ -265,6 +293,29 @@ def _check_index(key: str, flag: str, what: str, shown: str, index: Path) -> Fil
     return FileCheck(key, flag, what, shown, exists=True, size_bytes=size, format="safetensors")
 
 
+def _check_tokenizer(key: str, flag: str, what: str, shown: str, path: Path) -> FileCheck:
+    """A tokenizer is a ``tokenizer.json`` (Hugging Face tokenizers' format), not weights."""
+    if path.is_dir():
+        inner = (
+            "point at its tokenizer.json"
+            if (path / "tokenizer.json").is_file()
+            else ("no tokenizer.json in it")
+        )
+        return FileCheck(key, flag, what, shown, exists=True, problem=f"a folder: {inner}")
+    if not path.is_file():
+        return FileCheck(key, flag, what, shown, problem="file not found")
+    try:
+        size = path.stat().st_size
+        with path.open("rb") as fh:
+            head = fh.read(64).lstrip()
+    except OSError as exc:
+        return FileCheck(key, flag, what, shown, exists=True, problem=f"unreadable: {exc}")
+    if path.suffix.lower() != ".json" or not head.startswith(b"{"):
+        problem = "not a tokenizer.json"
+        return FileCheck(key, flag, what, shown, exists=True, size_bytes=size, problem=problem)
+    return FileCheck(key, flag, what, shown, exists=True, size_bytes=size, format="json")
+
+
 def sniff_format(head: bytes, size: int) -> FileFormat:
     """GGUF starts with b"GGUF"; safetensors with a little-endian u64 header length
     followed by a JSON object."""
@@ -303,23 +354,44 @@ def command(config: BackendConfig, exe: Path) -> list[str]:
         raise LaunchError("this engine has no launch settings; it is managed elsewhere")
     host, port = endpoint(config)
     checks = check_files(config)
-    required = {"diffusion_model"} if isinstance(config, SdCppBackendConfig) else {"model"}
+    if isinstance(config, SdCppBackendConfig):
+        if missing := missing_files(config):
+            flags = {key: flag for key, flag, _ in SDCPP_FILES}
+            named = [" or ".join(flags.get(k, k) for k in m.split(" or ")) for m in missing]
+            raise LaunchError(f"{', '.join(named)} not set")
+    else:
+        for check in checks:
+            if check.key == "model" and check.path is None:
+                raise LaunchError(f"{check.flag} ({check.what}) is not set")
     for check in checks:
-        if check.key in required and check.path is None:
-            raise LaunchError(f"{check.flag} ({check.what}) is not set")
         if check.path is not None and check.problem is not None:
             raise LaunchError(f"{check.flag} {check.path}: {check.problem}")
     argv = [str(exe)]
     for check in checks:
         if check.path is not None:
             argv += [check.flag, str(Path(os.path.expandvars(check.path)).expanduser())]
-    if isinstance(launch, SdCppLaunch):
+    if isinstance(launch, SdCppLaunch) and isinstance(config, SdCppBackendConfig):
+        argv += _model_args(config, launch)
         argv += _lora_args(launch)
     if isinstance(config, SdCppBackendConfig):
         argv += ["--listen-ip", host, "--listen-port", str(port)]
     else:
         argv += ["--host", host, "--port", str(port)]
     return argv + list(launch.extra_args)
+
+
+def _model_args(config: SdCppBackendConfig, launch: SdCppLaunch) -> list[str]:
+    """``--vae-format`` and ``--model-args``: the launch block's, over the family's."""
+    family = recipes.family(config.family)
+    args: list[str] = []
+    vae_format = launch.vae_format or (family.vae_format if family is not None else None)
+    if vae_format is not None:
+        args += ["--vae-format", vae_format]
+    model_args = dict(family.model_args) if family is not None else {}
+    model_args |= {key: recipes.arg_text(value) for key, value in launch.model_args.items()}
+    if model_args:
+        args += ["--model-args", recipes.model_args_text(model_args)]
+    return args
 
 
 def _lora_args(launch: SdCppLaunch) -> list[str]:

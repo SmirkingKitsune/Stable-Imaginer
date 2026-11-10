@@ -96,7 +96,7 @@ export function lorasScreen({ navigate }) {
   const install = h('button.btn.btn-primary.blueprint.engine-go', { type: 'button', onclick: () => installLora() },
     corners(), icon('download', 14), h('span.only-wide', 'Install from Hugging Face'));
   const header = h('header.topbar.sub',
-    iconButton('back', 'Back', () => (history.length > 1 ? history.back() : navigate('#/'))),
+    iconButton('back', 'Back', () => navigate(lastPlace())),
     h('div.topbar-heading', h('span.topbar-title', 'LoRAs'), meta),
     h('span.spacer'),
     h('label.search.lib-search', icon('search', 15), search, h('kbd', '/')),

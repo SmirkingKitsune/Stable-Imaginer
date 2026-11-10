@@ -32,7 +32,6 @@ name the file by its path (``config/<profile>.local.yaml``, like the Engines scr
 import asyncio
 import contextlib
 import hashlib
-import io
 import os
 import re
 import time
@@ -44,7 +43,7 @@ from pathlib import Path, PurePosixPath
 from typing import Any, Literal
 
 import sqlalchemy as sa
-from PIL import Image, UnidentifiedImageError
+from PIL import UnidentifiedImageError
 
 from imaginer.backends import diffusers_inproc
 from imaginer.backends.common import expand_path, file_sha256, lora_matches, scan_loras
@@ -82,16 +81,16 @@ from imaginer.engines import launch
 from imaginer.engines.service import EngineService
 from imaginer.hub.client import hub_cache_dir
 from imaginer.hub.service import HubService
+from imaginer.image_models import recipes
 from imaginer.loras import files
-from imaginer.services import mappers
+from imaginer.services import covers, mappers
 from imaginer.services.artifacts import ArtifactService
+from imaginer.services.covers import COVER_MAX_BYTES
 
 log = get_logger(__name__)
 
 State = Literal["ok", "maybe", "no", "unknown"]
 _RANK: dict[str, int] = {"ok": 0, "maybe": 1, "unknown": 2, "no": 3}
-COVER_SIDE = 768  # px, the longer side of a stored cover
-COVER_MAX_BYTES = 20 * 1024 * 1024  # a Hub card image larger than this isn't fetched
 RECENT_IMAGES = 24
 USED_IN = 24
 _CHUNK = 500
@@ -142,6 +141,7 @@ class _Model:
     loaded: bool = False
     modules: files.Modules | None = None
     remote: str | None = None  # where it runs when that isn't here
+    group: str | None = None  # its family's LoRA group (families.yaml), when known
 
     @property
     def where(self) -> str:
@@ -465,10 +465,10 @@ class LoraLibrary:
         else:
             raise InvalidRequestError("say which image: artifact_id, or hub")
         try:
-            webp, width, height = await asyncio.to_thread(_thumbnail, data)
+            webp, width, height = await asyncio.to_thread(covers.thumbnail, data)
         except (UnidentifiedImageError, OSError, ValueError) as exc:
             raise InvalidRequestError(f"that image can't be read: {exc}") from exc
-        await asyncio.to_thread(_write_atomic, self.covers_dir / f"{entry.id}.webp", webp)
+        await asyncio.to_thread(covers.write_atomic, self.covers_dir / f"{entry.id}.webp", webp)
         cover |= {"width": width, "height": height, "v": int(time.time() * 1000)}
         async with self._db.session() as session, session.begin():
             row = await self._row(session, entry)
@@ -822,6 +822,9 @@ class LoraLibrary:
                 continue
             key = files.model_key(text)
             model = models.setdefault(key, _Model(key=key, name=files.model_name(text)))
+            family = recipes.family(getattr(config, "family", None))
+            if family is not None and family.lora_group:
+                model.group = model.group or family.lora_group
             if model.name.islower():  # "Qwen-Image-2.1" reads better than a file's lower case
                 model.name = files.model_name(text)
             if quant and quant not in model.quants:
@@ -845,7 +848,10 @@ class LoraLibrary:
         """The model an engine runs: (its name as set, its modules if they can be read
         here, its quantization, where it runs when that isn't here)."""
         if isinstance(config, SdCppBackendConfig):
-            file = config.launch.diffusion_model if config.launch is not None else None
+            # Its own weights: a checkpoint (SD 1.x, SDXL), else its diffusion model.
+            file = None
+            if config.launch is not None:
+                file = config.launch.model or config.launch.diffusion_model
             if file is not None:
                 path = expand_path(file)
                 modules = await asyncio.to_thread(files.model_file_modules, path)
@@ -1099,9 +1105,16 @@ class LoraLibrary:
         base = _base_of(entry)
         made_for = base is not None and files.model_key(base) == model.key
         lineage = entry.rec("lineage") or (files.model_name(base) if base else "")
+        group = lora_group(base, facts.family)
+        same_family = group is not None and group == model.group
+        other_family = group is not None and model.group is not None and group != model.group
         if model.modules is None or not facts.modules:
             if made_for:
                 return "ok", "made for it · keys not checked"
+            if same_family:
+                return "ok", f"made for {_group_name(group)} · keys not checked"
+            if other_family:
+                return "no", f"made for {_group_name(group)}"
             if lineage and files.lineage_matches(lineage, model.name):
                 return "maybe", "same lineage, untested"
             if model.modules is None:
@@ -1114,10 +1127,13 @@ class LoraLibrary:
         # A LoRA for this model's architecture finds (nearly) all its modules; one for
         # another finds none, or only the few layers two architectures happen to share.
         if hits * 2 < total:
+            if same_family:
+                # A checkpoint's keys and a LoRA's (kohya, Diffusers) are named differently.
+                return "maybe", f"made for {_group_name(group)} · {hits}/{total} keys match"
             return "no", f"{hits}/{total} keys"
         if hits * 10 < total * 9:
             return "maybe", f"{hits}/{total} keys match"
-        if base is not None and not made_for:
+        if base is not None and not made_for and not same_family:
             return "maybe", f"keys match, made for {files.model_name(base)}"
         return "ok", f"{hits}/{total} keys"
 
@@ -1264,6 +1280,47 @@ _FAMILIES = (
 )  # fmt: skip
 
 
+# Base-model names LoRA trainers write (kohya's ss_base_model_version, modelspec's
+# architecture, a Hub card's base_model), by the LoRA group of the families they fit.
+_GROUPS = (
+    ("stable-diffusion-xl", "sdxl"), ("sdxl", "sdxl"), ("sd_xl", "sdxl"), ("pony", "sdxl"),
+    ("illustrious", "sdxl"), ("noobai", "sdxl"), ("sd3.5-large", "sd35-large"),
+    ("sd3.5_large", "sd35-large"), ("stable-diffusion-3.5-large", "sd35-large"),
+    ("sd3.5-medium", "sd35-medium"), ("stable-diffusion-3.5-medium", "sd35-medium"),
+    ("sd3", "sd3"), ("stable-diffusion-3", "sd3"), ("sd_v2", "sd2"), ("sd2", "sd2"),
+    ("stable-diffusion-v2", "sd2"), ("stable-diffusion-2", "sd2"), ("sd_v1", "sd1"),
+    ("sd1", "sd1"), ("v1-5", "sd1"), ("stable-diffusion-v1", "sd1"),
+    ("flux.2-klein-9b", "flux2-klein-9b"), ("flux-2-klein-9b", "flux2-klein-9b"),
+    ("flux.2-klein", "flux2-klein-4b"), ("flux-2-klein", "flux2-klein-4b"),
+    ("flux.2-dev", "flux2-dev"), ("flux-2-dev", "flux2-dev"), ("flux.1", "flux1"),
+    ("flux-1", "flux1"), ("flux1", "flux1"), ("chroma1-radiance", "chroma-radiance"),
+    ("chroma", "chroma"), ("qwen-image-2.1", "qwen-image-21"),
+    ("qwen_image_2.1", "qwen-image-21"), ("qwen-image", "qwen-image"),
+    ("qwen_image", "qwen-image"), ("z-image-turbo", "z-image-turbo"),
+    ("z_image_turbo", "z-image-turbo"), ("z-image", "z-image"),
+)  # fmt: skip
+
+
+def lora_group(base: str | None, family: str | None) -> str | None:
+    """The LoRA group (families.yaml's lora_group) of the model a LoRA was made for, from
+    the base model it names (or the family its metadata names)."""
+    for text in (base, family):
+        if not text:
+            continue
+        name = text.casefold().replace(" ", "-")
+        for needle, group in _GROUPS:
+            if needle in name:
+                return group
+    return None
+
+
+def _group_name(group: str | None) -> str:
+    names = {f.lora_group: f.group for f in recipes.catalog().families() if f.lora_group}
+    if group is None:
+        return "another model"
+    return names.get(group) or group
+
+
 def _family_name(family: str | None) -> str | None:
     """A model family as people call it: "sdxl_base_v1-0" is SDXL."""
     if not family:
@@ -1340,23 +1397,6 @@ def _pipeline_folder(model_id: str, settings: Settings) -> Path | None:
         if found:
             return found[-1]
     return None
-
-
-def _thumbnail(data: bytes) -> tuple[bytes, int, int]:
-    with Image.open(io.BytesIO(data)) as img:
-        img.load()
-        frame = img.convert("RGBA" if "A" in img.getbands() else "RGB")
-    frame.thumbnail((COVER_SIDE, COVER_SIDE), Image.Resampling.LANCZOS)
-    out = io.BytesIO()
-    frame.save(out, "WEBP", quality=86, method=4)
-    return out.getvalue(), frame.width, frame.height
-
-
-def _write_atomic(path: Path, data: bytes) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_suffix(f".{os.getpid()}.tmp")
-    tmp.write_bytes(data)
-    tmp.replace(path)
 
 
 def _move_file(src: Path, dest: Path, root: Path) -> None:

@@ -45,8 +45,14 @@ export function looksLikeRef(value) {
 /** A repo id on its own (owner/name): opened directly rather than searched for. */
 const isRepoId = (v) => /^[A-Za-z0-9][\w.-]*\/[A-Za-z0-9][\w.-]*$/.test(v.trim());
 
-/** Open the dialog for engine e. ref opens that repo straight away. */
-export function hubDialog(e, { ref = null, onChange = () => {} } = {}) {
+/** Open the dialog for engine e. ref opens that repo straight away.
+ *
+ * A model card can be the target instead (modelTarget): its slots are matched instead of an
+ * engine's settings, and a download or a "Use" fills the card's slot.
+ *
+ * With onPick, nothing is downloaded: a repo lists its model files, and the one picked is
+ * handed back ({repo, sha, variant, name, size_bytes, local, ref}) for a card not made yet. */
+export function hubDialog(e, { ref = null, onChange = () => {}, onPick = null } = {}) {
   const state = {
     view: ref ? 'repo' : 'search',
     query: '',
@@ -66,7 +72,7 @@ export function hubDialog(e, { ref = null, onChange = () => {} } = {}) {
   let events = null;
   let box;
   const layer = modal((close) => {
-    box = h('div.dialog.blueprint.hub-dialog', { role: 'dialog', 'aria-modal': 'true', 'aria-label': `Hugging Face models for ${e.name}` });
+    box = h('div.dialog.blueprint.hub-dialog', { role: 'dialog', 'aria-modal': 'true', 'aria-label': `Hugging Face models for ${e.label ?? e.name}` });
     box.close = () => { events?.abort(); close(); onChange(); };
     return box;
   }, { onDismiss: () => { events?.abort(); onChange(); } });
@@ -82,7 +88,7 @@ export function hubDialog(e, { ref = null, onChange = () => {} } = {}) {
   function head() {
     return h('div.dialog-head.row',
       h('div',
-        h('span.eyebrow.accent', `${e.name} · Hugging Face`),
+        h('span.eyebrow.accent', `${e.label ?? e.name} · Hugging Face`),
         h('div.dialog-title', state.view === 'repo' && state.repo ? state.repo.id : 'Find a model')),
       h('button.icon-btn', { type: 'button', 'aria-label': 'Close', title: 'Close', onclick: () => box.close() }, icon('x', 16)));
   }
@@ -175,11 +181,21 @@ export function hubDialog(e, { ref = null, onChange = () => {} } = {}) {
         ? 'Gated: accept its terms on the Hub with the account whose token this server uses.'
         : 'Gated: accept its terms on the Hub, then set HF_TOKEN (or run `hf auth login`) on this server.')),
       r.notes.map((n) => h('span.tray-hint.wrap', n)));
+    if (onPick) {
+      body.append(pickCell(r));
+      if (r.base_models.length) {
+        body.append(h('div.hub-bases', h('span.mono-meta', 'based on'),
+          r.base_models.map((b) => h('button.mini', { type: 'button', onclick: () => openRepo(b) }, b))));
+      }
+      return body;
+    }
     // A repo of LoRAs fills no model setting: show only its LoRAs, not every empty setting.
     const loras = r.roles.some((role) => role.key === 'lora' && role.candidates.length);
     const models = r.roles.some((role) => role.key !== 'lora' && role.candidates.length);
     if (e.type === 'diffusers' && (r.pipeline || !loras)) body.append(pipelineCell(r));
-    body.append(...r.roles.map((role) => (role.key === 'lora' ? (role.candidates.length ? loraCell(r, role) : null)
+    // A model card's slot: that slot only.
+    const roles = e.slot ? r.roles.filter((role) => role.key === e.slot) : r.roles;
+    body.append(...roles.map((role) => (role.key === 'lora' ? (role.candidates.length ? loraCell(r, role) : null)
       : e.type === 'diffusers' || (loras && !models) ? null : roleCell(r, role))).filter(Boolean));
     const quantizable = ['transformers', 'diffusers', 'safetensors'].includes(r.kind) || !r.roles.some((x) => x.candidates.length);
     if (quantizable) {
@@ -197,6 +213,36 @@ export function hubDialog(e, { ref = null, onChange = () => {} } = {}) {
           h('span.mono-meta', size(v.size_bytes)), h('span'), h('span')))));
     }
     return body;
+  }
+
+  /** Picking for a card not made yet: the repo's model files, each to use. */
+  function pickCell(r) {
+    const mains = r.variants.filter((v) => ['diffusion_model', 'model'].includes(v.component));
+    const list = mains.length ? mains : r.variants.filter((v) => !['lora', 'other'].includes(v.component));
+    const all = state.expanded.has('pick');
+    const shown = all ? list : list.slice(0, SHOWN * 2);
+    const pick = (v) => {
+      box.close();
+      onPick({
+        repo: r.id, sha: r.sha ?? null, variant: v.id, name: v.name, size_bytes: v.size_bytes ?? null,
+        local: v.local?.path ?? null, ref: `hf://${r.id}/${v.id}`,
+      });
+    };
+    return h('div.tray-cell.hub-role',
+      h('div.cell-head', h('span.eyebrow', 'Model files'), h('span.spacer'),
+        h('span.mono-meta', `${list.length} in this repo`)),
+      list.length
+        ? shown.map((v) => h('div.hub-variant',
+          h('span.hub-name', { title: v.files.map((f) => f.path).join('\n') }, v.name,
+            v.shards > 1 && h('span.hub-tag', `${v.shards} shards`)),
+          h('span.mono-meta', v.quant ?? v.format),
+          h('span.mono-meta', size(v.size_bytes)),
+          h('span.mono-meta', v.local ? WHERE[v.local.source] : ''),
+          h('button.mini.primary', { type: 'button', onclick: () => pick(v) }, v.local ? 'Use this' : 'Pick')))
+        : h('span.tray-hint', 'Nothing in this repo is a model file sd-server loads.'),
+      list.length > SHOWN * 2 && h('div', h('button.mini', {
+        type: 'button', onclick: () => { if (all) state.expanded.delete('pick'); else state.expanded.add('pick'); render(); },
+      }, all ? 'Show fewer' : `Show all ${list.length}`)));
   }
 
   function roleCell(r, role) {
@@ -370,7 +416,7 @@ export function hubDialog(e, { ref = null, onChange = () => {} } = {}) {
     state.expanded.clear();
     render();
     try {
-      state.repo = await api.hubRepo(refText, e.name);
+      state.repo = await repoFor(refText);
       state.loading = false;
       render();
       return true;
@@ -386,17 +432,23 @@ export function hubDialog(e, { ref = null, onChange = () => {} } = {}) {
   async function reloadRepo() {
     if (!state.repo) return;
     try {
-      state.repo = await api.hubRepo(state.ref, e.name);
+      state.repo = await repoFor(state.ref);
       if (state.view === 'repo') render();
     } catch {
       // Keep what is shown.
     }
   }
 
+  const repoFor = (refText) => (onPick ? api.hubRepo(refText)
+    : e.model ? api.hubRepo(refText, null, e.model) : api.hubRepo(refText, e.name));
+
   async function assign(key, value) {
     const patch = key === 'model_id' ? { model_id: value } : { launch: { files: { [key]: value } } };
     try {
-      await api.updateEngine(e.name, patch);
+      // An engine that runs a model card loads the card's files.
+      const card = e.model ?? (key !== 'model_id' ? e.model_card : null);
+      if (card) await api.updateModel(card, { components: { [key]: value } });
+      else await api.updateEngine(e.name, patch);
       toast(`${key} set to ${value.split(/[\\/]/).pop()}`);
       onChange();
       reloadRepo();
@@ -407,7 +459,8 @@ export function hubDialog(e, { ref = null, onChange = () => {} } = {}) {
 
   async function download(r, body) {
     try {
-      const job = await api.hubDownload({ repo: r.id, revision: r.sha ?? undefined, engine: e.name, ...body });
+      const target = e.model ? { model: e.model } : { engine: e.name };
+      const job = await api.hubDownload({ repo: r.id, revision: r.sha ?? undefined, ...target, ...body });
       jobs.set(job.id, job);
       announce(`Downloading ${job.label}`);
       render();
@@ -466,4 +519,9 @@ export function hubDialog(e, { ref = null, onChange = () => {} } = {}) {
   else search();
   follow();
   return layer;
+}
+
+/** A model card's slot as the dialog's target (in place of an engine). */
+export function modelTarget(card, slot = null) {
+  return { name: `model:${card.id}`, label: slot ? `${card.name} · ${slot}` : card.name, type: 'sdcpp', model: card.id, slot };
 }

@@ -437,8 +437,10 @@ class EngineFile(BaseModel):
     path: str | None
     exists: bool = False
     size_bytes: int | None = None
-    format: Literal["gguf", "safetensors", "unknown"] | None = None
+    format: Literal["gguf", "safetensors", "json", "unknown"] | None = None
     problem: str | None = Field(default=None, description="Why it can't be used, if it can't.")
+    required: bool = Field(default=False, description="The model's family needs it.")
+    label: str | None = Field(default=None, description="The family's name for it.")
 
 
 LoraApplyMode = Literal["auto", "immediately", "at_runtime"]
@@ -520,6 +522,11 @@ class EngineInfo(BaseModel):
     status: BackendStatus
     detail: str | None = None
     model: str | None = None
+    model_card: str | None = Field(
+        default=None, description="sd-server engines: the model card it runs (GET /v1/models)."
+    )
+    family: str | None = Field(default=None, description="Its model's family (a recipe id).")
+    family_name: str | None = None
     capabilities: list[Capability]
     declared_capabilities: list[Capability] | None = None
     default_for: list[Literal["chat", "t2i", "edit"]]
@@ -569,6 +576,11 @@ class EngineUpdate(_Input):
     port: int | None = Field(default=None, ge=1, le=65535)
     declared_capabilities: list[Capability] | None = None
     launch: EngineLaunchUpdate | None = None
+    model_card: str | None = Field(
+        default=None,
+        max_length=64,
+        description="sd-server engines: the model card to run; empty: none (its own files).",
+    )
     model_id: str | None = Field(
         default=None,
         min_length=1,
@@ -652,8 +664,15 @@ class HubVariant(BaseModel):
 
     id: str = Field(description="Its first file's path in the repo.")
     name: str
-    component: Literal["model", "mmproj", "diffusion_model", "vae", "text_encoder", "lora", "other"]
-    format: Literal["gguf", "safetensors"]
+    component: Literal[
+        "model", "mmproj", "diffusion_model", "vae", "text_encoder", "lora", "tokenizer",
+        "connector", "other",
+    ]  # fmt: skip
+    format: Literal["gguf", "safetensors", "json"]
+    encoder: Literal["clip_l", "clip_g", "t5xxl", "llm"] | None = Field(
+        default=None, description="A text encoder's kind, when it can be told."
+    )
+    tiny: bool = Field(default=False, description="A tiny autoencoder (sd-server's --tae).")
     quant: str | None = None
     size_bytes: int
     shards: int = Field(default=1, description="Weight files; an index isn't counted.")
@@ -712,6 +731,7 @@ class HubRepo(BaseModel):
     variants: list[HubVariant] = Field(default_factory=list)
     pipeline: HubPipeline | None = None
     engine: str | None = None
+    model: str | None = Field(default=None, description="The model card matched to, if any.")
     roles: list[HubRole] = Field(default_factory=list)
     quant: str | None = Field(default=None, description="From a 'repo:QUANT' reference.")
     path: str | None = Field(default=None, description="A file or folder the reference named.")
@@ -724,7 +744,12 @@ class HubDownloadRequest(_Input):
         default=None, max_length=1024, description="A variant id; none: the Diffusers pipeline."
     )
     engine: str | None = Field(default=None, description="Set this engine's setting when done.")
-    key: str | None = Field(default=None, description="The launch setting, or 'model_id'.")
+    model: str | None = Field(
+        default=None, max_length=64, description="Or put it in this model card's slot (key)."
+    )
+    key: str | None = Field(
+        default=None, description="The launch setting, 'model_id', or a model card's slot."
+    )
 
 
 class HubDownload(BaseModel):
@@ -739,7 +764,10 @@ class HubDownload(BaseModel):
     file_index: int
     current_file: str | None = None
     target: str
-    assign: list[str] = Field(default_factory=list, description="'<engine>.<setting>'.")
+    assign: list[str] = Field(
+        default_factory=list,
+        description="'<engine>.<setting>', or 'model:<card id>.<slot>' for a model card.",
+    )
     speed_bps: float | None = None
     started_at: datetime
     finished_at: datetime | None = None
@@ -1161,3 +1189,257 @@ class LoraPresetSet(_Input):
     )
     create: bool = Field(default=False, description="Make the preset (with the defaults' LoRAs).")
     description: str = Field(default="", max_length=200)
+
+
+# --- the model library --------------------------------------------------------------------
+
+PromptStyle = Literal["natural", "tags", "json"]
+
+
+class ModelSlot(BaseModel):
+    """A component slot of a model family (an sd-server recipe slot)."""
+
+    id: str = Field(description="sd-server's slot name, e.g. diffusion_model or t5xxl.")
+    flag: str = Field(description="Its command-line flag, e.g. --t5xxl.")
+    what: str
+    label: str = Field(description="The recipe's name for it, e.g. Qwen 3 VL 8B Text Encoder.")
+    required: bool
+    sources: list[str] = Field(
+        default_factory=list, description="Hub references to get it from, best first."
+    )
+
+
+class ModelFamilyBrief(BaseModel):
+    id: str
+    name: str
+    group: str | None = None
+    hidden: bool = False
+
+
+class ModelFamily(ModelFamilyBrief):
+    """An image model family sd-server runs: its recipe, and Stable-Imaginer's notes."""
+
+    description: str = ""
+    model_url: str | None = None
+    origin: Literal["builtin", "engine"] = Field(
+        description="builtin: the bundled recipe; engine: the one a running sd-server reported."
+    )
+    slots: list[ModelSlot]
+    required_any: list[list[str]] = Field(
+        default_factory=list, description="Groups of slots of which one must be filled."
+    )
+    defaults: dict[str, Any] = Field(description="Generation defaults, in ImageDefaults' names.")
+    size_multiple: int
+    capabilities: list[Capability]
+    features: list[str] = Field(default_factory=list, description="The recipe's features.")
+    prompt: PromptStyle
+    prompt_hint: str | None = None
+    note: str | None = None
+    vae_format: str | None = None
+    model_args: dict[str, str] = Field(default_factory=dict)
+
+
+class ModelGuess(BaseModel):
+    family: str
+    name: str
+    score: float = Field(description="0..1: how well the evidence fits.")
+    reasons: list[str]
+
+
+class ModelComponent(BaseModel):
+    """One slot of a model card, checked on disk."""
+
+    slot: str
+    flag: str
+    what: str
+    label: str
+    required: bool = Field(description="Its family needs it (or one of its group).")
+    path: str | None = None
+    exists: bool = False
+    size_bytes: int | None = None
+    format: Literal["gguf", "safetensors", "json", "unknown"] | None = None
+    problem: str | None = None
+    source: dict[str, Any] | None = Field(
+        default=None, description="Where the Hub installed it from: repo, revision, path."
+    )
+    shared_with: list[str] = Field(
+        default_factory=list, description="Other model cards that use the same file."
+    )
+    sources: list[str] = Field(
+        default_factory=list, description="Hub references to get it from, best first."
+    )
+
+
+class ModelCover(BaseModel):
+    url: str
+    source: str
+    width: int | None = None
+    height: int | None = None
+    conversation_id: str | None = None
+    artifact_id: str | None = None
+
+
+class ModelEngineUse(BaseModel):
+    """An sd-server engine running (or set to run) the model."""
+
+    engine: str
+    launchable: bool = Field(description="Started here, so switching models restarts it.")
+    running: bool = False
+    needs_restart: bool = Field(
+        default=False, description="Running with other files or launch arguments than these."
+    )
+
+
+class ModelLaunch(BaseModel):
+    vae_format: str | None = None
+    model_args: dict[str, str] = Field(
+        default_factory=dict, description="--model-args over the family's."
+    )
+    extra_args: list[str] = Field(
+        default_factory=list, description="Appended to the engine's own launch arguments."
+    )
+
+
+class ModelCardItem(BaseModel):
+    id: str
+    name: str
+    family: str | None = None
+    family_name: str | None = None
+    group: str | None = None
+    main_file: str | None = Field(default=None, description="Its checkpoint or diffusion model.")
+    size_bytes: int = Field(default=0, description="Of its component files on disk.")
+    ready: bool = Field(description="It has a family, every component it needs, all usable.")
+    missing: list[str] = Field(
+        default_factory=list, description="Slots still empty, e.g. t5xxl, or vae or tae."
+    )
+    problems: list[str] = Field(default_factory=list)
+    engines: list[ModelEngineUse] = Field(default_factory=list)
+    tags: list[str] = Field(default_factory=list)
+    pinned: bool = False
+    notes: str = ""
+    cover: ModelCover | None = None
+    uses: int = Field(default=0, description="Images made with it.")
+    last_used_at: datetime | None = None
+    created_at: datetime
+    updated_at: datetime
+
+
+class ModelCardDetail(ModelCardItem):
+    components: list[ModelComponent]
+    launch: ModelLaunch
+    defaults: dict[str, Any] = Field(description="Its ImageDefaults.")
+    presets: dict[str, dict[str, Any]] = Field(description="Its presets (ImagePreset), by name.")
+    prompt_hint: str | None = Field(default=None, description="Its own, over the family's.")
+    family_prompt_hint: str | None = None
+    family_note: str | None = None
+    capabilities: list[Capability] = Field(default_factory=list)
+    detected: list[ModelGuess] = Field(
+        default_factory=list, description="Families its main file looks like, best first."
+    )
+    recent_images: list[Artifact] = Field(default_factory=list)
+
+
+class SharedComponent(BaseModel):
+    """A component file on disk, and the cards that use it."""
+
+    path: str
+    slots: list[str]
+    cards: list[str] = Field(description="Ids of the model cards that use it.")
+    size_bytes: int | None = None
+    exists: bool = False
+
+
+class ModelLibraryEngine(BaseModel):
+    name: str
+    model_card: str | None = None
+    launchable: bool
+    running: bool = False
+
+
+class ModelLibraryView(BaseModel):
+    items: list[ModelCardItem]
+    families: list[ModelFamilyBrief] = Field(description="Every family a card can have.")
+    components: list[SharedComponent]
+    engines: list[ModelLibraryEngine] = Field(description="The sd-server engines.")
+    tags: list[str] = Field(default_factory=list)
+
+
+class ModelCreate(_Input):
+    """A new model card: from a model file on this machine (path), from a Hub reference
+    (ref: its components are downloaded into it next), or empty for a family. Without a
+    family, it is detected."""
+
+    name: str | None = Field(default=None, max_length=120)
+    family: str | None = Field(default=None, max_length=64)
+    path: str | None = Field(default=None, max_length=1024)
+    ref: str | None = Field(default=None, max_length=1024)
+    components: dict[str, str] = Field(default_factory=dict, description="slot -> path")
+
+
+class ModelDetect(_Input):
+    path: str | None = Field(default=None, max_length=1024)
+    ref: str | None = Field(default=None, max_length=1024)
+
+
+class ModelDetected(BaseModel):
+    guesses: list[ModelGuess]
+    slot: str | None = Field(
+        default=None, description="The slot the file goes in for the best guess."
+    )
+    name: str | None = Field(default=None, description="A name for a card made from it.")
+
+
+class ModelLocate(_Input):
+    """A file dropped or picked in the browser, which tells its name and size but not its
+    folder."""
+
+    name: str = Field(min_length=1, max_length=255)
+    size_bytes: int | None = Field(default=None, ge=0)
+
+
+class ModelLocated(BaseModel):
+    paths: list[str] = Field(description="Files with that name here, same size first.")
+    searched: list[str] = Field(description="The folders looked in.")
+
+
+class ModelLaunchUpdate(_Input):
+    vae_format: Literal["", "auto", "flux", "sd3", "flux2", "wan"] | None = Field(
+        default=None, description="Empty: the family's."
+    )
+    model_args: dict[str, str] | None = Field(default=None, description="Replaces them whole.")
+    extra_args: list[str] | None = None
+
+
+class ModelUpdate(_Input):
+    """Only fields present are changed."""
+
+    name: str | None = Field(default=None, max_length=120)
+    family: str | None = Field(default=None, max_length=64)
+    components: dict[str, str | None] | None = Field(
+        default=None, description="slot -> path; null or empty clears it."
+    )
+    launch: ModelLaunchUpdate | None = None
+    defaults: dict[str, Any] | None = Field(
+        default=None, description="Merged over its defaults (ImageDefaults' fields)."
+    )
+    reset_defaults: bool = Field(default=False, description="Back to its family's defaults.")
+    presets: dict[str, dict[str, Any] | None] | None = Field(
+        default=None, description="By name: merged over the preset it replaces; null removes it."
+    )
+    prompt_hint: str | None = Field(default=None, max_length=2000)
+    notes: str | None = Field(default=None, max_length=4000)
+    tags: list[str] | None = Field(default=None, max_length=24)
+    pinned: bool | None = None
+
+
+class ModelUse(_Input):
+    engine: str = Field(min_length=1, max_length=64)
+    start: bool = Field(
+        default=True,
+        description="Start the engine with it if it isn't running (one that is restarts).",
+    )
+
+
+class ModelCoverSet(_Input):
+    artifact_id: str | None = Field(default=None, max_length=36)
+    hub: bool = Field(default=False, description="The first image on its main file's Hub card.")

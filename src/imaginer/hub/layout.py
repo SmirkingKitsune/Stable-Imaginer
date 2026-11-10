@@ -28,8 +28,13 @@ from pathlib import PurePosixPath
 from typing import Any, Literal
 
 LayoutKind = Literal["gguf", "diffusers", "comfy", "transformers", "safetensors", "unknown"]
-Component = Literal["model", "mmproj", "diffusion_model", "vae", "text_encoder", "lora", "other"]
-WeightFormat = Literal["gguf", "safetensors"]
+Component = Literal[
+    "model", "mmproj", "diffusion_model", "vae", "text_encoder", "lora", "tokenizer",
+    "connector", "other",
+]  # fmt: skip
+WeightFormat = Literal["gguf", "safetensors", "json"]
+# What kind of text encoder a file is, for sd-server's slots (None: can't tell).
+Encoder = Literal["clip_l", "clip_g", "t5xxl", "llm"]
 TaskKind = Literal["image", "llm"]
 
 IMAGE_TASKS = frozenset(
@@ -61,12 +66,18 @@ _FOLDERS: dict[str, Component] = {
     "diffusion_models": "diffusion_model",
     "unet": "diffusion_model",
     "transformer": "diffusion_model",
-    "checkpoints": "diffusion_model",
+    "unconditional_transformer": "diffusion_model",
+    "checkpoints": "model",
+    "stable-diffusion": "model",
     "vae": "vae",
+    "vae_approx": "vae",
     "text_encoders": "text_encoder",
     "text_encoder": "text_encoder",
     "text_encoder_2": "text_encoder",
+    "text_encoder_3": "text_encoder",
     "clip": "text_encoder",
+    "text_connector": "connector",
+    "tokenizers": "tokenizer",
     "loras": "lora",
     "lora": "lora",
     "clip_vision": "other",
@@ -81,7 +92,18 @@ _COMFY = frozenset(
 )
 _CHECKPOINT_NAMES = frozenset({"model", "pytorch_model", "diffusion_pytorch_model"})
 _TEXT_ENCODER_WORDS = ("text_encoder", "text-encoder", "textencoder")
-_TEXT_ENCODER_TOKENS = frozenset({"t5", "t5xxl", "umt5", "clip"})
+_TEXT_ENCODER_TOKENS = frozenset({"t5", "t5xxl", "umt5", "clip", "clipl", "clipg"})
+# Name parts that say which text encoder a file is.
+_CLIP_L = re.compile(
+    r"(?:^|[-_.])(?:clip[-_.]?l|clip[-_.]?vit[-_.]?l\w*|vit[-_.]?l[-_.]?14)(?:$|[-_.])"
+)
+_CLIP_G = re.compile(r"(?:^|[-_.])(?:clip[-_.]?g|clip[-_.]?vit[-_.]?(?:big)?g\w*|bigg)(?:$|[-_.])")
+_T5 = re.compile(r"(?:^|[-_.])(?:t5\w*|umt5\w*|flan[-_.]?t5\w*)(?:$|[-_.])")
+# Transformers text encoder classes (model_index.json) that are CLIP or T5.
+_CLIP_CLASSES = frozenset({"CLIPTextModel", "CLIPTextModelWithProjection"})
+_T5_CLASSES = frozenset({"T5EncoderModel", "UMT5EncoderModel", "T5ForConditionalGeneration"})
+# A tiny autoencoder (TAESD, TAEF1, TAEQI...): a VAE file sd-server loads with --tae.
+_TAE = re.compile(r"(?:^|[-_.])(?:tae\w*|taesd\w*)(?:$|[-_.])", re.IGNORECASE)
 
 # Which quant to suggest when nothing more specific is known: a good size/quality balance
 # first, then larger, then smaller.
@@ -114,6 +136,12 @@ class Variant:
     format: WeightFormat
     files: tuple[RepoFile, ...]
     quant: str | None = None
+    encoder: Encoder | None = None  # a text encoder's kind, when it can be told
+
+    @property
+    def tiny(self) -> bool:
+        """A tiny autoencoder rather than a full VAE."""
+        return self.component == "vae" and _TAE.search(PurePosixPath(self.id).name) is not None
 
     @property
     def id(self) -> str:
@@ -232,23 +260,34 @@ def classify(
             shards = (index, *shards)
         # Weights named for their library rather than their model are named by their folder.
         generic = base.lower() in _CHECKPOINT_NAMES
+        component = _component(
+            shards[-1].path,
+            base,
+            task,
+            repo_id,
+            "config.json" in paths,
+            components,
+            adapter=adapter and pipeline is None,
+        )
         variants.append(
             Variant(
                 name=(prefix.rstrip("/") or repo_name or base) if generic else base,
-                component=_component(
-                    shards[-1].path,
-                    base,
-                    task,
-                    repo_id,
-                    "config.json" in paths,
-                    components,
-                    adapter=adapter and pipeline is None,
-                ),
+                component=component,
                 format=fmt,
                 files=shards,
                 quant=quant_of(base),
+                encoder=_encoder(shards[-1].path, base, component, repo_id, model_index, task),
             )
         )
+    # Tokenizers: sd-server reads a tokenizer.json for the few families that need one.
+    for f in files:
+        p = PurePosixPath(f.path)
+        if p.name == "tokenizer.json":
+            folder = str(p.parent)
+            label = (
+                repo_name if folder == "." else f"{folder} ({repo_name})" if repo_name else folder
+            )
+            variants.append(Variant(label, "tokenizer", "json", (f,)))
     variants.sort(key=lambda v: (v.folder, v.component, v.name.lower()))
 
     kind = _kind(files, pipeline)
@@ -296,8 +335,12 @@ def _component(
     lower = base.lower()
     if "mmproj" in lower:
         return "mmproj"
+    if "connector" in lower:
+        return "connector"
     for folder in reversed(p.parts[:-1]):
         found = _FOLDERS.get(folder.lower())
+        if found is None and re.fullmatch(r"vae[-_.]\w+", folder.lower()):
+            found = "vae"  # SDXL's vae_1_0, vae_decoder...
         if found is not None:
             return found
     if len(p.parts) > 1 and p.parts[0] in pipeline_components:
@@ -327,6 +370,45 @@ def _component(
     if configured and lower in _CHECKPOINT_NAMES:
         return "model"  # a transformers checkpoint
     return "diffusion_model" if task == "image" else "model"
+
+
+def _encoder(
+    path: str,
+    base: str,
+    component: Component,
+    repo_id: str,
+    model_index: Mapping[str, Any] | None,
+    task: TaskKind | None,
+) -> Encoder | None:
+    """Which text encoder a file is: CLIP-L, CLIP-G, T5 (FLAN-T5 and UMT5 too) or an LLM.
+    By a Diffusers pipeline's class for its folder, else by its name or its repo's. A bare
+    model is only taken for an LLM in a repo the Hub tags as one."""
+    if component not in {"text_encoder", "model"}:
+        return None
+    p = PurePosixPath(path)
+    folder = p.parts[0] if len(p.parts) > 1 else None
+    entry = model_index.get(folder) if model_index is not None and folder else None
+    if isinstance(entry, list | tuple) and len(entry) == 2 and isinstance(entry[1], str):
+        cls = entry[1]
+        if cls in _T5_CLASSES:
+            return "t5xxl"
+        if cls in _CLIP_CLASSES:
+            # SDXL and SD3 put CLIP-L first and OpenCLIP bigG second.
+            return "clip_g" if folder == "text_encoder_2" else "clip_l"
+        return "llm"
+    for text in (base.lower(), repo_id.rpartition("/")[2].lower()):
+        if _CLIP_G.search(text):
+            return "clip_g"
+        if _CLIP_L.search(text):
+            return "clip_l"
+        if _T5.search(text):
+            return "t5xxl"
+        if text == base.lower() and re.search(r"(?:^|[-_.])clip(?:$|[-_.])", text):
+            return None  # a CLIP of unknown size
+    if component == "model" and task != "llm":
+        return None  # e.g. a checkpoint in an untagged repo
+    # An LLM (a GGUF chat model, a Qwen3-VL or Mistral text encoder) unless it says otherwise.
+    return "llm"
 
 
 def _kind(files: list[RepoFile], pipeline: Pipeline | None) -> LayoutKind:
@@ -407,9 +489,15 @@ class Role:
     formats: frozenset[WeightFormat]
     split_gguf: bool  # llama.cpp opens a split GGUF from its first shard; sd-server doesn't
     indexed: bool = False  # sd-server reads sharded safetensors through their index
+    encoders: frozenset[Encoder] = frozenset()  # a text encoder slot: the kinds it takes
+    tiny: bool | None = None  # a VAE slot: True for --tae, False for --vae
 
     def loads(self, variant: Variant) -> bool:
         if variant.format not in self.formats:
+            return False
+        if self.encoders and variant.encoder is not None and variant.encoder not in self.encoders:
+            return False
+        if self.tiny is not None and variant.tiny != self.tiny:
             return False
         if not variant.sharded:
             return True
@@ -418,16 +506,26 @@ class Role:
 
 _GGUF: frozenset[WeightFormat] = frozenset({"gguf"})
 _ANY: frozenset[WeightFormat] = frozenset({"gguf", "safetensors"})
+_TEXT: frozenset[Component] = frozenset({"text_encoder", "model"})
 ROLES: dict[str, dict[str, Role]] = {
     "llamacpp": {
         "model": Role(frozenset({"model", "text_encoder"}), _GGUF, split_gguf=True),
         "mmproj": Role(frozenset({"mmproj"}), _GGUF, split_gguf=False),
     },
+    # Every sd-server slot (image_models/recipes.SLOTS); an engine shows its family's.
     "sdcpp": {
+        "model": Role(frozenset({"model", "diffusion_model"}), _ANY, False, indexed=True),
         "diffusion_model": Role(frozenset({"diffusion_model"}), _ANY, False, indexed=True),
-        "vae": Role(frozenset({"vae"}), _ANY, False, indexed=True),
-        "llm": Role(frozenset({"text_encoder", "model"}), _ANY, False, indexed=True),
+        "uncond_diffusion_model": Role(frozenset({"diffusion_model"}), _ANY, False, indexed=True),
+        "vae": Role(frozenset({"vae"}), _ANY, False, indexed=True, tiny=False),
+        "tae": Role(frozenset({"vae"}), _ANY, False, indexed=True, tiny=True),
+        "clip_l": Role(_TEXT, _ANY, False, indexed=True, encoders=frozenset({"clip_l"})),
+        "clip_g": Role(_TEXT, _ANY, False, indexed=True, encoders=frozenset({"clip_g"})),
+        "t5xxl": Role(_TEXT, _ANY, False, indexed=True, encoders=frozenset({"t5xxl"})),
+        "llm": Role(_TEXT, _ANY, False, indexed=True, encoders=frozenset({"llm"})),
         "llm_vision": Role(frozenset({"mmproj"}), _GGUF, split_gguf=False),
+        "embeddings_connectors": Role(frozenset({"connector"}), _ANY, False, indexed=True),
+        "tokenizer": Role(frozenset({"tokenizer"}), frozenset({"json"}), False),
     },
 }
 # Not a launch setting: a LoRA goes into sd-server's --lora-model-dir, which lists it.
@@ -447,7 +545,14 @@ def roles_for(engine_type: str, layout: RepoLayout) -> dict[str, list[Variant]]:
         components = role.components
         if engine_type == "sdcpp" and key == "diffusion_model" and layout.task is None:
             components = components | {"model"}  # an untagged repo's models may be diffusion ones
-        out[key] = [v for v in layout.variants if v.component in components and role.loads(v)]
+        found = [v for v in layout.variants if v.component in components and role.loads(v)]
+        if engine_type == "sdcpp" and key == "model":
+            # A checkpoint holds the whole model: one in checkpoints/, or a file at the top.
+            found = [v for v in found if v.component == "model" or "/" not in v.id]
+        elif engine_type == "sdcpp" and role.encoders:
+            # A bare model counts as a text encoder when it says which kind it is.
+            found = [v for v in found if v.component != "model" or v.encoder is not None]
+        out[key] = found
     return out
 
 
@@ -455,9 +560,16 @@ def ranked(candidates: list[Variant], *, key: str) -> list[Variant]:
     """Most useful first: by quant preference, then fewer files, smaller, plainer name."""
     order = PREFERRED_PROJECTORS if key in {"mmproj", "llm_vision"} else PREFERRED_QUANTS
 
-    def rank(v: Variant) -> tuple[int, int, int, int]:
+    def rank(v: Variant) -> tuple[int, int, int, int, int, int]:
         position = order.index(v.quant) if v.quant in order else len(order)
-        return (position, len(v.files), v.size, len(v.id))
+        # Ideogram 4's unconditional model goes in its own slot, not the diffusion model's.
+        uncond = "uncond" in v.id.lower()
+        misplaced = uncond != (key == "uncond_diffusion_model")
+        # A named single file (FLUX's ae.safetensors) over a Diffusers part of the same
+        # thing (vae/diffusion_pytorch_model.safetensors): sd.cpp's docs use the former.
+        name = _DIFFUSERS_VARIANT.sub("", shard_base(PurePosixPath(v.files[-1].path).name))
+        part = name.lower() in _CHECKPOINT_NAMES
+        return (int(misplaced), int(part), position, len(v.files), v.size, len(v.id))
 
     return sorted(candidates, key=rank)
 

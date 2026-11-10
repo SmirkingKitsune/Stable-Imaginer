@@ -48,6 +48,13 @@ jobs:
       - name: Tests
         run: uv run pytest
 
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Browser argument regression tests
+        run: node --test tests/web/argv.test.mjs
+
   package:
     name: package / ${{ matrix.os }}
     runs-on: ${{ matrix.os }}

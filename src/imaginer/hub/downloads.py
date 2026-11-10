@@ -198,12 +198,15 @@ class DownloadManager:
                 for index, f in enumerate(job.files):
                     job.file_index, job.current = index, f.path
                     done += await self._fetch_with_retries(job, f, done)
-                job.state, job.current = "succeeded", None
+                job.current = None
+                # Set what the download was for before saying it succeeded, so a client that
+                # sees it done also sees the setting it changed.
                 if self._on_success is not None:
                     try:
                         await self._on_success(job)
                     except ImaginerError as exc:
                         job.warning = f"downloaded, but not set: {exc.detail}"
+                job.state = "succeeded"
             log.info("hub.download_done", repo=job.repo_id, label=job.label)
         except asyncio.CancelledError:
             job.state = "cancelled"

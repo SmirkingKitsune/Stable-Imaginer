@@ -15,8 +15,10 @@ import asyncio
 import base64
 import io
 import itertools
+import json
 import threading
 from dataclasses import dataclass, field
+from importlib import resources
 from pathlib import PurePosixPath
 from typing import Any
 
@@ -72,6 +74,7 @@ class FakeSdCpp:
         return Starlette(
             routes=[
                 Route("/sdcpp/v1/capabilities", self._capabilities),
+                Route("/sdcpp/v1/recipes", self._recipes),
                 Route("/sdcpp/v1/img_gen", self._img_gen, methods=["POST"]),
                 Route("/sdcpp/v1/jobs/{job_id}", self._job),
                 Route("/sdcpp/v1/jobs/{job_id}/cancel", self._cancel, methods=["POST"]),
@@ -111,6 +114,16 @@ class FakeSdCpp:
                 "preview_modes": self.preview_modes,
             }
         )
+
+    async def _recipes(self, request: Request) -> Response:
+        """sd-server's built-in recipes: the ones Stable-Imaginer bundles a snapshot of."""
+        data = json.loads(
+            resources.files("imaginer.image_models")
+            .joinpath("data/sdcpp_recipes.json")
+            .read_text(encoding="utf-8")
+        )
+        recipes = [{**r, "source": "builtin"} for r in data["recipes"]]
+        return JSONResponse({"recipes": recipes, "errors": []})
 
     async def _img_gen(self, request: Request) -> Response:
         if self.queue_full:

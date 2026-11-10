@@ -35,7 +35,7 @@ them as written; the LLM, the quality check and a raw prompt get the words witho
 
 import asyncio
 import json
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field
 from typing import Any, Literal
 
@@ -130,6 +130,12 @@ class TurnRunner:
         self._tools = tools
         self._qa = qa
         self._config = config
+        self._prompt_hints: Callable[[str | None], str | None] | None = None
+
+    def set_prompt_hints(self, hints: Callable[[str | None], str | None]) -> None:
+        """How to prompt the model an image backend runs (None: the default one's): the
+        model library's note, added to the system prompt when image tools are offered."""
+        self._prompt_hints = hints
 
     async def start(self, conversation_id: str, body: dto.MessageCreate) -> TurnChannel:
         if not body.content.strip() and not body.attachments:
@@ -376,6 +382,15 @@ class TurnRunner:
             guidance.append(MODE_GUIDANCE[state.mode])
         if tools and state.reviewer is not None:
             guidance.append(QA_GUIDANCE)
+        if tools and self._prompt_hints is not None:
+            chosen = state.image_options.backend if state.image_options is not None else None
+            try:
+                hint = self._prompt_hints(chosen)
+            except Exception:
+                log.exception("turn.prompt_hint_failed")
+                hint = None
+            if hint:
+                guidance.append(f"About the image model: {hint}")
         vision = Capability.VISION_IN in capabilities
         rounds = self._config.max_tool_iterations if tools else 0
         for round_index in range(rounds + 1):

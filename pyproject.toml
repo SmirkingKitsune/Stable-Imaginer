@@ -96,6 +96,7 @@ select = [
 
 [tool.ruff.lint.per-file-ignores]
 "src/imaginer/cli.py" = ["T20"]
+"scripts/*" = ["T20"]
 
 # --- mypy -------------------------------------------------------------------
 

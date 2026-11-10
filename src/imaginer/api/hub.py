@@ -67,11 +67,14 @@ async def repo(
         description="owner/name, owner/name:QUANT, a Hub URL or an hf:// path.",
     ),
     engine: str | None = Query(default=None, description="Match the files to this engine."),
+    model: str | None = Query(
+        default=None, max_length=64, description="Or to this model card's slots."
+    ),
 ) -> dto.HubRepo:
     """A repo's layout: its loadable files (quants, shards, projectors, VAEs, text encoders)
-    or Diffusers pipeline, what is already on this machine, and, for an engine, which file
-    can fill each of its settings."""
-    return await container.hub.repo(ref, engine=engine)
+    or Diffusers pipeline, what is already on this machine, and, for an engine or a model
+    card, which file can fill each of its settings."""
+    return await container.hub.repo(ref, engine=engine, model=model)
 
 
 @router.get("/downloads")

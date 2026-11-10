@@ -34,7 +34,7 @@ backends:
   sdcpp:
     type: sdcpp
     base_url: http://127.0.0.1:1234
-    launch: {}  # diffusion_model, vae, llm, llm_vision: paths to the model files
+    launch: {}  # its files come from a model card: import one in the model library (#/models)
     declared_capabilities: [t2i, edit, multi_ref, rgba, lora]
     defaults:
       width: 2048

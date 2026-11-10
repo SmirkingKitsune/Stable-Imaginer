@@ -197,7 +197,9 @@ export const api = {
   /** {q, format, sort, limit, base_model, relation} */
   hubSearch: (params) => getJson(`v1/hub/search?${new URLSearchParams(params)}`),
   /** A repo's layout, matched to engine's model settings. ref: anything a person pastes. */
-  hubRepo: (ref, engine = null) => getJson(`v1/hub/repo?${new URLSearchParams(engine ? { ref, engine } : { ref })}`),
+  hubRepo: (ref, engine = null, model = null) => getJson(`v1/hub/repo?${new URLSearchParams({
+    ref, ...(engine ? { engine } : {}), ...(model ? { model } : {}),
+  })}`),
   hubDownloads: () => getJson('v1/hub/downloads'),
   hubDownload: (body) => sendJson('POST', 'v1/hub/downloads', body),
   cancelHubDownload: (id) => sendJson('POST', `v1/hub/downloads/${id}/cancel`),
@@ -205,6 +207,19 @@ export const api = {
   hubEvents: (signal) => request('GET', 'v1/hub/events', { signal, headers: { Accept: 'text/event-stream' } }),
 
   // --- the LoRA library ---
+  models: () => getJson('v1/models'),
+  model: (id) => getJson(`v1/models/${id}`),
+  createModel: (body) => sendJson('POST', 'v1/models', body),
+  updateModel: (id, patch) => sendJson('PATCH', `v1/models/${id}`, patch),
+  deleteModel: (id) => sendJson('DELETE', `v1/models/${id}`),
+  useModel: (id, body) => sendJson('POST', `v1/models/${id}/use`, body),
+  modelFamilies: (hidden = false) => getJson(`v1/models/families${hidden ? '?hidden=true' : ''}`),
+  modelFamily: (id) => getJson(`v1/models/families/${encodeURIComponent(id)}`),
+  detectModel: (body) => sendJson('POST', 'v1/models/detect', body),
+  /** {name, size_bytes}: where a file dropped in the browser is on the server's machine. */
+  locateModel: (body) => sendJson('POST', 'v1/models/locate', body),
+  setModelCover: (id, body) => sendJson('PUT', `v1/models/${id}/cover`, body),
+  clearModelCover: (id) => sendJson('DELETE', `v1/models/${id}/cover`),
   loras: () => getJson('v1/loras'),
   lora: (id) => getJson(`v1/loras/${id}`),
   updateLora: (id, patch) => sendJson('PATCH', `v1/loras/${id}`, patch),

@@ -22,11 +22,19 @@ def _layout(repo_id: str) -> RepoLayout:
     return classify(files, repo_id=repo_id, **meta)
 
 
-def _picks(engine: str, repo_id: str, **quants: str) -> dict[str, str | None]:
+# The slots of Qwen-Image-2.1's family, which the older tests were written for.
+QWEN_SLOTS = ("diffusion_model", "vae", "llm", "llm_vision")
+
+
+def _picks(
+    engine: str, repo_id: str, slots: tuple[str, ...] | None = None, **quants: str
+) -> dict[str, str | None]:
     roles = roles_for(engine, _layout(repo_id))
+    wanted = slots or (QWEN_SLOTS if engine == "sdcpp" else tuple(roles))
     return {
         key: (best.id if (best := suggest(found, key=key, quant=quants.get(key))) else None)
         for key, found in roles.items()
+        if key in wanted
     }
 
 

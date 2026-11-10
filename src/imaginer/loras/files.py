@@ -193,6 +193,57 @@ def _read_gguf(path: Path) -> list[tuple[str, list[int]]] | None:
         return None
 
 
+def gguf_metadata(path: Path) -> dict[str, str] | None:
+    """A GGUF file's string metadata (``general.architecture``, ``general.name``...); None
+    if it isn't a GGUF file."""
+    try:
+        return _cached("gguf-meta", path, _read_gguf_meta)  # type: ignore[no-any-return]
+    except OSError:
+        return None
+
+
+def _read_gguf_meta(path: Path) -> dict[str, str] | None:
+    try:
+        with path.open("rb") as fh:
+            if fh.read(4) != b"GGUF" or _u32(fh) < 2:
+                return None
+            _u64(fh)
+            n_kv = _u64(fh)
+            if n_kv > GGUF_MAX_KV:
+                return None
+            meta = {}
+            for _ in range(n_kv):
+                key = _string(fh)
+                kind = _u32(fh)
+                if kind == _GGUF_STRING:
+                    meta[key] = _string(fh)
+                else:
+                    _skip_value(fh, kind)
+            return meta
+    except (OSError, _Bad, struct.error):
+        return None
+
+
+def tensor_names(path: Path) -> list[str] | None:
+    """The tensor names of a model file: a GGUF or safetensors file, or a safetensors index
+    (``*.safetensors.index.json``, or a folder holding ``model.safetensors.index.json``);
+    None if they can't be read."""
+    try:
+        if path.is_dir():
+            path = path / "model.safetensors.index.json"
+        if path.name.endswith(".json"):
+            data = json.loads(path.read_text(encoding="utf-8"))
+            weight_map = data.get("weight_map") if isinstance(data, dict) else None
+            return list(weight_map) if isinstance(weight_map, dict) else None
+        if path.suffix.lower() == ".gguf":
+            tensors = gguf_tensors(path)
+            return [name for name, _ in tensors] if tensors is not None else None
+        header = safetensors_header(path)
+    except (OSError, ValueError):
+        return None
+    return [k for k in header if k != "__metadata__"] if header is not None else None
+
+
 # --- module names --------------------------------------------------------------------------
 
 

@@ -76,7 +76,7 @@ def test_sd_server_command(tmp_path: Path) -> None:
 @pytest.mark.parametrize(
     ("files", "fragment"),
     [
-        ({}, "--diffusion-model (diffusion model) is not set"),
+        ({}, "--model or --diffusion-model not set"),
         ({"diffusion_model": "missing.gguf"}, "file not found"),
     ],
 )

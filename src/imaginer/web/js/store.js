@@ -113,8 +113,26 @@ export function libraryLora(engine, path) {
   return libraryIndex.get(`${engine}\n${path}`) ?? null;
 }
 
+// --- the model library -----------------------------------------------------------
+
+let models = null; // GET /v1/models
+let modelsLoad = null;
+
+/** Load (or reload) the model library. Resolves with it; a failure keeps the last one. */
+export function loadModels() {
+  modelsLoad ??= api.models().then((lib) => {
+    models = lib;
+    emit('models');
+    return lib;
+  }, () => models).finally(() => { modelsLoad = null; });
+  return modelsLoad;
+}
+
+export const modelLibrary = () => models;
+
 // Where the user was working (a conversation, or the gallery) before opening a settings
-// screen: "Use in next prompt" in the library goes back there.
+// screen: those screens' Back goes there, and so does "Use in next prompt" in the library,
+// however many cards were opened in between.
 let workPlace = '#/';
 export function notePlace(hash) { workPlace = hash || '#/'; }
 export const lastPlace = () => workPlace;

@@ -48,6 +48,27 @@ VAE and transformers Qwen3-VL tensor names, so a Diffusers download of Qwen-Imag
 `--diffusion-model`, `--vae` and `--llm`. The sd.cpp docs themselves use the ComfyUI and GGUF
 files.
 
+## Model cards
+
+A model card's slots (see [models.md](models.md)) open the same dialog for one slot at a time:
+its family's curated sources first, then any repo. A download lands in the card's slot, and an
+engine that runs a card downloads into the card. For sd-server, a repo's files are matched
+to every slot a family can have:
+
+- **`--model`:** a whole checkpoint, at the repo's top level or in `checkpoints/`.
+- **`--diffusion-model` and `--uncond-diffusion-model`:** Ideogram 4's
+  `unconditional_transformer/` goes in the second.
+- **`--vae` and `--tae`:** a tiny autoencoder (`taesd*`, `taef1`…) only in `--tae`.
+- **`--clip_l`, `--clip_g`, `--t5xxl` and `--llm`:** by the Diffusers class of the folder
+  (`CLIPTextModel`, `text_encoder_2`'s OpenCLIP bigG, `T5EncoderModel`), else by name
+  (`clip_l`, `clip_g`, `t5xxl`, `umt5`, `flan-t5`). Anything else, such as Qwen3, Mistral
+  or Gemma, is an LLM.
+- **`--embeddings-connectors`:** `*connector*` files.
+- **`--tokenizer`:** `tokenizer.json`.
+
+A named file is suggested over a Diffusers part of the same thing (`ae.safetensors` over
+`vae/diffusion_pytorch_model.safetensors`).
+
 ## Model file checks
 
 The Engines screen checks model files against what each engine can load:
@@ -56,7 +77,9 @@ The Engines screen checks model files against what each engine can load:
   (`-00001-of-0000N`); llama.cpp finds the rest.
 - **sd-server:** GGUF or safetensors, or a safetensors index: a `*.safetensors.index.json`,
   or a folder holding `model.safetensors.index.json`. A single shard of a sharded checkpoint
-  would load part of a model, so it is flagged with the index to use instead.
+  would load part of a model, so it is flagged with the index to use instead. `--tokenizer`
+  takes a `tokenizer.json`. Which slots must be filled is the model's family's: FLUX.1 needs
+  CLIP-L, T5-XXL and a VAE (or a tiny autoencoder), SDXL only its checkpoint.
 
 ## Where files go, and copies already on disk
 

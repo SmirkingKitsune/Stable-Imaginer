@@ -24,6 +24,7 @@ from imaginer.backends.common import WordsSource, find_preset, preset_loras
 from imaginer.backends.diffusers_inproc import DiffusersBackend, missing_dependencies
 from imaginer.backends.llamacpp import LlamaCppBackend
 from imaginer.backends.sdcpp import SdCppBackend
+from imaginer.backends.sdcpp import size_multiple as sdcpp_size_multiple
 from imaginer.core.clock import utcnow
 from imaginer.core.config import (
     BackendConfig,
@@ -197,6 +198,13 @@ class BackendRegistry:
         return list(self._entries)
 
     # --- leases ---------------------------------------------------------------
+
+    def leased(self, name: str) -> bool:
+        """Whether a turn or job holds the backend's adapter (or a replaced one it built)."""
+        entry = self._entries.get(name)
+        if entry is not None and entry.backend is not None and self._leases.get(id(entry.backend)):
+            return True
+        return any(b.name == name for b in self._retired.values())
 
     def _hold(self, backend: Backend) -> None:
         key = id(backend)
@@ -508,13 +516,17 @@ def _image_defaults(config: BackendConfig, backend: Backend | None) -> ImageDefa
         # An adapter whose defaults live elsewhere (a linked instance's engine) reports them.
         reported = getattr(backend, "image_defaults", None)
         return reported if isinstance(reported, ImageDefaultsInfo) else None
+    if isinstance(config, SdCppBackendConfig):
+        multiple = sdcpp_size_multiple(config)
+    else:
+        multiple = getattr(config, "size_multiple", None) or sdcpp_size_multiple(None)
     return ImageDefaultsInfo(
         width=defaults.width,
         height=defaults.height,
         steps=defaults.steps,
         cfg_scale=defaults.cfg_scale,
         sampler=defaults.sampler,
-        size_multiple=config.size_multiple,  # type: ignore[union-attr]
+        size_multiple=multiple,
         loras=_lora_infos(defaults.loras),
     )
 
