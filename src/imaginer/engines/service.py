@@ -10,6 +10,11 @@ backend shares that one file.
 Starting, stopping and installing take one lock per engine type, because an install
 replaces the runtime that every engine of that type is started from.
 
+An sd-server with an edit card switches between its model card and the edit card per task
+(:meth:`EngineService.ensure`, called by the adapter as a job starts, inside the engine's
+gate): it restarts with the other card's files and waits for them to load. Which card is
+loaded is not saved: a started engine always starts with its model card.
+
 Runtimes install on this machine, so only local engines (launched here, or on a loopback
 address) show a runtime or accept an install; a remote engine is updated on its own host.
 """
@@ -18,6 +23,7 @@ import asyncio
 import contextlib
 import os
 import tempfile
+import time
 from collections.abc import Awaitable, Callable
 from pathlib import Path
 from typing import Any
@@ -27,7 +33,9 @@ import yaml
 from pydantic import TypeAdapter, ValidationError
 
 from imaginer.backends import diffusers_inproc
+from imaginer.backends.base import BackendHealth, LoadingCallback
 from imaginer.backends.registry import BackendRegistry
+from imaginer.backends.sdcpp import Face
 from imaginer.core.config import (
     BackendConfig,
     ConfigError,
@@ -42,7 +50,14 @@ from imaginer.core.config import (
 )
 from imaginer.core.logging import get_logger
 from imaginer.domain import models as dto
-from imaginer.domain.errors import ConflictError, InvalidRequestError, NotFoundError
+from imaginer.domain.enums import BackendStatus
+from imaginer.domain.errors import (
+    ConflictError,
+    EngineTimeoutError,
+    EngineUnavailableError,
+    InvalidRequestError,
+    NotFoundError,
+)
 from imaginer.engines import launch
 from imaginer.engines.installer import (
     Installer,
@@ -68,6 +83,7 @@ _VIEWED = (SdCppBackendConfig, LlamaCppBackendConfig)
 CardSettings = Callable[
     [str, dict[str, dict[str, Any]] | None, list[dict[str, Any]] | None], Awaitable[None]
 ]
+SWITCH_POLL_S = 1.0  # how often a switching engine is asked whether it has loaded
 
 
 class EngineService:
@@ -91,6 +107,9 @@ class EngineService:
         }
         self._view: ConfigView = view or (lambda _name, config: config)
         self.on_card_settings: CardSettings | None = None
+        self.card_name: Callable[[str | None], str | None] = lambda card: card
+        self._loading: dict[str, str] = {}  # engine -> the card it is switching to
+        self._switches: dict[str, asyncio.Task[None]] = {}  # engine -> its stop-and-start
         self.supervisor = Supervisor(settings.data_root / "engines" / "logs")
         self.installer = Installer()
         self._tasks: set[asyncio.Task[None]] = set()
@@ -138,6 +157,131 @@ class EngineService:
         except launch.LaunchError:
             return None
 
+    def edit_command(self, name: str) -> list[str] | None:
+        """The command line the engine would switch to for edits, if it has an edit card."""
+        view = getattr(self.effective(name), "edit_view", None)
+        exe = self._executable(view) if view is not None else None
+        if view is None or exe is None or view.launch is None:
+            return None
+        try:
+            return launch.command(view, exe)
+        except launch.LaunchError:
+            return None
+
+    def loaded_face(self, name: str) -> Face | None:
+        """Which of its cards a running engine has loaded: its model card (main) or its edit
+        card. None while it is stopped or switching, or when it runs other files (its card
+        changed since it started)."""
+        if name in self._loading:
+            return None
+        now = self.running_command(name)
+        if now is None:
+            return None
+        if now == self.command(name):
+            return "main"
+        return "edit" if now == self.edit_command(name) else None
+
+    def loading(self, engine: str) -> str | None:
+        """The card the engine is switching to, while it switches."""
+        return self._loading.get(engine)
+
+    async def ensure(
+        self,
+        engine: str,
+        face: Face,
+        config: SdCppBackendConfig,
+        *,
+        notify: LoadingCallback | None,
+        probe: Callable[[], Awaitable[BackendHealth]],
+    ) -> None:
+        """Return once the engine runs ``config``'s files (a face's card), loaded. One that
+        runs the other card's is restarted with these first; one that is stopped stays
+        stopped (it fails, as it would without an edit card). A job calls this inside the
+        engine's gate, so nothing else is using the engine."""
+        own = self._require(engine)
+        exe = self._executable(own)
+        if exe is None or config.launch is None:
+            return  # not started here: it runs what it runs
+        try:
+            # Before anything stops: missing files fail now and leave the engine running.
+            argv = await asyncio.to_thread(launch.command, config, exe)
+        except launch.LaunchError as exc:
+            raise InvalidRequestError(f"{engine} can't switch cards: {exc}") from exc
+        card = self.card_name(config.model_card) or config.model_card or face
+        running = self.running_command(engine)
+        if running is None and engine not in self._switches:
+            raise EngineUnavailableError(f"{engine} is stopped: start it first", backend=engine)
+        deadline = time.monotonic() + config.launch.swap_timeout_s
+        if running != argv:
+            log.info("engine.switching", engine=engine, face=face, card=config.model_card)
+            self._loading[engine] = card
+            if notify is not None:
+                await notify(card)
+            switch = self._switches.get(engine)
+            if switch is None or switch.done():
+                switch = asyncio.ensure_future(self._restart(engine, own.type, argv))
+                self._switches[engine] = switch
+                switch.add_done_callback(lambda _t: self._switches.pop(engine, None))
+            # Shielded: a cancelled job must not leave the engine half restarted.
+            await asyncio.shield(switch)
+        try:
+            await self._loaded(engine, card, probe, deadline)
+        except asyncio.CancelledError:
+            # The engine goes on loading: say so until it is ready (or gone).
+            self._spawn(self._settle(engine, card, probe, deadline))
+            raise
+        except BaseException:
+            self._loading.pop(engine, None)
+            raise
+        if self._loading.pop(engine, None) is not None:
+            log.info("engine.switched", engine=engine, face=face, card=config.model_card)
+            if notify is not None:
+                await notify(None)
+
+    async def _restart(self, engine: str, engine_type: str, argv: list[str]) -> None:
+        async with self._lock(engine_type):
+            await self.supervisor.stop(engine)
+            await self.supervisor.start(engine, argv)
+
+    async def _loaded(
+        self,
+        engine: str,
+        card: str,
+        probe: Callable[[], Awaitable[BackendHealth]],
+        deadline: float,
+    ) -> None:
+        """Wait until the engine answers ready, without holding a lock: it can be stopped
+        meanwhile (which ends the wait), and other engines started."""
+        while True:
+            health = await probe()
+            if health.status is BackendStatus.OK:
+                return
+            proc = self.supervisor.peek(engine)
+            if proc is None or not proc.alive:
+                summary = proc.run.last_error if proc is not None and proc.run else None
+                raise EngineUnavailableError(
+                    f"{engine} stopped while loading {card}" + (f": {summary}" if summary else ""),
+                    backend=engine,
+                )
+            if time.monotonic() > deadline:
+                raise EngineTimeoutError(
+                    f"{engine} did not load {card} in time (launch.swap_timeout_s)",
+                    backend=engine,
+                )
+            await asyncio.sleep(SWITCH_POLL_S)
+
+    async def _settle(
+        self,
+        engine: str,
+        card: str,
+        probe: Callable[[], Awaitable[BackendHealth]],
+        deadline: float,
+    ) -> None:
+        try:
+            await self._loaded(engine, card, probe, deadline)
+        finally:
+            self._loading.pop(engine, None)
+
     def refresh(self, name: str) -> None:
         """Apply the view again (a model card changed): the registry takes the new config
         as it runs. A running engine keeps its files until it is restarted."""
@@ -173,6 +317,10 @@ class EngineService:
             detail=info.detail,
             model=info.model,
             model_card=getattr(config, "model_card", None),
+            edit_card=getattr(config, "edit_card", None),
+            edit_card_name=self.card_name(getattr(config, "edit_card", None)),
+            loaded=self.loaded_face(name) if getattr(config, "edit_card", None) else None,
+            loading=self.loading(name),
             agent=getattr(config, "agent", None),
             family=family.id if family is not None else getattr(running, "family", None),
             family_name=family.name if family is not None else None,
@@ -395,6 +543,12 @@ class EngineService:
                     f"{name} is not an sd-server engine; it runs no model card"
                 )
             patch["model_card"] = body.model_card.strip() or None
+        if body.edit_card is not None:
+            if not isinstance(config, SdCppBackendConfig):
+                raise InvalidRequestError(
+                    f"{name} is not an sd-server engine; it runs no model card"
+                )
+            patch["edit_card"] = body.edit_card.strip() or None
         if body.agent is not None:
             if not isinstance(config, LlamaCppBackendConfig):
                 raise InvalidRequestError(f"{name} is not a llama-server engine; it runs no agent")

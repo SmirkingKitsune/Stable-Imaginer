@@ -11,6 +11,11 @@ reason, instead of silently disappearing.
 Whoever uses an adapter holds a :class:`Lease` on it: a turn for its whole run, an image
 job until it ends. When a backend is reconfigured, its old adapter is closed only once the
 last lease on it is released, so a long job keeps its client.
+
+An sd-server with an edit card has two faces, one per card (``SdCppBackend.edit_face``):
+an edit gets the edit face, with that card's presets and capabilities, and the face
+switches the engine to its card when the job runs. A lease on either face counts as one on
+the engine's adapter.
 """
 
 import asyncio
@@ -23,7 +28,7 @@ from imaginer.backends.base import BackendHealth, ImageBackend, LLMBackend
 from imaginer.backends.common import WordsSource, find_preset, preset_loras
 from imaginer.backends.diffusers_inproc import DiffusersBackend, missing_dependencies
 from imaginer.backends.llamacpp import LlamaCppBackend
-from imaginer.backends.sdcpp import SdCppBackend
+from imaginer.backends.sdcpp import CardSwitcher, SdCppBackend
 from imaginer.backends.sdcpp import size_multiple as sdcpp_size_multiple
 from imaginer.core.clock import utcnow
 from imaginer.core.config import (
@@ -44,7 +49,13 @@ from imaginer.domain.errors import (
     ImaginerError,
     InvalidRequestError,
 )
-from imaginer.domain.models import BackendInfo, ImageDefaultsInfo, ImagePresetInfo, LoraInfo
+from imaginer.domain.models import (
+    BackendEditInfo,
+    BackendInfo,
+    ImageDefaultsInfo,
+    ImagePresetInfo,
+    LoraInfo,
+)
 
 log = get_logger(__name__)
 
@@ -103,17 +114,21 @@ class _Entry:
 
 
 class Lease[B: (LLMBackend, ImageBackend)]:
-    """A hold on one adapter. Release it when done; releasing again does nothing."""
+    """A hold on one adapter. Release it when done; releasing again does nothing. On an
+    engine's edit face, the hold is on the engine's adapter (``owner``), which closes both."""
 
-    def __init__(self, registry: "BackendRegistry", backend: B) -> None:
+    def __init__(
+        self, registry: "BackendRegistry", backend: B, owner: Backend | None = None
+    ) -> None:
         self.backend: B = backend
+        self._owner: Backend = owner if owner is not None else backend
         self._registry: BackendRegistry | None = registry
-        registry._hold(backend)
+        registry._hold(self._owner)
 
     def release(self) -> None:
         registry, self._registry = self._registry, None
         if registry is not None:
-            registry._unhold(self.backend)
+            registry._unhold(self._owner)
 
 
 class BackendRegistry:
@@ -130,6 +145,7 @@ class BackendRegistry:
         self._retired: dict[int, Backend] = {}  # replaced adapters that are still leased
         self._closing: set[asyncio.Task[None]] = set()
         self._lora_words: WordsSource | None = None
+        self._switcher: CardSwitcher | None = None
 
     def set_lora_words(self, words: WordsSource | None) -> None:
         """Where image adapters get a LoRA's trigger words (the LoRA library), for every
@@ -138,9 +154,19 @@ class BackendRegistry:
         for entry in self._entries.values():
             self._attach(entry)
 
+    def set_switcher(self, switcher: CardSwitcher | None) -> None:
+        """What switches an sd-server between its model card and its edit card (the engine
+        service), for every adapter there is and every one built later."""
+        self._switcher = switcher
+        for entry in self._entries.values():
+            self._attach(entry)
+
     def _attach(self, entry: _Entry) -> _Entry:
-        if entry.backend is not None and hasattr(entry.backend, "lora_words"):
-            entry.backend.lora_words = self._lora_words
+        for face in _faces(entry.backend):
+            if hasattr(face, "lora_words"):
+                face.lora_words = self._lora_words
+            if isinstance(face, SdCppBackend):
+                face.switcher = self._switcher
         return entry
 
     @classmethod
@@ -302,7 +328,7 @@ class BackendRegistry:
         must be one of its presets; with LoRAs to apply it must also offer ``lora``."""
         base = Capability.T2I if task == "t2i" else Capability.EDIT
         entry = await self._ready(task, name, BackendKind.IMAGE, {base, *require}, preset)
-        return Lease(self, cast(ImageBackend, entry.backend))
+        return Lease(self, cast(ImageBackend, _face(entry, task)), owner=entry.backend)
 
     async def _ready(
         self,
@@ -318,10 +344,10 @@ class BackendRegistry:
             entry = self._select(task, name, kind)
             needs = set(required)
             if kind is BackendKind.IMAGE:
-                chosen = find_preset(entry.name, _presets(entry), preset)
-                if _loras(entry, chosen):
+                chosen = find_preset(_card_label(entry, task), _presets(entry, task), preset)
+                if _loras(entry, chosen, task):
                     needs.add(Capability.LORA)
-            await self._ensure_ready(entry, needs)
+            await self._ensure_ready(entry, needs, task)
             if self._entries.get(entry.name) is entry:
                 return entry
 
@@ -333,18 +359,25 @@ class BackendRegistry:
     def validate_image_preset(self, preset: str, name: str | None = None) -> None:
         """Fail now, not mid-turn, if no image backend the message could use has ``preset``:
         ``name``, or else the default backends for t2i and edit."""
+        tasks: tuple[Literal["t2i", "edit"], ...] = ("t2i", "edit")
+        candidates: dict[str, _Entry]
         if name is not None:
-            find_preset(name, _presets(self._select("t2i", name, BackendKind.IMAGE)), preset)
+            named = self._select("t2i", name, BackendKind.IMAGE)
+            # Either card's: an edit card's presets are for its edits.
+            both = {p: v for task in tasks for p, v in _presets(named, task).items()}
+            find_preset(name, both, preset)
             return
         candidates = {
             chosen: entry
-            for task in ("t2i", "edit")
+            for task in tasks
             if (chosen := self._settings.default_backend(task)) is not None
             and (entry := self._entries.get(chosen)) is not None
             and entry.kind is BackendKind.IMAGE
         }
-        if not any(preset in _presets(entry) for entry in candidates.values()):
-            known = sorted({p for entry in candidates.values() for p in _presets(entry)})
+        # A preset of either card counts: the edit card's are for edits.
+        offered = {p for e in candidates.values() for task in tasks for p in _presets(e, task)}
+        if preset not in offered:
+            known = sorted(offered)
             where = ", ".join(sorted(candidates)) or "no image backend"
             raise InvalidRequestError(
                 f"no image preset '{preset}' on {where} (presets: {', '.join(known) or 'none'})",
@@ -356,18 +389,26 @@ class BackendRegistry:
     ) -> ImagePreset | None:
         """The preset as the backend a ``task`` call would use has it; None if it doesn't."""
         try:
-            return find_preset("", _presets(self._select(task, name, BackendKind.IMAGE)), preset)
+            entry = self._select(task, name, BackendKind.IMAGE)
+            return find_preset("", _presets(entry, task), preset)
         except ImaginerError:
             return None
 
     def offers(self, task: Task) -> bool:
-        """Whether a request for ``task`` could be routed at all (a built backend exists).
+        """Whether a request for ``task`` could be routed at all: a built backend exists, and
+        its model could do it (an edit-only model makes no images from text).
 
         Says nothing about health: an engine that is down still "offers" the task, and a
         request then fails with 503 rather than the tool silently disappearing."""
         name = self._settings.default_backend(task)
         entry = self._entries.get(name) if name else None
-        return entry is not None and entry.backend is not None
+        if entry is None or entry.backend is None:
+            return False
+        if task == "chat":
+            return True
+        declared = getattr(_face(entry, task), "declared", None)
+        base = Capability.T2I if task == "t2i" else Capability.EDIT
+        return declared is None or base in declared
 
     def _select(self, task: Task, name: str | None, kind: BackendKind) -> _Entry:
         chosen = name or self._settings.default_backend(task)
@@ -389,15 +430,20 @@ class BackendRegistry:
             )
         return entry
 
-    async def _ensure_ready(self, entry: _Entry, required: set[Capability]) -> None:
+    async def _ensure_ready(
+        self, entry: _Entry, required: set[Capability], task: Task = "chat"
+    ) -> None:
         assert entry.backend is not None
         health = await self._fresh(entry)
-        if health.status is not BackendStatus.OK:
+        # An engine switching between its cards is down for a while: work waits for it at
+        # the engine's gate rather than failing.
+        switching = getattr(entry.backend, "loading", None) is not None
+        if health.status is not BackendStatus.OK and not switching:
             raise EngineUnavailableError(
                 f"backend '{entry.name}' is {health.status.value}: {health.detail}",
                 backend=entry.name,
             )
-        missing = required - entry.backend.capabilities()
+        missing = required - _face(entry, task).capabilities()
         if missing:
             raise CapabilityUnavailableError(
                 f"backend '{entry.name}' lacks {', '.join(sorted(missing))}",
@@ -428,17 +474,7 @@ class BackendRegistry:
             ],
             detail=entry.reason,
             image_defaults=_image_defaults(entry.config, entry.backend),
-            image_presets=[
-                ImagePresetInfo(
-                    name=key,
-                    description=p.description,
-                    loras=_lora_infos(p.loras) if p.loras is not None else None,
-                    steps=p.steps,
-                    cfg_scale=p.cfg_scale,
-                    sampler=p.sampler,
-                )
-                for key, p in _presets(entry).items()
-            ],
+            image_presets=_preset_infos(_presets(entry)),
         )
         if entry.backend is None:
             return info
@@ -448,6 +484,10 @@ class BackendRegistry:
             and time.monotonic() - entry.probed_at < max_age_s
         )
         health = entry.health if recent and entry.health is not None else await self._probe(entry)
+        capabilities = set(entry.backend.capabilities())
+        edit = _face(entry, "edit")
+        if edit is not entry.backend:
+            capabilities |= edit.capabilities() & {Capability.EDIT, Capability.MULTI_REF}
         return info.model_copy(
             update={
                 "model": entry.backend.model,
@@ -455,9 +495,29 @@ class BackendRegistry:
                 "detail": health.detail,
                 "latency_ms": health.latency_ms,
                 "probed_at": health.probed_at,
-                "capabilities": sorted(entry.backend.capabilities()),
+                "capabilities": sorted(capabilities),
                 "available_loras": getattr(entry.backend, "available_loras", None),
+                "edit": self._edit_info(entry) if entry.kind is BackendKind.IMAGE else None,
+                "loading": getattr(entry.backend, "loading", None),
             }
+        )
+
+    def _edit_info(self, entry: _Entry) -> BackendEditInfo | None:
+        """How the backend edits: its edit card's settings, or its own."""
+        face = _face(entry, "edit")
+        caps = face.capabilities()
+        if Capability.EDIT not in caps and Capability.EDIT not in getattr(face, "declared", caps):
+            return None
+        config = _face_config(entry, "edit")
+        card = getattr(entry.config, "edit_card", None) if face is not entry.backend else None
+        return BackendEditInfo(
+            card=card,
+            card_name=self._switcher.card_name(card) if card and self._switcher else None,
+            capabilities=sorted(caps),
+            max_ref_images=getattr(face, "max_ref_images", None),
+            mask=bool(getattr(face, "takes_mask", True)),
+            image_defaults=_image_defaults(config, face),
+            image_presets=_preset_infos(_presets(entry, "edit")),
         )
 
     async def aclose(self) -> None:
@@ -480,22 +540,67 @@ def _adapter_fields(config: BackendConfig) -> dict[str, Any]:
     launch = getattr(config, "launch", None)
     read = set(_ADAPTER_LAUNCH_FIELDS)
     fields["launch"] = launch.model_dump(include=read, exclude_none=True) if launch else {}
+    edit_view = getattr(config, "edit_view", None)  # excluded from dumps, read all the same
+    if edit_view is not None:
+        fields["edit_view"] = _adapter_fields(edit_view)
     return fields
 
 
-def _presets(entry: _Entry) -> dict[str, ImagePreset]:
-    """Its configured presets, or for an engine a linked instance shares, the presets that
-    instance reports."""
-    presets = getattr(entry.config, "presets", None)
+def _faces(backend: Backend | None) -> list[Backend]:
+    """An adapter, and its edit face if it has one."""
+    if backend is None:
+        return []
+    edit = getattr(backend, "edit_face", None)
+    return [backend, edit] if edit is not None else [backend]
+
+
+def _face(entry: _Entry, task: Task) -> Backend:
+    """What serves ``task`` on the backend: an edit gets an sd-server's edit face."""
+    assert entry.backend is not None
+    edit = getattr(entry.backend, "edit_face", None)
+    return edit if task == "edit" and edit is not None else entry.backend
+
+
+def _face_config(entry: _Entry, task: Task) -> BackendConfig:
+    """The config ``task`` runs with: for an edit on an engine with an edit card, the card's."""
+    edit_view = getattr(entry.config, "edit_view", None)
+    return edit_view if task == "edit" and edit_view is not None else entry.config
+
+
+def _card_label(entry: _Entry, task: Task) -> str:
+    """How errors name what a task runs on: the backend, and for an edit card that too."""
+    if task == "edit" and getattr(entry.config, "edit_view", None) is not None:
+        return f"{entry.name} (its edit card)"
+    return entry.name
+
+
+def _presets(entry: _Entry, task: Task = "t2i") -> dict[str, ImagePreset]:
+    """Its configured presets (an edit card's, for an edit), or for an engine a linked
+    instance shares, the presets that instance reports."""
+    presets = getattr(_face_config(entry, task), "presets", None)
     if isinstance(presets, dict):
         return presets
     reported = getattr(entry.backend, "image_presets", None)
     return reported if isinstance(reported, dict) else {}
 
 
-def _loras(entry: _Entry, preset: ImagePreset | None) -> list[LoraRef]:
+def _preset_infos(presets: Mapping[str, ImagePreset]) -> list[ImagePresetInfo]:
+    return [
+        ImagePresetInfo(
+            name=key,
+            description=p.description,
+            loras=_lora_infos(p.loras) if p.loras is not None else None,
+            steps=p.steps,
+            cfg_scale=p.cfg_scale,
+            sampler=p.sampler,
+        )
+        for key, p in presets.items()
+    ]
+
+
+def _loras(entry: _Entry, preset: ImagePreset | None, task: Task = "t2i") -> list[LoraRef]:
     """The LoRAs a request with ``preset`` applies on this backend."""
-    defaults = getattr(entry.config, "defaults", None)
+    defaults = getattr(_face_config(entry, task), "defaults", None)
     if defaults is not None:
         return preset_loras(defaults, preset)
     if preset is not None and preset.loras is not None:

@@ -406,6 +406,21 @@ class ImagePresetInfo(BaseModel):
     sampler: str | None
 
 
+class BackendEditInfo(BaseModel):
+    """How an image backend edits. With an edit card, that card's settings; otherwise its
+    own (the same model makes and edits images)."""
+
+    card: str | None = Field(default=None, description="Its edit card, if it has one.")
+    card_name: str | None = None
+    capabilities: list[Capability] = Field(default_factory=list)
+    max_ref_images: int | None = Field(
+        default=None, description="Input images an edit takes at most (a mask counts as one)."
+    )
+    mask: bool = Field(default=True, description="Whether an edit can take a mask.")
+    image_defaults: ImageDefaultsInfo | None = None
+    image_presets: list[ImagePresetInfo] = Field(default_factory=list)
+
+
 class BackendInfo(BaseModel):
     name: str
     type: str
@@ -429,6 +444,12 @@ class BackendInfo(BaseModel):
     available_loras: list[str] | None = Field(
         default=None,
         description="LoRAs the engine can apply, as paths for presets; null if it doesn't say.",
+    )
+    edit: BackendEditInfo | None = Field(
+        default=None, description="Image backends that edit: how (its edit card's settings)."
+    )
+    loading: str | None = Field(
+        default=None, description="The model card it is switching to (edit card swaps)."
     )
 
 
@@ -537,6 +558,16 @@ class EngineInfo(BaseModel):
     model_card: str | None = Field(
         default=None, description="sd-server engines: the model card it runs (GET /v1/models)."
     )
+    edit_card: str | None = Field(
+        default=None, description="sd-server engines: the model card it switches to for edits."
+    )
+    edit_card_name: str | None = None
+    loaded: Literal["main", "edit"] | None = Field(
+        default=None,
+        description="With an edit card: which card it has loaded now (none while switching, "
+        "or when it runs other files).",
+    )
+    loading: str | None = Field(default=None, description="The card it is switching to.")
     agent: str | None = Field(
         default=None, description="llama-server engines: the agent it runs (GET /v1/agents)."
     )
@@ -595,6 +626,11 @@ class EngineUpdate(_Input):
         default=None,
         max_length=64,
         description="sd-server engines: the model card to run; empty: none (its own files).",
+    )
+    edit_card: str | None = Field(
+        default=None,
+        max_length=64,
+        description="sd-server engines: the model card to switch to for edits; empty: none.",
     )
     agent: str | None = Field(
         default=None,
@@ -1237,6 +1273,13 @@ class ModelFamilyBrief(BaseModel):
     name: str
     group: str | None = None
     hidden: bool = False
+    slot_labels: dict[str, str] = Field(
+        default_factory=dict,
+        description="Each slot's label: a file is shared between families of a group only "
+        "where they label the slot alike (Qwen-Image's 2.5-VL encoder is not 2.1's 3-VL).",
+    )
+    edit: bool = Field(default=False, description="It can edit with reference images.")
+    edit_only: bool = Field(default=False, description="It only edits: no text-to-image.")
 
 
 class ModelFamily(ModelFamilyBrief):
@@ -1306,8 +1349,12 @@ class ModelEngineUse(BaseModel):
     """An sd-server engine running (or set to run) the model."""
 
     engine: str
+    role: Literal["main", "edit"] = Field(
+        default="main", description="main: its model card; edit: its edit card."
+    )
     launchable: bool = Field(description="Started here, so switching models restarts it.")
     running: bool = False
+    loaded: bool = Field(default=False, description="The engine has this card loaded now.")
     needs_restart: bool = Field(
         default=False, description="Running with other files or launch arguments than these."
     )
@@ -1336,6 +1383,9 @@ class ModelCardItem(BaseModel):
         default_factory=list, description="Slots still empty, e.g. t5xxl, or vae or tae."
     )
     problems: list[str] = Field(default_factory=list)
+    warnings: list[str] = Field(
+        default_factory=list, description="What it can't do with these files, though ready."
+    )
     engines: list[ModelEngineUse] = Field(default_factory=list)
     tags: list[str] = Field(default_factory=list)
     pinned: bool = False
@@ -1375,8 +1425,12 @@ class SharedComponent(BaseModel):
 class ModelLibraryEngine(BaseModel):
     name: str
     model_card: str | None = None
+    edit_card: str | None = Field(default=None, description="The card it switches to for edits.")
     launchable: bool
     running: bool = False
+    loaded: Literal["main", "edit"] | None = Field(
+        default=None, description="Which of its cards it has loaded, while it runs one."
+    )
 
 
 class ModelLibraryView(BaseModel):
@@ -1460,6 +1514,11 @@ class ModelUse(_Input):
     start: bool = Field(
         default=True,
         description="Start the engine with it if it isn't running (one that is restarts).",
+    )
+    role: Literal["main", "edit"] = Field(
+        default="main",
+        description="main: run it for everything; edit: switch to it for edits only (an edit "
+        "model). Making it the edit card restarts nothing.",
     )
 
 

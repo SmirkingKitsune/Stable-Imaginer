@@ -133,6 +133,7 @@ class Container:
 
         conversations.add_delete_hook(stop_work)
         engines = EngineService(settings, registry, raw=raw, view=view)
+        registry.set_switcher(engines)  # an sd-server's edit card swaps per task
         hub = HubService(settings, engines)
         models.attach(engines=engines, hub=hub, artifacts=artifacts)
         agents.attach(
@@ -150,9 +151,20 @@ class Container:
             await models.adopt_engines()
         except Exception:
             log.exception("models.adopt_failed")
-        turn_runner.set_prompt_hints(
-            lambda backend: models.prompt_hint(backend or settings.default_backend("t2i") or "")
-        )
+
+        def image_hints(backend: str | None) -> str | None:
+            """How to prompt the image models a turn uses: the t2i engine's (with its edit
+            card's), and the edit engine's when edits go elsewhere."""
+            t2i = backend or settings.default_backend("t2i") or ""
+            hint = models.prompt_hint(t2i)
+            edit = settings.default_backend("edit")
+            if backend is None and edit and edit != t2i:
+                other = models.prompt_hint(edit)
+                if other and other != hint:
+                    hint = f"{hint} For edit_image: {other}" if hint else f"For edit_image: {other}"
+            return hint
+
+        turn_runner.set_prompt_hints(image_hints)
         loras = LoraLibrary(settings, db, registry, engines, artifacts, hub)
         await loras.start()
         registry.set_lora_words(loras.words_for)

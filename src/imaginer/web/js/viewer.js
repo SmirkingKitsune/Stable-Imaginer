@@ -27,7 +27,7 @@ import { clock, imagesSummary, parseArgs, plural, specOf, truncate } from './for
 import { convHash } from './origin.js';
 import { promptBar } from './promptbar.js';
 import {
-  agentOf, agentOfMessage, attacherOf, branchAt, byLabel, cancelJob, currentBranch, ensureLoaded, imageEngine,
+  agentOf, agentOfMessage, attacherOf, branchAt, byLabel, cancelJob, currentBranch, editEngine, ensureLoaded, imageEngine,
   images, lineageOf, on, onPath, pathOf, retry, running, select, send, stop,
 } from './store.js';
 
@@ -143,9 +143,19 @@ export function viewerScreen({ id, label, navigate }) {
   const seg = (mode, text) => h('button.pick', { type: 'button', onclick: () => setMode(mode) }, text);
   const modeSeg = h('div.tray-seg.cmp-modes', { hidden: true, role: 'group', 'aria-label': 'Compare view' },
     seg('slider', 'Slider'), seg('side', 'Side by side'));
+  const editBtn = action('pencil', 'Edit', 'Edit this image', () => current && editCurrent());
+  const maskBtn = action('brush', 'Mask', 'Mask: paint the area to change', () => current && navigate(convHash(id, 'mask', current.label)));
+  /** What the image engine's edits allow: an edit model may take no mask. */
+  const editActions = () => {
+    const engine = editEngine();
+    const edit = engine ? engine.edit : {}; // the backends aren't loaded yet: offer them
+    editBtn.hidden = !edit;
+    maskBtn.hidden = !edit || edit.mask === false;
+  };
+  editActions();
   const actions = h('div.side-actions',
-    action('pencil', 'Edit', 'Edit this image', () => current && editCurrent()),
-    action('brush', 'Mask', 'Mask: paint the area to change', () => current && navigate(convHash(id, 'mask', current.label))),
+    editBtn,
+    maskBtn,
     retryBtn,
     action('download', 'Download', 'Download', () => current && save(current)));
   const pixelNote = h('span.mono-meta.side-note');
@@ -901,7 +911,8 @@ export function viewerScreen({ id, label, navigate }) {
     agentLayer.append(h('div.step-plate.blueprint', corners(),
       h('div.job-progress',
         h('div.job-step',
-          h('span.job-step-n', total ? ['Step ', String(p.step ?? 0), h('span.muted', ` / ${total}`)] : job.status === 'queued' ? 'Queued' : 'Starting'),
+          h('span.job-step-n', total ? ['Step ', String(p.step ?? 0), h('span.muted', ` / ${total}`)] : job.status === 'queued' ? 'Queued'
+            : p.phase === 'loading' ? `Loading ${p.model ?? 'the edit model'}…` : 'Starting'),
           h('span.mono-meta.accent', total ? `${pct}%` : '')),
         h('div.step-bar', h('i', { style: { width: `${pct}%` } })),
         h('span.mono-meta', [job.backend, modelName(job.model), job.seed != null && `seed ${job.seed}`, requested.aspect_ratio].filter(Boolean).join(' · '))),
@@ -970,7 +981,7 @@ export function viewerScreen({ id, label, navigate }) {
   // The stage resizes with the window, the side column, and compare's second pane.
   const sizer = new ResizeObserver(() => fit());
   sizer.observe(main.el);
-  const unsubscribe = [on(`conv:${id}`, render), on('agents', render), on('turns', () => {
+  const unsubscribe = [on(`conv:${id}`, render), on('agents', render), on('backends', editActions), on('turns', () => {
     bar.refresh();
     if (c) render();
   })];

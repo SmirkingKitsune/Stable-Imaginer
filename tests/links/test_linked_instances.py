@@ -3,14 +3,24 @@ a NAS that shares its chat engine, each using the other's."""
 
 import asyncio
 import json
+import time
 from collections.abc import AsyncIterator
 from typing import Any
 
 import httpx
 import pytest
 
-from imaginer.core.config import ImagePreset, LinkShare, LoraRef, RoutingConfig
+from imaginer.backends.openai_http.transport import HttpTransport
+from imaginer.core.config import (
+    ImagePreset,
+    LinkShare,
+    LoraRef,
+    RetryConfig,
+    RoutingConfig,
+    TimeoutConfig,
+)
 from imaginer.domain.enums import BackendKind
+from imaginer.links import gallery
 from tests.conftest import llama_config, sd_config
 from tests.fakes.fake_llama import FakeLlama
 from tests.fakes.fake_sdcpp import FakeSdCpp
@@ -313,6 +323,69 @@ async def test_an_offline_link_fails_loudly(desk_and_nas: Pair) -> None:
         status = {s["name"]: s["status"] for s in page["sources"]}
         assert status == {"desk": "ok", "nas": "unreachable"}
         assert [i["id"] for i in page["items"]] == [cid]
+
+
+def _refusing_after(delay_s: float) -> HttpTransport:
+    """A link transport whose every request is refused after ``delay_s``, as a closed port
+    is on Windows (the OS retries the connection for about 2 s before giving up)."""
+
+    async def refuse(request: httpx.Request) -> httpx.Response:
+        await asyncio.sleep(delay_s)
+        raise httpx.ConnectError("Connection refused", request=request)
+
+    client = httpx.AsyncClient(transport=httpx.MockTransport(refuse), base_url="http://refused")
+    return HttpTransport(
+        name="link nas",
+        base_url="http://refused",
+        timeouts=TimeoutConfig(),
+        retry=RetryConfig(attempts=1),
+        client=client,
+    )
+
+
+async def test_the_gallery_doesnt_wait_for_a_link_known_to_be_offline(
+    desk_and_nas: Pair, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    desk, nas = desk_and_nas
+    link_id = await pair(desk, nas, name="nas")
+    async with nas.client() as client:
+        await client.post("/v1/conversations", json={"title": "on the nas"})
+    link = desk.container.links.get(link_id)
+    online, offline = link.transport, _refusing_after(1.0)
+    link.transport = offline  # the NAS goes away
+    async with desk.client() as client:
+        cid = (await client.post("/v1/conversations", json={"title": "on the desk"})).json()["id"]
+
+        # The first listing finds out the slow way, and has the link checked again.
+        page = (await client.get("/v1/gallery")).json()
+        assert {s["name"]: s["status"] for s in page["sources"]}["nas"] == "unreachable"
+
+        async def known_offline() -> bool:
+            return link.status == "unreachable"
+
+        await _until(known_offline)
+
+        # From then on, the desk's own conversations come without waiting for the NAS.
+        started = time.monotonic()
+        page = (await client.get("/v1/gallery")).json()
+        assert time.monotonic() - started < 0.5
+        nas_source = next(s for s in page["sources"] if s["name"] == "nas")
+        assert nas_source["status"] == "unreachable"
+        assert nas_source["detail"]
+        assert [i["id"] for i in page["items"]] == [cid]
+        assert page["next_cursor"] is None
+
+        # The NAS comes back: listings ask it again, and its conversations reappear.
+        monkeypatch.setattr(gallery, "RECHECK_AFTER_S", 0.0)
+        link.transport = online
+
+        async def back() -> bool:
+            page = (await client.get("/v1/gallery")).json()
+            return {i["title"] for i in page["items"]} == {"on the desk", "on the nas"}
+
+        await _until(back)
+    assert link.status == "ok"
+    await offline.aclose()
 
 
 async def test_unlinking_reaches_both_sides(desk_and_nas: Pair) -> None:

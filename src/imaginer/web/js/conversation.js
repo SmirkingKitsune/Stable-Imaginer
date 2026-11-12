@@ -25,7 +25,7 @@ import {
 import { convHash } from './origin.js';
 import { promptBar } from './promptbar.js';
 import {
-  agentOfMessage, byLabel, cancelJob, connection, currentBranch, ensureLoaded, imageEngine, images, libraryLora,
+  agentOfMessage, byLabel, cancelJob, connection, currentBranch, editEngine, ensureLoaded, imageEngine, images, libraryLora,
   loraLibrary, on, pathOf, remove, rename, retry, reloadConversation, running, select, send, setArchivedFlag, siblingsOf,
   stale, stop,
 } from './store.js';
@@ -398,7 +398,9 @@ export function conversationScreen({ id, navigate, focusBar = false }) {
     let state;
     if (gaveUp) state = h('span.state.fail', 'UNKNOWN · OFFLINE');
     else if (lost) state = h('span.state.wait', stepText ? `LAST SEEN · ${stepText}` : 'LAST SEEN');
-    else if (job?.status === 'running') {
+    else if (job?.status === 'running' && p?.phase === 'loading') {
+      state = h('span.state.wait', `LOADING · ${modelName(p.model) || 'MODEL'}`.toUpperCase());
+    } else if (job?.status === 'running') {
       state = h('span.state.run', stepText ? `RUNNING · ${stepText}` : 'RUNNING');
     } else if (job?.status === 'queued') state = h('span.state.wait', 'QUEUED');
     else if (job?.status === 'succeeded') state = h('span.state.done', `DONE · ${job.outputs.length}`);
@@ -575,7 +577,7 @@ export function conversationScreen({ id, navigate, focusBar = false }) {
     const of = (p.images ?? shown?.n ?? 1) > 1 ? ` · IMAGE ${p.image ?? 1}/${p.images ?? shown.n}` : '';
     const preview = h('div.job-preview.blueprint', { style: { aspectRatio: ratio } },
       corners(),
-      h('span.job-chip', job.status === 'queued' ? 'QUEUED' : `STEP ${step}${of}`),
+      h('span.job-chip', job.status === 'queued' ? 'QUEUED' : p.phase === 'loading' ? `LOADING ${p.model ?? ''}`.trim() : `STEP ${step}${of}`),
       h('div.scanline', { style: { top: `${pct}%` } }));
     const engine = [job.backend, modelName(job.model), `seed ${job.seed}`, aspect].filter(Boolean).join(' · ');
     return h('div.job', { class: lost ? 'stale' : '' },
@@ -584,7 +586,8 @@ export function conversationScreen({ id, navigate, focusBar = false }) {
         aside ?? (inputs.length ? lineage(inputs, mask) : h('div')),
         h('div.job-progress',
           h('div.job-step',
-            h('span.job-step-n', total ? ['Step ', String(step), h('span.muted', ` / ${total}`)] : job.status === 'queued' ? 'Queued' : 'Starting'),
+            h('span.job-step-n', total ? ['Step ', String(step), h('span.muted', ` / ${total}`)] : job.status === 'queued' ? 'Queued'
+              : p.phase === 'loading' ? `Loading ${p.model ?? 'the edit model'}…` : 'Starting'),
             lost ? h('span.mono-meta', 'paused · not live') : h('span.mono-meta.accent', total ? `${pct}%` : '')),
           h('div.step-bar', h('i', { style: { width: `${pct}%` } })),
           h('span.mono-meta', engine)),
@@ -605,19 +608,28 @@ export function conversationScreen({ id, navigate, focusBar = false }) {
       corners(), pic,
       h('div.fig-hover',
         h('span.label-chip', a.label),
-        h('div.fig-actions',
-          h('button.mini.primary', {
-            type: 'button', onclick: () => bar.addArtifact(a, { first: true, prefill: `Edit @${a.label}: ` }),
-          }, icon('pencil', 13), 'Edit'),
-          h('button.mini', {
-            type: 'button', title: 'Paint a mask for an edit', onclick: () => navigate(convHash(id, 'mask', a.label)),
-          }, icon('brush', 13), 'Mask'),
-          retryButton(result, 'Run this call again on a new branch'),
-          h('button.mini.square', {
-            type: 'button', title: 'Add to the bar as a reference', 'aria-label': `Use ${a.label} as a reference`,
-            onclick: () => bar.addArtifact(a),
-          }, icon('plus', 13))))),
+        figActions(a, result))),
       h('figcaption', h('span.mono-meta', specOf(a)), attemptSwitch));
+  }
+
+  /** Edit, Mask, Retry, reference: what the image engine's edits allow (an edit model may
+   * take no mask, or one image only). */
+  function figActions(a, result) {
+    const engine = editEngine();
+    const edit = engine ? engine.edit : {}; // the backends aren't loaded yet: offer them all
+    const single = edit?.max_ref_images === 1;
+    return h('div.fig-actions',
+      edit && h('button.mini.primary', {
+        type: 'button', onclick: () => bar.addArtifact(a, { first: true, prefill: `Edit @${a.label}: ` }),
+      }, icon('pencil', 13), 'Edit'),
+      edit?.mask !== false && edit && h('button.mini', {
+        type: 'button', title: 'Paint a mask for an edit', onclick: () => navigate(convHash(id, 'mask', a.label)),
+      }, icon('brush', 13), 'Mask'),
+      retryButton(result, 'Run this call again on a new branch'),
+      edit && !single && h('button.mini.square', {
+        type: 'button', title: 'Add to the bar as a reference', 'aria-label': `Use ${a.label} as a reference`,
+        onclick: () => bar.addArtifact(a),
+      }, icon('plus', 13)));
   }
 
   // --- branches -----------------------------------------------------------------

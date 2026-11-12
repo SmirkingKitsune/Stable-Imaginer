@@ -51,6 +51,8 @@ class FakeSdCpp:
     requests: list[dict[str, Any]] = field(default_factory=list)
     cancels: list[str] = field(default_factory=list)
     started: threading.Event = field(default_factory=threading.Event)  # a job began generating
+    model_name: str = "qwen_image_2.1-Q4_K.gguf"  # the loaded model it reports
+    color_salt: int = 0  # shifts every image's colour: tells two loaded models' images apart
 
     def reset(self) -> None:
         self.state = "ready"
@@ -94,9 +96,9 @@ class FakeSdCpp:
             {
                 **extra,
                 "model": {
-                    "name": "qwen_image_2.1-Q4_K.gguf",
-                    "stem": "qwen_image_2.1-Q4_K",
-                    "path": "/models/qwen_image_2.1-Q4_K.gguf",
+                    "name": self.model_name,
+                    "stem": PurePosixPath(self.model_name).stem,
+                    "path": f"/models/{self.model_name}",
                 },
                 "runtime": {"state": self.state, "origin": self.origin},
                 "current_mode": "img_gen",
@@ -207,7 +209,7 @@ class FakeSdCpp:
             base64.b64decode(ref.split(",", 1)[1], validate=True)
         seed = int(body["seed"])
         data = render(
-            seed,
+            seed + self.color_salt,
             body["width"],
             body["height"],
             RGBA_MARKER in body["prompt"],

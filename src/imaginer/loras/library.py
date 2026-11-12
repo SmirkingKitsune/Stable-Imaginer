@@ -1281,8 +1281,15 @@ _FAMILIES = (
 
 
 # Base-model names LoRA trainers write (kohya's ss_base_model_version, modelspec's
-# architecture, a Hub card's base_model), by the LoRA group of the families they fit.
+# architecture, a Hub card's base_model), by the LoRA group of the families they fit. The
+# first that matches wins, so edit models come before the text-to-image ones they extend.
 _GROUPS = (
+    ("kontext", "flux1-kontext"), ("qwen-image-edit", "qwen-image-edit"),
+    ("qwen_image_edit", "qwen-image-edit"), ("longcat-image-edit", "longcat-image-edit"),
+    ("longcat_image_edit", "longcat-image-edit"), ("boogu-image-0.1-edit", "boogu-image-edit"),
+    ("boogu-image-edit", "boogu-image-edit"), ("boogu_image_edit", "boogu-image-edit"),
+    ("mage-flow-edit", "mage-flow-edit"), ("mage_flow_edit", "mage-flow-edit"),
+    ("fibo-2.0-edit", "fibo2-edit"), ("fibo2_edit", "fibo2-edit"),
     ("stable-diffusion-xl", "sdxl"), ("sdxl", "sdxl"), ("sd_xl", "sdxl"), ("pony", "sdxl"),
     ("illustrious", "sdxl"), ("noobai", "sdxl"), ("sd3.5-large", "sd35-large"),
     ("sd3.5_large", "sd35-large"), ("stable-diffusion-3.5-large", "sd35-large"),

@@ -31,8 +31,9 @@ import asyncio
 import base64
 import contextlib
 import time
-from dataclasses import replace
-from typing import Any
+from collections.abc import Awaitable, Callable
+from dataclasses import dataclass, field, replace
+from typing import Any, Literal, Protocol
 
 from imaginer.backends.base import (
     BackendHealth,
@@ -40,6 +41,7 @@ from imaginer.backends.base import (
     GenProgress,
     GenRequest,
     ImageResult,
+    LoadingCallback,
 )
 from imaginer.backends.common import (
     WordsSource,
@@ -87,9 +89,17 @@ def _lora_dir_of(config: SdCppBackendConfig) -> object:
 
 
 def family_capabilities(config: SdCppBackendConfig) -> frozenset[Capability]:
-    """What the engine's model family can do at most (all of it, without a family)."""
+    """What the engine's model family can do at most (all of it, without a family): with
+    the files it launches, no edits from a GGUF text encoder missing its vision projector."""
     family = recipes.family(config.family)
-    return SUPPORTED & family.capabilities() if family is not None else SUPPORTED
+    if family is None:
+        return SUPPORTED
+    files = (
+        {slot: getattr(config.launch, slot, None) for slot in recipes.SLOT_IDS}
+        if config.launch is not None
+        else None
+    )
+    return SUPPORTED & family.capabilities(files)
 
 
 def expected_capabilities(config: SdCppBackendConfig) -> set[Capability]:
@@ -99,6 +109,15 @@ def expected_capabilities(config: SdCppBackendConfig) -> set[Capability]:
     declared = config.declared_capabilities
     supported = family_capabilities(config)
     return set(supported & declared if declared is not None else supported)
+
+
+def ref_limit(config: SdCppBackendConfig) -> int:
+    """The most input images an edit takes: the config's limit, or fewer if the model family
+    handles fewer well (FLUX.1 Kontext edits one image)."""
+    family = recipes.family(config.family)
+    if family is not None and family.max_refs is not None:
+        return min(config.max_ref_images, family.max_refs)
+    return config.max_ref_images
 
 
 def size_multiple(config: SdCppBackendConfig | None) -> int:
@@ -111,7 +130,51 @@ def size_multiple(config: SdCppBackendConfig | None) -> int:
     return family.size_multiple if family is not None else LEGACY_SIZE_MULTIPLE
 
 
+Face = Literal["main", "edit"]
+
+
+class CardSwitcher(Protocol):
+    """Switches an engine between its model card and its edit card (EngineService)."""
+
+    def loading(self, engine: str) -> str | None:
+        """The card the engine is switching to, while it does."""
+        ...
+
+    def card_name(self, card_id: str | None) -> str | None: ...
+
+    async def ensure(
+        self,
+        engine: str,
+        face: Face,
+        config: SdCppBackendConfig,
+        *,
+        notify: LoadingCallback | None,
+        probe: Callable[[], Awaitable[BackendHealth]],
+    ) -> None:
+        """Return once the engine runs ``config``'s files, restarting it with them first if
+        it runs the other card's."""
+        ...
+
+
+@dataclass(slots=True)
+class _ServerState:
+    """What the running sd-server reported at its last probe. An engine with an edit card
+    has two faces (one per card) on one server, so they share it."""
+
+    probed: set[Capability] = field(default_factory=set)
+    model: str = "unknown"
+    max_side: int = 4096
+    preview_modes: set[str] = field(default_factory=set)
+    loras: dict[str, dict[str, Any]] | None = None  # path -> entry; None: not listed
+    recipes_read: bool = False
+
+
 class SdCppBackend:
+    """One sd-server. With an edit card (``config.edit_view``) it has a second face,
+    ``edit_face``: the same server as it runs the edit card, with that card's family,
+    defaults and presets. Each face makes sure the server runs its card before it makes an
+    image, so an edit switches the engine to the edit card and text-to-image switches back."""
+
     lora_words: WordsSource | None = None  # the LoRA library's trigger words, if it has any
 
     def __init__(
@@ -120,6 +183,8 @@ class SdCppBackend:
         config: SdCppBackendConfig,
         *,
         transport: HttpTransport | None = None,
+        server: _ServerState | None = None,
+        face: Face | None = None,
     ) -> None:
         self.name = name
         self._config = config
@@ -132,13 +197,41 @@ class SdCppBackend:
         )
         self._family = recipes.family(config.family)
         self._declared = frozenset(expected_capabilities(config))
-        self._probed: set[Capability] = set()
-        self._model = "unknown"
-        self._max_side = 4096
-        self._preview_modes: set[str] = set()
-        self._loras: dict[str, dict[str, Any]] | None = None  # path -> entry; None: not listed
-        self._recipes_read = False
+        self._server = server or _ServerState()
+        self.switcher: CardSwitcher | None = None
+        self.edit_face: SdCppBackend | None = None
+        self._face: Face | None = face
         check_sigmas(config.defaults, config.presets)
+        if config.edit_view is not None and face is None:
+            self._face = "main"
+            self.edit_face = SdCppBackend(
+                name, config.edit_view, transport=self._transport, server=self._server, face="edit"
+            )
+
+    @property
+    def face(self) -> Face | None:
+        """Which card this face runs (none: the engine has no edit card)."""
+        return self._face
+
+    @property
+    def config(self) -> SdCppBackendConfig:
+        return self._config
+
+    @property
+    def declared(self) -> frozenset[Capability]:
+        """What this face can do at most: its family's, narrowed by declared_capabilities."""
+        return self._declared
+
+    @property
+    def loading(self) -> str | None:
+        """The card the engine is switching to, while it switches."""
+        if self._face is None or self.switcher is None:
+            return None
+        return self.switcher.loading(self.name)
+
+    @property
+    def takes_mask(self) -> bool:
+        return self._mask_instruction() is not None
 
     @property
     def size_multiple(self) -> int:
@@ -160,6 +253,10 @@ class SdCppBackend:
             return self._family.rgba
         return DEFAULT_RGBA_PROMPT_TEMPLATE
 
+    def _takes(self, feature: str) -> bool:
+        """Whether the engine's family has a recipe feature (any, without a family)."""
+        return self._family is None or feature in self._family.features
+
     def _mask_instruction(self) -> str | None:
         """How a mask is explained to the model; None when its family takes no mask."""
         if self._config.mask_instruction is not None:
@@ -170,45 +267,67 @@ class SdCppBackend:
 
     def update_config(self, config: BackendConfig) -> bool:
         """Take new presets or defaults as they are: requests read them. False when
-        anything else changed, which needs a new adapter."""
-        if not isinstance(config, SdCppBackendConfig):
+        anything else changed, which needs a new adapter (for the edit face too)."""
+        if not isinstance(config, SdCppBackendConfig) or not self._takes_config(config):
             return False
+        if (config.edit_view is None) != (self.edit_face is None):
+            return False
+        if self.edit_face is not None:
+            assert config.edit_view is not None
+            if not self.edit_face._takes_config(config.edit_view):
+                return False
+            self.edit_face._config = config.edit_view
+        self._config = config
+        return True
+
+    def _takes_config(self, config: SdCppBackendConfig) -> bool:
         try:
             check_sigmas(config.defaults, config.presets)
         except ValueError:
             return False
         live = set(LIVE_FIELDS)
-        if config.model_dump(exclude=live | {"launch"}) != self._config.model_dump(
+        return config.model_dump(exclude=live | {"launch"}) == self._config.model_dump(
             exclude=live | {"launch"}
-        ) or _lora_dir_of(config) != _lora_dir_of(self._config):
-            return False
-        self._config = config
-        return True
+        ) and _lora_dir_of(config) == _lora_dir_of(self._config)
 
     @property
     def model(self) -> str:
-        return self._model
+        return self._server.model
 
     @property
     def max_ref_images(self) -> int:
-        return self._config.max_ref_images
+        return ref_limit(self._config)
 
     @property
     def available_loras(self) -> list[str] | None:
         """The LoRA paths the engine listed at its last probe; None if it lists none."""
-        return sorted(self._loras) if self._loras is not None else None
+        loras = self._server.loras
+        return sorted(loras) if loras is not None else None
 
     def capabilities(self) -> set[Capability]:
-        return set(self._declared & self._probed)
+        if self.loading is not None:
+            # The engine is down while it switches cards: say what it will do once loaded,
+            # so work waits for it rather than failing.
+            return set(self._declared)
+        return set(self._declared & self._server.probed)
 
     async def health(self) -> BackendHealth:
+        if (card := self.loading) is not None:
+            return BackendHealth(
+                status=BackendStatus.DEGRADED, detail=f"loading {card}", probed_at=utcnow()
+            )
+        return await self.probe()
+
+    async def probe(self) -> BackendHealth:
+        """Ask the server how it is, even while it switches cards."""
         started = time.perf_counter()
+        server = self._server
         try:
             caps = await self._transport.get_json(
                 "/sdcpp/v1/capabilities", timeout_s=HEALTH_TIMEOUT_S, attempts=1
             )
         except ImaginerError as exc:
-            self._probed = set()
+            server.probed = set()
             return self._health(BackendStatus.DOWN, started, exc.detail)
         if not isinstance(caps, dict):
             return self._health(BackendStatus.DEGRADED, started, "unexpected capabilities response")
@@ -221,7 +340,7 @@ class SdCppBackend:
                 detail += f" ({runtime['error']})"
             return self._health(BackendStatus.DEGRADED, started, detail)
         if "img_gen" not in (caps.get("supported_modes") or ["img_gen"]):
-            self._probed = set()
+            server.probed = set()
             return self._health(
                 BackendStatus.DEGRADED, started, "loaded model cannot generate images"
             )
@@ -231,17 +350,17 @@ class SdCppBackend:
         if runtime.get("origin") != "command_line" and not features.get("ref_images", True):
             probed -= {Capability.EDIT, Capability.MULTI_REF}
         # Servers that take a request's LoRAs list the ones they can apply (maybe none).
-        self._loras = _lora_catalog(caps.get("loras"))
-        if self._loras is not None and features.get("lora", True):
+        server.loras = _lora_catalog(caps.get("loras"))
+        if server.loras is not None and features.get("lora", True):
             probed.add(Capability.LORA)
-        self._probed = probed
-        self._model = (caps.get("model") or {}).get("name") or self._model
+        server.probed = probed
+        server.model = (caps.get("model") or {}).get("name") or server.model
         limits = caps.get("limits") or {}
-        self._max_side = int(min(limits.get("max_width", 4096), limits.get("max_height", 4096)))
-        self._preview_modes = set(caps.get("preview_modes") or [])
-        if not self._recipes_read:
+        server.max_side = int(min(limits.get("max_width", 4096), limits.get("max_height", 4096)))
+        server.preview_modes = set(caps.get("preview_modes") or [])
+        if not server.recipes_read:
             await self._read_recipes()
-        detail = f"model {self._model}"
+        detail = f"model {server.model}"
         if self._config.declared_capabilities is None:
             detail += "; edit/rgba support assumed (set declared_capabilities to restrict)"
         return self._health(BackendStatus.OK, started, detail)
@@ -249,7 +368,7 @@ class SdCppBackend:
     async def _read_recipes(self) -> None:
         """The engine's own recipes, which describe its build's families better than the
         bundled snapshot. Builds before the recipe API have none; that's fine."""
-        self._recipes_read = True
+        self._server.recipes_read = True
         with contextlib.suppress(ImaginerError):
             listed = await self._transport.get_json(
                 "/sdcpp/v1/recipes", timeout_s=HEALTH_TIMEOUT_S, attempts=1
@@ -270,11 +389,12 @@ class SdCppBackend:
                 f"{self.name} can't edit with a mask: {name} takes reference images only",
                 backend=self.name,
             )
+        limited = self.max_ref_images < self._config.max_ref_images and self._family is not None
         fitted = await prepare_inputs(
-            self.name,
+            self._family.name if limited and self._family is not None else self.name,
             req.images,
             req.mask,
-            max_inputs=self._config.max_ref_images,
+            max_inputs=self.max_ref_images,
             max_pixels=default_max_ref_pixels(self._config.defaults, self._config.max_ref_pixels),
         )
         if req.mask is not None and instruction is not None:
@@ -295,7 +415,7 @@ class SdCppBackend:
             req,
             self._config.defaults,
             size_multiple=self.size_multiple,
-            max_side=self._max_side,
+            max_side=self._server.max_side,
             base_size=base_size,
             preset=find_preset(self.name, self._config.presets, req.preset),
         )
@@ -306,10 +426,10 @@ class SdCppBackend:
         missing from the last listing asks for a new listing first: the server rescans its
         folder every time."""
         try:
-            matched = match_loras(self.name, wanted, self._loras, unlisted=UNLISTED)
+            matched = match_loras(self.name, wanted, self._server.loras, unlisted=UNLISTED)
         except InvalidRequestError:
-            await self.health()
-            matched = match_loras(self.name, wanted, self._loras, unlisted=UNLISTED)
+            await self.probe()
+            matched = match_loras(self.name, wanted, self._server.loras, unlisted=UNLISTED)
         return merge_loras(matched)
 
     def _body(self, req: GenRequest, params: dict[str, Any], refs: list[str]) -> dict[str, Any]:
@@ -333,10 +453,12 @@ class SdCppBackend:
             guidance["txt_cfg"] = params["cfg_scale"]
         if "guidance" in params:
             guidance["distilled_guidance"] = params["guidance"]
+        if refs and "img_cfg_scale" in params and self._takes("img_cfg"):
+            guidance["img_cfg"] = params["img_cfg_scale"]  # LLaDA, Fibo 2 have none
         if guidance:
             sample["guidance"] = guidance
         preview = self._config.preview
-        if self._preview_modes and preview not in self._preview_modes:
+        if self._server.preview_modes and preview not in self._server.preview_modes:
             preview = "none"
         if self._family is not None and not self._family.previews:
             preview = "none"  # pixel-space models make no previews
@@ -358,6 +480,8 @@ class SdCppBackend:
             body["sample_params"] = sample
         if refs:
             body["ref_images"] = refs
+            if params.get("ref_image_args"):
+                body["ref_image_args"] = params["ref_image_args"]
         if loras := params.get("loras"):
             body["lora"] = [{"path": x["path"], "multiplier": x["weight"]} for x in loras]
         return body
@@ -365,6 +489,11 @@ class SdCppBackend:
     async def _run(
         self, req: GenRequest, refs: list[str], base_size: tuple[int, int] | None = None
     ) -> list[ImageResult]:
+        if self._face is not None and self.switcher is not None:
+            # The engine may run the other card: switch it to this face's first.
+            await self.switcher.ensure(
+                self.name, self._face, self._config, notify=req.on_loading, probe=self.probe
+            )
         params = self.resolved_params(req, base_size)
         # Only an engine launched here has its LoRA folder on this machine, the folder its
         # listed paths are relative to: their trigger phrases and hashes come from there.

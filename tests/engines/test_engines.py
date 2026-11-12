@@ -2,6 +2,7 @@
 
 import asyncio
 import json
+import os
 import struct
 import subprocess
 import sys
@@ -18,6 +19,8 @@ from fastapi import FastAPI
 
 from imaginer.core.config import SdCppLaunch, load_settings, local_overrides_path
 from imaginer.engines import installer, launch, service
+from imaginer.engines import supervisor as engine_supervisor
+from imaginer.engines.proctree import ProcessTree
 from imaginer.engines.supervisor import Supervisor
 from imaginer.main import create_app
 from tests.conftest import SettingsFactory, sd_config
@@ -124,6 +127,86 @@ async def test_stop_ends_a_running_engine(tmp_path: Path) -> None:
     await supervisor.stop("sd")
     assert proc.state == "stopped" and proc.run is not None and proc.run.stopped_by_us
     await supervisor.aclose()
+
+
+def _engine_with_a_child(then: str) -> list[str]:
+    """An engine that starts a child sharing its output pipe (as a wrapper script or
+    llama-server's router does), says the child's pid, then runs ``then``."""
+    script = (
+        "import subprocess, sys, time; "
+        "child = subprocess.Popen("
+        "[sys.executable, '-c', 'import time; time.sleep(60)'], stdout=sys.stdout); "
+        f"print(f'child {{child.pid}}', flush=True); {then}"
+    )
+    return [sys.executable, "-c", script]
+
+
+async def _child_pid(proc: Any) -> int:
+    await _until(lambda: any(line.text.startswith("child ") for line in proc.run.lines))
+    [line] = [line for line in proc.run.lines if line.text.startswith("child ")]
+    return int(line.text.split()[1])
+
+
+def _running(pid: int) -> bool:
+    # if/else statements, not early returns: mypy reports the other platform's code.
+    if sys.platform == "win32":
+        import ctypes
+
+        kernel32 = ctypes.WinDLL("kernel32")
+        kernel32.OpenProcess.restype = ctypes.c_void_p
+        handle = kernel32.OpenProcess(0x1000, False, pid)  # PROCESS_QUERY_LIMITED_INFORMATION
+        code = ctypes.c_ulong()
+        if handle:
+            kernel32.GetExitCodeProcess(ctypes.c_void_p(handle), ctypes.byref(code))
+            kernel32.CloseHandle(ctypes.c_void_p(handle))
+        running = code.value == 259  # STILL_ACTIVE
+    else:
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            running = False
+        else:
+            running = True  # or a zombie, until something reaps it
+    return running
+
+
+async def test_stop_ends_an_engine_whose_child_holds_its_output(tmp_path: Path) -> None:
+    supervisor = Supervisor(tmp_path / "logs")
+    proc = await supervisor.start("sd", _engine_with_a_child("time.sleep(60)"))
+    child = await _child_pid(proc)
+    assert _running(child)
+    await asyncio.wait_for(supervisor.stop("sd"), 5)
+    assert proc.state == "stopped"
+    await _until(lambda: not _running(child))
+
+
+async def test_an_engine_that_exits_takes_its_children_with_it(tmp_path: Path) -> None:
+    supervisor = Supervisor(tmp_path / "logs")
+    proc = await supervisor.start("sd", _engine_with_a_child("raise SystemExit(3)"))
+    child = await _child_pid(proc)
+    await _until(lambda: proc.state == "exited")
+    assert proc.run is not None and proc.run.exit_code == 3
+    await _until(lambda: not _running(child))
+
+
+async def test_an_exit_is_seen_while_something_else_holds_the_output_open(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A process the tree can't reach (it left the process group, say) keeps the pipe
+    open: the exit is still reported, after a bounded wait for the last output."""
+    trees: list[ProcessTree] = []
+    real_close = ProcessTree.close
+    monkeypatch.setattr(ProcessTree, "close", lambda self: trees.append(self))
+    monkeypatch.setattr(engine_supervisor, "DRAIN_S", 0.2)
+    supervisor = Supervisor(tmp_path / "logs")
+    proc = await supervisor.start("sd", _engine_with_a_child("raise SystemExit(3)"))
+    child = await _child_pid(proc)
+    await _until(lambda: proc.state == "exited")
+    assert proc.run is not None and proc.run.exit_code == 3
+    assert _running(child)
+    [tree] = trees
+    real_close(tree)
+    await _until(lambda: not _running(child))
 
 
 SLEEPER = [sys.executable, "-c", "import time; time.sleep(60)"]

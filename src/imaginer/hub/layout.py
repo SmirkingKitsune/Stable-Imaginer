@@ -99,6 +99,9 @@ _CLIP_L = re.compile(
 )
 _CLIP_G = re.compile(r"(?:^|[-_.])(?:clip[-_.]?g|clip[-_.]?vit[-_.]?(?:big)?g\w*|bigg)(?:$|[-_.])")
 _T5 = re.compile(r"(?:^|[-_.])(?:t5\w*|umt5\w*|flan[-_.]?t5\w*)(?:$|[-_.])")
+# A chat model's name (a GGUF quantizer's repo often has no task tag): an instruct or
+# vision-language model is an LLM, never an image model.
+_CHAT_MODEL = re.compile(r"(?:^|[-_.])(?:instruct|it|chat|vl)(?:$|[-_.])")
 # Transformers text encoder classes (model_index.json) that are CLIP or T5.
 _CLIP_CLASSES = frozenset({"CLIPTextModel", "CLIPTextModelWithProjection"})
 _T5_CLASSES = frozenset({"T5EncoderModel", "UMT5EncoderModel", "T5ForConditionalGeneration"})
@@ -406,7 +409,9 @@ def _encoder(
         if text == base.lower() and re.search(r"(?:^|[-_.])clip(?:$|[-_.])", text):
             return None  # a CLIP of unknown size
     if component == "model" and task != "llm":
-        return None  # e.g. a checkpoint in an untagged repo
+        chat = p.suffix.lower() == ".gguf" and _CHAT_MODEL.search(base.lower())
+        if not chat:
+            return None  # e.g. a checkpoint in an untagged repo
     # An LLM (a GGUF chat model, a Qwen3-VL or Mistral text encoder) unless it says otherwise.
     return "llm"
 

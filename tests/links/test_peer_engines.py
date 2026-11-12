@@ -103,6 +103,9 @@ class FakeEngines:
     def executable(self, config: Any) -> Path:
         return self.exe
 
+    def loading(self, name: str) -> str | None:
+        return None  # no edit card to switch to
+
     async def start(self, name: str) -> None:
         self.starts += 1
         self.supervisor.procs[name] = FakeProcess()

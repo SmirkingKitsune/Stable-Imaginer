@@ -47,6 +47,10 @@ backends:
       cfg_scale: 6.0
       sampler: euler
       output_format: png
+    # An edit model next to it (docs/models.md, "An edit card"): with launch settings, set
+    # edit_card to its card's id. An edit restarts sd-server with it; the next new image
+    # switches back.
+    # edit_card: <the edit model's card id, from the model library>
     # LoRAs: start sd-server with launch.lora_model_dir (a folder of LoRAs only), then pick a
     # preset in the prompt bar. Each preset's steps and CFG are the ones its LoRA was made for.
     # presets:

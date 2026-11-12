@@ -14,7 +14,7 @@ from imaginer.backends.base import ImageInput
 from imaginer.backends.registry import BackendRegistry
 from imaginer.db.repositories.artifacts import ParentRef
 from imaginer.domain.enums import ArtifactKind, Capability, JobTask, LineageRelation
-from imaginer.domain.errors import InvalidRequestError, NotFoundError
+from imaginer.domain.errors import CapabilityUnavailableError, InvalidRequestError, NotFoundError
 from imaginer.domain.models import Artifact
 from imaginer.orchestration.jobs import JobManager, JobSpec, random_seed
 from imaginer.services.artifacts import ArtifactService
@@ -103,7 +103,7 @@ class EditImageTool(Tool):
             # The user painted this mask for the edit; the model doesn't have to name it.
             args = args.model_copy(update={"mask": options.mask})
         params = sampler_params(ctx)
-        preset = user_preset(options)
+        preset = user_preset(options, self._registry, "edit")
         loras = user_loras(options)
         labels = [*args.images, *([args.mask] if args.mask else [])]
         resolved = await self._resolve(ctx.conversation_id, labels, mask=args.mask)
@@ -115,9 +115,20 @@ class EditImageTool(Tool):
             require.add(Capability.RGBA)
         if loras:
             require.add(Capability.LORA)
-        lease = await self._registry.image_backend(
-            "edit", options.backend if options else None, require=require, **preset
-        )
+        try:
+            lease = await self._registry.image_backend(
+                "edit", options.backend if options else None, require=require, **preset
+            )
+        except CapabilityUnavailableError as exc:
+            if exc.extra.get("missing") == [Capability.MULTI_REF]:
+                # Say what to do instead: an edit model like FLUX.1 Kontext takes one image.
+                raise CapabilityUnavailableError(
+                    f"the edit model takes one image at a time, got {len(labels)}: edit one "
+                    "image, and describe anything else in the prompt"
+                    + (" (it takes no mask)" if args.mask else ""),
+                    **exc.extra,
+                ) from exc
+            raise
         backend = lease.backend
         try:
             if len(labels) > backend.max_ref_images:

@@ -1,6 +1,6 @@
 """Pieces shared by the image tools: common arguments, job running, result shaping."""
 
-from typing import Any
+from typing import TYPE_CHECKING, Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -10,6 +10,9 @@ from imaginer.domain.errors import ImaginerError, InvalidRequestError
 from imaginer.domain.models import SEED_MAX, Artifact, AspectRatio, ImageRequestOptions
 from imaginer.orchestration.jobs import JobManager, JobSpec
 from imaginer.tools.base import ToolContext, ToolOutcome
+
+if TYPE_CHECKING:
+    from imaginer.backends.registry import BackendRegistry
 
 
 class ImageOptions(BaseModel):
@@ -67,10 +70,23 @@ def user_params(options: ImageRequestOptions | None) -> dict[str, Any]:
     return {k: v for k, v in params.items() if v is not None}
 
 
-def user_preset(options: ImageRequestOptions | None) -> dict[str, Any]:
+def user_preset(
+    options: ImageRequestOptions | None,
+    registry: "BackendRegistry | None" = None,
+    task: Literal["t2i", "edit"] = "t2i",
+) -> dict[str, Any]:
     """The backend preset the user picked, as keyword arguments for the lease and the job
-    (only the user picks one: its LoRAs and settings aren't offered to the model)."""
-    return {"preset": options.preset} if options is not None and options.preset else {}
+    (only the user picks one: its LoRAs and settings aren't offered to the model). A preset
+    of an engine's edit card is for its edits, and one of its model card for the rest: the
+    other task goes without it."""
+    if options is None or not options.preset:
+        return {}
+    if registry is not None:
+        other: Literal["t2i", "edit"] = "edit" if task == "t2i" else "t2i"
+        mine = registry.image_preset(task, options.backend, options.preset)
+        if mine is None and registry.image_preset(other, options.backend, options.preset):
+            return {}
+    return {"preset": options.preset}
 
 
 def user_loras(options: ImageRequestOptions | None) -> tuple[LoraRef, ...]:

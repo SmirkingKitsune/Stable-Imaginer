@@ -133,6 +133,19 @@ class ImageDefaults(_Strict):
     clip_skip: int | None = Field(
         default=None, ge=1, description="CLIP layers to skip (SD 1.x/2.x/SDXL); 1 skips none."
     )
+    img_cfg_scale: float | None = Field(
+        default=None,
+        ge=0,
+        description="Image guidance for edits (sd.cpp's --img-cfg-scale): how closely the result "
+        "keeps to the reference images. Only families with image CFG (Kontext, Qwen Image "
+        "Edit, LongCat, Boogu, Mage-Flow) use it; unset is 1.",
+    )
+    ref_image_args: str | None = Field(
+        default=None,
+        max_length=500,
+        description="sd-server's ref_image_args for edits, e.g. resize_before_vae=false or "
+        "vlm_max_size=512 (stable-diffusion.cpp docs/edit.md).",
+    )
     loras: list[LoraRef] = Field(
         default_factory=list, description="Applied to every image unless a preset says otherwise."
     )
@@ -165,6 +178,7 @@ class ImagePreset(_Strict):
     sigmas: list[float] | str | None = None
     guidance: float | None = None
     clip_skip: int | None = Field(default=None, ge=1)
+    img_cfg_scale: float | None = Field(default=None, ge=0)
 
 
 ImagePresets = dict[Annotated[str, Field(pattern=PRESET_PATTERN)], ImagePreset]
@@ -252,6 +266,12 @@ class SdCppLaunch(_Launch):
         description="--lora-apply-mode. auto (sd-server's default) applies at runtime when the "
         "model is quantized, else merges the LoRA into the weights.",
     )
+    swap_timeout_s: float = Field(
+        default=300,
+        gt=0,
+        description="With an edit card: how long switching between the model card and the "
+        "edit card may take to load before the image fails.",
+    )
 
 
 class LlamaCppBackendConfig(_HttpBackend):
@@ -279,6 +299,19 @@ class SdCppBackendConfig(_HttpBackend):
         max_length=64,
         description="The model card (GET /v1/models) this engine runs: its files, family, "
         "defaults and presets replace the ones set here.",
+    )
+    edit_card: str | None = Field(
+        default=None,
+        max_length=64,
+        description="A model card for edits (an edit model such as Qwen-Image-Edit). An edit "
+        "restarts the engine with it, and the next text-to-image request switches back. "
+        "Needs launch settings and concurrency 1.",
+    )
+    edit_view: "SdCppBackendConfig | None" = Field(
+        default=None,
+        exclude=True,
+        description="Internal: the engine's config as it runs the edit card (filled by the "
+        "model library, never configured).",
     )
     family: str | None = Field(
         default=None,
@@ -320,6 +353,27 @@ class SdCppBackendConfig(_HttpBackend):
         description="none | proj | tae | vae. Previews carry step progress; proj is cheapest.",
     )
     preview_interval: int = Field(default=1, ge=1)
+
+    @field_validator("edit_view", mode="before")
+    @classmethod
+    def _no_edit_view(cls, value: object) -> object:
+        if value is not None:
+            raise ValueError("edit_view is set by the model library: name edit_card instead")
+        return value
+
+    @model_validator(mode="after")
+    def _check_edit_card(self) -> "SdCppBackendConfig":
+        if self.edit_card is None:
+            return self
+        if self.launch is None:
+            raise ValueError(
+                "edit_card needs launch settings: switching cards restarts the engine here"
+            )
+        if self.concurrency != 1:
+            raise ValueError("edit_card needs concurrency 1: one card is loaded at a time")
+        if self.edit_card == self.model_card:
+            raise ValueError("edit_card is the model card already: leave it empty")
+        return self
 
 
 class DiffusersBackendConfig(_Strict):

@@ -30,7 +30,7 @@ from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path, PurePath
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Literal
 
 import sqlalchemy as sa
 from PIL import UnidentifiedImageError
@@ -51,7 +51,7 @@ from imaginer.core.logging import get_logger
 from imaginer.db.engine import Database
 from imaginer.db.models import Artifact, Conversation, GenerationJob, ImageModelRecord, JobOutput
 from imaginer.domain import models as dto
-from imaginer.domain.enums import JobStatus
+from imaginer.domain.enums import Capability, JobStatus
 from imaginer.domain.errors import ConflictError, InvalidRequestError, NotFoundError
 from imaginer.engines import launch
 from imaginer.hub.refs import RefError, parse_ref
@@ -183,6 +183,7 @@ class ModelLibrary:
         self._hub = hub
         self._artifacts = artifacts
         engines.on_card_settings = self._engine_settings
+        engines.card_name = self.card_name
         hub.on_model_install = self.install_component
         hub.model_config = self.card_config
         hub.model_components = self.component_list
@@ -194,6 +195,10 @@ class ModelLibrary:
 
     def card(self, card_id: str | None) -> Card | None:
         return self._cards.get(card_id) if card_id else None
+
+    def card_name(self, card_id: str | None) -> str | None:
+        card = self.card(card_id)
+        return card.name if card is not None else None
 
     def card_config(self, card_id: str) -> SdCppBackendConfig:
         """A card as an sd-server engine config (its family and files), for matching a Hub
@@ -221,12 +226,29 @@ class ModelLibrary:
     def effective(self, name: str, config: BackendConfig) -> BackendConfig:
         """An engine's config as it runs: for an sd-server with a model card, the card's
         files, family, defaults and presets over its own. A card that is gone leaves the
-        engine as it is configured."""
-        if not isinstance(config, SdCppBackendConfig) or not config.model_card:
+        engine as it is configured. With an edit card, ``edit_view`` is the same for the
+        edit card: what the engine runs while it edits."""
+        if not isinstance(config, SdCppBackendConfig):
             return config
-        card = self._cards.get(config.model_card)
+        view = self._overlay(name, config, config.model_card)
+        if config.edit_card:
+            if config.edit_card not in self._cards:
+                log.warning("models.edit_card_missing", engine=name, card=config.edit_card)
+            else:
+                own = config.model_copy(update={"model_card": config.edit_card, "edit_card": None})
+                edit = self._overlay(name, own, config.edit_card)
+                view = view.model_copy(update={"edit_view": edit})
+        return view
+
+    def _overlay(
+        self, name: str, config: SdCppBackendConfig, card_id: str | None
+    ) -> SdCppBackendConfig:
+        """``config`` with the card's files, family, defaults and presets over its own."""
+        if not card_id:
+            return config
+        card = self._cards.get(card_id)
         if card is None:
-            log.warning("models.card_missing", engine=name, card=config.model_card)
+            log.warning("models.card_missing", engine=name, card=card_id)
             return config
         update: dict[str, Any] = {
             "family": card.family,
@@ -259,17 +281,23 @@ class ModelLibrary:
 
     def prompt_hint(self, engine: str) -> str | None:
         """What the chat model should know to prompt the model an engine runs (tags for
-        SD 1.x/SDXL, JSON for Ideogram 4); None for natural language."""
+        SD 1.x/SDXL, JSON for Ideogram 4); None for natural language. With an edit card,
+        how to prompt that too, for edit_image."""
         if self._engines is None:
             return None
-        card = self.engine_card(engine)
-        if card is not None and card.prompt_hint:
-            return card.prompt_hint
+        hint = _card_hint(self.engine_card(engine))
         with contextlib.suppress(NotFoundError):
             config = self._engines.effective(engine)
-            family = recipes.family(getattr(config, "family", None))
-            return family.prompt_hint() if family is not None else None
-        return None
+            if hint is None:
+                family = recipes.family(getattr(config, "family", None))
+                hint = family.prompt_hint() if family is not None else None
+            edit_card = getattr(self._engines.own_config(engine), "edit_card", None)
+            if edit_card and getattr(config, "edit_view", None) is not None:
+                edit_hint = _card_hint(self.card(edit_card))
+                if edit_hint and edit_hint != hint:
+                    edit = f"For edit_image (it runs {self.card_name(edit_card)}): {edit_hint}"
+                    hint = f"{hint} {edit}" if hint else edit
+        return hint
 
     def _sdcpp_engines(self) -> list[tuple[str, SdCppBackendConfig]]:
         out = []
@@ -280,7 +308,8 @@ class ModelLibrary:
         return out
 
     def _users(self, card_id: str) -> list[str]:
-        return [n for n, c in self._sdcpp_engines() if c.model_card == card_id]
+        """The engines that run the card, for text-to-image or for edits."""
+        return [n for n, c in self._sdcpp_engines() if card_id in (c.model_card, c.edit_card)]
 
     def _refresh_engines(self, card_id: str) -> None:
         for name in self._users(card_id):
@@ -372,7 +401,7 @@ class ModelLibrary:
         items = [await asyncio.to_thread(self._item, c, checks[c.id], usage) for c in cards]
         used_families = {c.family for c in cards if c.family}
         families = [
-            dto.ModelFamilyBrief(id=f.id, name=f.name, group=f.group, hidden=f.hidden)
+            _family_brief(f)
             for f in recipes.catalog().families(hidden=True)
             if not f.hidden or f.id in used_families
         ]
@@ -399,8 +428,10 @@ class ModelLibrary:
             dto.ModelLibraryEngine(
                 name=name,
                 model_card=config.model_card,
+                edit_card=config.edit_card,
                 launchable=config.launch is not None,
                 running=self.engines.running(name),
+                loaded=self.engines.loaded_face(name),
             )
             for name, config in self._sdcpp_engines()
         ]
@@ -440,7 +471,7 @@ class ModelLibrary:
             prompt_hint=card.prompt_hint,
             family_prompt_hint=family.prompt_hint() if family is not None else None,
             family_note=family.note if family is not None else None,
-            capabilities=sorted(family.capabilities()) if family is not None else [],
+            capabilities=sorted(family.capabilities(card.components)) if family is not None else [],
             detected=[_guess_view(g) for g in guesses[:5]],
             recent_images=await self._recent_images(card.id),
         )
@@ -476,12 +507,22 @@ class ModelLibrary:
         filled = [c.key for c in checks]
         missing = family.missing(filled) if family is not None else ["a family"]
         problems = [f"{c.flag} {c.path}: {c.problem}" for c in checks if c.problem]
+        warnings: list[str] = []
         if family is not None:
             problems += [
                 f"{c.flag}: {family.name} has no {c.what} slot"
                 for c in checks
                 if c.key not in family.slot_ids
             ]
+            if family.needs_vision(card.components):
+                # A GGUF text encoder has no vision weights: without its projector the
+                # model can't see the images it is given.
+                if family.edit_only:
+                    missing.append("llm_vision")
+                else:
+                    warnings.append(
+                        "Its GGUF text encoder needs a vision projector (llm_vision) to edit"
+                    )
         use = usage.get(card.id, _Use())
         cover = card.cover
         return dto.ModelCardItem(
@@ -495,6 +536,7 @@ class ModelLibrary:
             ready=family is not None and not missing and not problems,
             missing=missing,
             problems=problems,
+            warnings=warnings,
             engines=self._uses(card.id),
             tags=list(card.tags),
             pinned=card.pinned,
@@ -518,18 +560,24 @@ class ModelLibrary:
     def _uses(self, card_id: str) -> list[dto.ModelEngineUse]:
         out = []
         for name, config in self._sdcpp_engines():
-            if config.model_card != card_id:
+            if card_id not in (config.model_card, config.edit_card):
                 continue
+            role: Literal["main", "edit"] = "main" if config.model_card == card_id else "edit"
             running = self.engines.running(name)
+            loaded = self.engines.loaded_face(name) if running else None
             stale = False
             if running and config.launch is not None:
-                now = self.engines.command(name)
-                stale = now is not None and now != self.engines.running_command(name)
+                # Running files that are neither card's as they are now: it swaps one for
+                # the other per task, so either is current.
+                switching = self.engines.loading(name) is not None
+                stale = not switching and self.engines.command(name) is not None and loaded is None
             out.append(
                 dto.ModelEngineUse(
                     engine=name,
+                    role=role,
                     launchable=config.launch is not None,
                     running=running,
+                    loaded=loaded == role,
                     needs_restart=stale,
                 )
             )
@@ -862,6 +910,8 @@ class ModelLibrary:
             raise InvalidRequestError(f"{body.engine} is not an sd-server engine")
         if engines.busy(body.engine):
             raise ConflictError(f"{body.engine} is making an image: try again when it's done")
+        if body.role == "edit":
+            return await self._use_for_edits(card, body.engine, config)
         launchable = config.launch is not None
         running = engines.running(body.engine)
         if launchable and (running or body.start):
@@ -871,11 +921,35 @@ class ModelLibrary:
                 raise InvalidRequestError(f"{card.name} isn't ready: {'; '.join(gaps)}")
         if running:
             await engines.stop(body.engine)
-        await engines.update(body.engine, dto.EngineUpdate(model_card=card_id))
+        # A card is one or the other: running it for everything ends its use for edits.
+        edit_card = "" if config.edit_card == card_id else None
+        await engines.update(body.engine, dto.EngineUpdate(model_card=card_id, edit_card=edit_card))
         if launchable and (running or body.start):
             await engines.start(body.engine)
         log.info("models.used", card=card_id, engine=body.engine, restarted=running)
         return await self.get(card_id)
+
+    async def _use_for_edits(
+        self, card: Card, engine: str, config: SdCppBackendConfig
+    ) -> dto.ModelCardDetail:
+        """Make the card the engine's edit card: an edit switches the engine to it, and the
+        next text-to-image request back. Nothing restarts now."""
+        family = recipes.family(card.family)
+        if family is None or Capability.EDIT not in family.capabilities():
+            raise InvalidRequestError(f"{card.name} can't edit: its family takes no images")
+        if config.launch is None:
+            raise InvalidRequestError(
+                f"{engine} isn't started here, so it can't switch to {card.name} for edits"
+            )
+        if config.model_card == card.id:
+            raise InvalidRequestError(f"{engine} runs {card.name} already, for edits too")
+        item = (await self.get(card.id)).model_dump()
+        if not item["ready"]:
+            gaps = [*item["missing"], *item["problems"]]
+            raise InvalidRequestError(f"{card.name} isn't ready: {'; '.join(gaps)}")
+        await self.engines.update(engine, dto.EngineUpdate(edit_card=card.id))
+        log.info("models.used_for_edits", card=card.id, engine=engine)
+        return await self.get(card.id)
 
     async def install_component(
         self, card_id: str, slot: str, path: Path, source: dict[str, Any]
@@ -1032,6 +1106,29 @@ def _family_view(family: recipes.Family) -> dto.ModelFamily:
         note=family.note,
         vae_format=family.vae_format,
         model_args=dict(family.model_args),
+    )
+
+
+def _card_hint(card: Card | None) -> str | None:
+    """A card's own prompting note, else its family's."""
+    if card is None:
+        return None
+    if card.prompt_hint:
+        return card.prompt_hint
+    family = recipes.family(card.family)
+    return family.prompt_hint() if family is not None else None
+
+
+def _family_brief(family: recipes.Family) -> dto.ModelFamilyBrief:
+    caps = family.capabilities()
+    return dto.ModelFamilyBrief(
+        id=family.id,
+        name=family.name,
+        group=family.group,
+        hidden=family.hidden,
+        slot_labels={s.id: s.label for s in family.slots},
+        edit=Capability.EDIT in caps,
+        edit_only=family.edit_only,
     )
 
 

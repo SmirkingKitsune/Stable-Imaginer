@@ -80,7 +80,7 @@ class SetPortraitTool(Tool):
         if agent is None:
             return ToolOutcome.error("no_agent", "only an agent has a portrait to set")
         options = ctx.image_options
-        preset = user_preset(options)
+        preset = user_preset(options, self._registry, "t2i")
         loras = user_loras(options)
         params = sampler_params(ctx)
         lease = await self._registry.image_backend(

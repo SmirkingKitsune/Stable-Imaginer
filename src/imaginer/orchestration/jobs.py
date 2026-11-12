@@ -274,6 +274,7 @@ class JobManager:
                     emit,
                     status=JobStatus.SUCCEEDED,
                     finished_at=utcnow(),
+                    model=spec.backend.model,  # an edit card swap loads another model
                     params_json={
                         "requested": spec.requested,
                         "n": spec.n,
@@ -325,6 +326,11 @@ class JobManager:
         async def on_submitted(engine_job_id: str) -> None:
             await self._update(job_id, None, engine_job_id=engine_job_id)
 
+        async def on_loading(model: str | None) -> None:
+            # An edit card swap: the engine loads another model before it can start.
+            progress = {"phase": "loading", "model": model} if model is not None else None
+            await self._update(job_id, emit, progress_json=progress)
+
         common: dict[str, Any] = {
             "prompt": spec.prompt,
             "seed": (spec.seed + index) % (SEED_MAX + 1),
@@ -338,6 +344,7 @@ class JobManager:
             "params": spec.params,
             "on_progress": on_progress,
             "on_submitted": on_submitted,
+            "on_loading": on_loading,
         }
         if spec.task is JobTask.EDIT:
             return EditRequest(images=spec.images, mask=spec.mask, **common)

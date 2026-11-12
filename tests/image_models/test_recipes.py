@@ -4,8 +4,19 @@ from imaginer.domain.enums import Capability
 from imaginer.image_models import recipes
 from imaginer.image_models.library import seed_defaults
 
+EDIT_FAMILIES = (
+    "flux1-kontext",
+    "qwen-image-edit",
+    "qwen-image-edit-2509",
+    "qwen-image-edit-2511",
+    "longcat-image-edit",
+    "boogu-image-edit",
+    "mage-flow-edit",
+    "fibo2-edit-turbo",
+)
 
-def test_every_image_recipe_is_a_family_and_edit_ones_are_hidden() -> None:
+
+def test_every_image_recipe_is_a_family_and_control_ones_are_hidden() -> None:
     catalog = recipes.catalog()
     shown = {f.id for f in catalog.families()}
     every = {f.id for f in catalog.families(hidden=True)}
@@ -15,8 +26,10 @@ def test_every_image_recipe_is_a_family_and_edit_ones_are_hidden() -> None:
         "flux1-dev",
         "qwen-image-21",
         "z-image-turbo",
+        *EDIT_FAMILIES,
     } <= shown
-    assert "qwen-image-edit-2511" in every - shown and "pid" in every - shown
+    hidden = every - shown
+    assert {"pid", "sdxl-controlnet", "krea2-raw-edit", "qwen-image-layered"} <= hidden
     assert not any(f.id.startswith(("wan2", "ltx")) for f in catalog.families(hidden=True))
     # Every family shown is grouped and placed for LoRAs.
     assert all(f.group and f.lora_group for f in catalog.families())
@@ -99,3 +112,51 @@ def test_an_engines_recipes_replace_the_snapshots() -> None:
     assert family is not None and family.origin == "engine" and family.group == "X"
     assert family.slot_ids == ("diffusion_model", "llm") and "ref_images" in family.features
     assert catalog.get("some-video") is None
+
+
+def test_edit_families_say_what_they_take() -> None:
+    kontext, qwen, edit_2511, longcat = (
+        recipes.family(i)
+        for i in ("flux1-kontext", "qwen-image-edit", "qwen-image-edit-2511", "longcat-image-edit")
+    )
+    assert kontext is not None and qwen is not None and edit_2511 is not None
+    assert longcat is not None
+    # Kontext makes images from text too, and edits one image at a time.
+    assert kontext.capabilities() == {Capability.T2I, Capability.LORA, Capability.EDIT}
+    assert kontext.group == "FLUX.1" and kontext.lora_group == "flux1-kontext"
+    # The Qwen edit models only edit; 2509 and 2511 take several images.
+    assert edit_2511.capabilities() == {Capability.EDIT, Capability.MULTI_REF, Capability.LORA}
+    assert qwen.capabilities() == {Capability.EDIT, Capability.LORA}
+    assert edit_2511.model_args == {"qwen_image_zero_cond_t": "true"}
+    assert "Picture 1" in (edit_2511.prompt_hint() or "")
+    # LongCat edit's doc passes a GGUF encoder's mmproj, which its recipe has no slot for.
+    assert longcat.slot("llm_vision") is not None and not longcat.slot("llm_vision").required  # type: ignore[union-attr]
+    llada = recipes.family("llada-image")
+    assert llada is not None and llada.size_multiple == 32 and llada.max_refs == 1
+
+
+def test_an_edit_needs_the_text_encoders_vision() -> None:
+    edit = recipes.family("qwen-image-edit-2511")
+    assert edit is not None
+    gguf = {"diffusion_model": "e.gguf", "llm": "Qwen2.5-VL-7B-Instruct.Q4_K_M.gguf"}
+    assert edit.needs_vision(gguf)
+    assert edit.capabilities(gguf) == {Capability.LORA}
+    assert not edit.needs_vision({**gguf, "llm_vision": "mmproj-f16.gguf"})
+    # A safetensors encoder carries its vision weights.
+    assert not edit.needs_vision({"llm": "qwen_2.5_vl_7b.safetensors"})
+    # Families that don't edit never need it.
+    flux = recipes.family("flux1-dev")
+    assert flux is not None and not flux.needs_vision({"llm": "x.gguf"})
+
+
+def test_loras_made_for_an_edit_model_fit_it_not_the_text_to_image_one() -> None:
+    from imaginer.loras.library import lora_group
+
+    assert lora_group("black-forest-labs/FLUX.1-Kontext-dev", None) == "flux1-kontext"
+    assert lora_group("black-forest-labs/FLUX.1-dev", None) == "flux1"
+    assert lora_group("Qwen/Qwen-Image-Edit-2509", None) == "qwen-image-edit"
+    assert lora_group("Qwen/Qwen-Image-2.1", None) == "qwen-image-21"
+    assert lora_group(None, "qwen_image_edit") == "qwen-image-edit"
+    # Every edit family's LoRA group is one a LoRA's base model can name.
+    groups = {f.lora_group for f in recipes.catalog().families()}
+    assert {"flux1-kontext", "qwen-image-edit", "mage-flow-edit", "fibo2-edit"} <= groups

@@ -4,13 +4,16 @@ Each run's output goes to a log file and to an in-memory tail, and is published 
 subscribers (the log stream in the UI). Processes are plain ``subprocess.Popen`` with
 reader threads, so this works on any asyncio loop on Windows and Linux. Stopping the
 server stops the engines it started.
+
+An engine is its whole process tree (see ``proctree``): stopping it, or its top process
+exiting, ends every process it started. An exit is noticed from the process itself, not
+from its output closing, so a child still holding the pipe can't hide it.
 """
 
 import asyncio
 import contextlib
 import re
 import subprocess
-import sys
 import threading
 from collections import deque
 from collections.abc import Callable
@@ -21,12 +24,14 @@ from typing import Literal
 
 from imaginer.core.clock import utcnow
 from imaginer.core.logging import get_logger
+from imaginer.engines.proctree import ProcessTree
 
 log = get_logger(__name__)
 
 State = Literal["stopped", "starting", "running", "stopping", "exited"]
 TAIL_LINES = 2000
 STOP_GRACE_S = 10.0
+DRAIN_S = 2.0  # once the engine has exited, how long its last output may take to arrive
 ERROR_RE = re.compile(r"\b(error|failed|fatal|exception|abort(ed)?|panic)\b", re.IGNORECASE)
 
 
@@ -64,7 +69,7 @@ class EngineProcess:
         self.name = name
         self.state: State = "stopped"
         self.run: Run | None = None
-        self._proc: subprocess.Popen[str] | None = None
+        self._tree: ProcessTree | None = None
         self._spawning: asyncio.Future[None] | None = None
         self._listeners: set[Listener] = set()
         self._exited = asyncio.Event()
@@ -110,23 +115,17 @@ class EngineProcess:
         """A start whose caller gave up: kill the process it made, if it made one."""
         if spawn.cancelled() or spawn.exception() is not None:
             return
-        if self._proc is None or self.run is None:  # it already exited
+        if self._tree is None or self.run is None:  # it already exited
             return
         self.run.stopped_by_us = True
         self._set_state("stopping")
-        with contextlib.suppress(OSError):
-            self._proc.kill()
+        self._tree.kill()
 
     async def _spawn(self, run: Run) -> None:
         loop = asyncio.get_running_loop()
-        # A statement, not a conditional expression: mypy only narrows platform checks here.
-        if sys.platform == "win32":
-            flags = subprocess.CREATE_NEW_PROCESS_GROUP
-        else:
-            flags = 0
         try:
-            proc = await asyncio.to_thread(
-                subprocess.Popen,
+            tree = await asyncio.to_thread(
+                ProcessTree.spawn,
                 run.argv,
                 stdin=subprocess.DEVNULL,
                 stdout=subprocess.PIPE,
@@ -135,7 +134,6 @@ class EngineProcess:
                 encoding="utf-8",
                 errors="replace",
                 bufsize=1,
-                creationflags=flags,
             )
         except OSError as exc:
             self._line(f"could not start: {exc}", error=True)
@@ -144,24 +142,46 @@ class EngineProcess:
             self._set_state("exited")
             self._exited.set()
             raise
-        self._proc = proc
+        proc = tree.proc
+        self._tree = tree
         run.pid = proc.pid
         self._line(f"$ {' '.join(run.argv)}", error=False)
         self._set_state("running")
         log.info("engine.started", engine=self.name, pid=proc.pid)
+        given_up = threading.Event()
 
         def pump() -> None:
+            """Copy output to the log and the tail until the pipe closes, or until the run
+            is given up on because something outside the tree kept the pipe open."""
+            assert proc.stdout is not None
             with run.log_path.open("a", encoding="utf-8") as sink:
-                assert proc.stdout is not None
                 for raw in proc.stdout:
-                    text = raw.rstrip("\r\n")
+                    if given_up.is_set():
+                        break
                     sink.write(raw if raw.endswith("\n") else raw + "\n")
                     sink.flush()
-                    loop.call_soon_threadsafe(self._line, text, None)
-            code = proc.wait()
-            loop.call_soon_threadsafe(self._on_exit, run, code)
+                    with contextlib.suppress(RuntimeError):  # the loop has closed
+                        loop.call_soon_threadsafe(self._output, run, raw.rstrip("\r\n"))
+            with contextlib.suppress(OSError):
+                proc.stdout.close()
 
-        threading.Thread(target=pump, name=f"engine-{self.name}", daemon=True).start()
+        def watch() -> None:
+            """The exit comes from the process, not from its output ending: a child that
+            inherited the pipe would keep that open."""
+            code = proc.wait()
+            tree.close()  # what the engine started goes with it, which closes the pipe
+            reader.join(DRAIN_S)
+            given_up.set()
+            with contextlib.suppress(RuntimeError):
+                loop.call_soon_threadsafe(self._on_exit, run, code)
+
+        reader = threading.Thread(target=pump, name=f"engine-{self.name}-log", daemon=True)
+        reader.start()
+        threading.Thread(target=watch, name=f"engine-{self.name}", daemon=True).start()
+
+    def _output(self, run: Run, text: str) -> None:
+        if run is self.run:  # not a line from an earlier run arriving late
+            self._line(text, None)
 
     def _line(self, text: str, error: bool | None) -> None:
         if self.run is None:
@@ -174,7 +194,7 @@ class EngineProcess:
         run.exit_code = code
         run.exited_at = utcnow()
         if run is self.run:
-            self._proc = None
+            self._tree = None
             self._set_state("exited" if not run.stopped_by_us else "stopped")
             self._exited.set()
         log.info("engine.exited", engine=self.name, code=code, stopped=run.stopped_by_us)
@@ -185,17 +205,17 @@ class EngineProcess:
             # Still being created: there is no handle to stop it with until it exists.
             with contextlib.suppress(OSError):
                 await asyncio.shield(spawning)
-        proc = self._proc
-        if proc is None or self.run is None:
+        tree = self._tree
+        if tree is None or self.run is None:
             return
         self.run.stopped_by_us = True
         self._set_state("stopping")
-        await asyncio.to_thread(proc.terminate)
+        await asyncio.to_thread(tree.terminate)
         try:
             await asyncio.wait_for(self._exited.wait(), STOP_GRACE_S)
         except TimeoutError:
-            with contextlib.suppress(OSError):
-                await asyncio.to_thread(proc.kill)
+            await asyncio.to_thread(tree.kill)
+            # Not open-ended: the exit is seen from the process, then output gets DRAIN_S.
             await self._exited.wait()
 
 

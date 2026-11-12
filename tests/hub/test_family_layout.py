@@ -3,7 +3,7 @@ Qwen-Image-2.1: checkpoints, CLIP-L/CLIP-G/T5 text encoders, FLUX's and Z-Image'
 
 import pytest
 
-from imaginer.hub.layout import RepoLayout, classify, roles_for, suggest
+from imaginer.hub.layout import RepoFile, RepoLayout, classify, roles_for, suggest
 from tests.hub.conftest import listing
 
 
@@ -99,3 +99,22 @@ def test_tokenizers_are_files_to_load_too() -> None:
     assert [v.id for v in tokenizers] == ["tokenizer_2/tokenizer.json"]
     assert roles_for("sdcpp", layout)["tokenizer"] == tokenizers
     assert roles_for("llamacpp", layout)["model"] == []
+
+
+def test_a_quantizers_untagged_gguf_of_a_chat_model_is_a_text_encoder() -> None:
+    """mradermacher's GGUF repos carry no task tag; an Instruct/VL model in one is an LLM
+    text encoder (Qwen Image's and its edit models' Qwen2.5-VL), not an image model."""
+    files = [
+        RepoFile("Qwen2.5-VL-7B-Instruct.Q8_0.gguf", 8098524160, None),
+        RepoFile("Qwen2.5-VL-7B-Instruct.mmproj-f16.gguf", 1354162912, None),
+    ]
+    layout = classify(files, repo_id="mradermacher/Qwen2.5-VL-7B-Instruct-GGUF", pipeline_tag=None)
+    roles = roles_for("sdcpp", layout)
+    assert [v.id for v in roles["llm"]] == ["Qwen2.5-VL-7B-Instruct.Q8_0.gguf"]
+    assert [v.id for v in roles["llm_vision"]] == ["Qwen2.5-VL-7B-Instruct.mmproj-f16.gguf"]
+    kontext = classify(
+        [RepoFile("flux1-kontext-dev-Q8_0.gguf", 12714452256, None)],
+        repo_id="QuantStack/FLUX.1-Kontext-dev-GGUF",
+        pipeline_tag=None,
+    )
+    assert roles_for("sdcpp", kontext)["llm"] == []  # an image model's GGUF stays one

@@ -378,7 +378,7 @@ export function enginesScreen({ name: wanted = null, navigate }) {
     }, h('option', { value: '' }, card ? 'Switch to…' : cards.length ? 'Pick a model card…' : 'No model cards yet'),
     cards.filter((c) => c.id !== e.model_card).map((c) => h('option', { value: c.id, disabled: e.launchable && !c.ready },
       `${c.name}${c.family_name ? ` · ${c.family_name}` : ''}${c.ready ? '' : ' (not ready)'}`)));
-    const use = card?.engines.find((u) => u.engine === e.name);
+    const use = card?.engines.find((u) => u.engine === e.name && u.role === 'main');
     const restart = use?.needs_restart && h('button.mini', {
       type: 'button', onclick: () => act(async () => { await api.stopEngine(e.name); return api.startEngine(e.name); }, 'Restarting'),
     }, icon('play', 12), 'Restart to load its files');
@@ -394,7 +394,47 @@ export function enginesScreen({ name: wanted = null, navigate }) {
       restart,
       h('span.tray-hint.wrap', card
         ? `Its files, defaults and presets are the card's.${e.launchable ? ` Switching restarts ${EXE.sdcpp}.` : ' It says what this engine runs: switch models where it runs.'}`
-        : 'Without a card, the files below are used as they are set.'));
+        : 'Without a card, the files below are used as they are set.'),
+      e.launchable && editCardRow(e, cards, lib));
+  }
+
+  /** The card the engine switches to for edits (an edit model): an edit restarts it with
+   *  that card, and the next text-to-image request switches back. */
+  function editCardRow(e, cards, lib) {
+    const edits = new Set((lib?.families ?? []).filter((f) => f.edit).map((f) => f.id));
+    const choices = cards.filter((c) => c.id !== e.model_card && edits.has(c.family));
+    const current = cards.find((c) => c.id === e.edit_card);
+    const pick = h('select.seed-input', {
+      'aria-label': 'Edit card',
+      onchange: async () => {
+        const id = pick.value;
+        if (id === (e.edit_card ?? '')) return;
+        const chosen = cards.find((c) => c.id === id);
+        try {
+          if (id) await api.useModel(id, { engine: e.name, role: 'edit' });
+          else await api.updateEngine(e.name, { edit_card: '' });
+          toast(id ? `${e.name} edits with ${chosen?.name ?? id}` : `${e.name} edits with its model card`);
+          loadModels();
+          loadBackends();
+          refresh();
+        } catch (err) {
+          toast(err.message, { error: true });
+          pick.value = e.edit_card ?? '';
+        }
+      },
+    }, h('option', { value: '' }, 'Its model card'),
+    choices.map((c) => h('option', { value: c.id, selected: c.id === e.edit_card, disabled: !c.ready },
+      `${c.name}${c.family_name ? ` · ${c.family_name}` : ''}${c.ready ? '' : ' (not ready)'}`)));
+    const state = e.loading ? `loading ${e.loading}…`
+      : e.loaded === 'edit' ? `${current?.name ?? 'the edit card'} is loaded`
+        : e.loaded === 'main' ? 'its model card is loaded' : null;
+    return h('div.edit-card',
+      h('div.cell-head', h('span.eyebrow', 'Edits with'), h('span.spacer'), state && h('span.mono-meta.accent', state)),
+      h('label.seed-field', icon('pencil', 13), pick),
+      h('span.tray-hint.wrap', e.edit_card
+        ? `An edit restarts ${EXE.sdcpp} with ${current?.name ?? 'it'}; the next new image switches back. Each switch loads a model.`
+        : choices.length ? 'Pick an edit model (Kontext, Qwen Image Edit…) to switch to for edits.'
+          : 'Import an edit model (Kontext, Qwen Image Edit…) to edit with it here.'));
   }
 
   async function saveCard(e, patch) {

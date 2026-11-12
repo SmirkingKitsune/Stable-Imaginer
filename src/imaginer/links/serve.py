@@ -122,7 +122,11 @@ class PeerEngines:
             status=info.status,
             detail=info.detail,
             capabilities=capabilities,
-            max_ref_images=getattr(config, "max_ref_images", None),
+            max_ref_images=(
+                sdcpp.ref_limit(config)
+                if isinstance(config, SdCppBackendConfig)
+                else getattr(config, "max_ref_images", None)
+            ),
             image_defaults=info.image_defaults,
             image_presets=info.image_presets,
             available_loras=loras,
@@ -157,6 +161,8 @@ class PeerEngines:
         health = await self._registry.probe(name)
         if health is not None and health.status is BackendStatus.OK:
             return
+        if self._engines.loading(name) is not None:
+            return  # switching to its edit card or back: the work waits at its gate
         loading = health is not None and health.status is BackendStatus.DEGRADED
         if not loading:
             config = self._settings.backends[name]

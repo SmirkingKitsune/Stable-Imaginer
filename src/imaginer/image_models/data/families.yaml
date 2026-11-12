@@ -15,31 +15,33 @@
 #   rgba         prompt template for transparent output ({prompt}); without one the family
 #                makes no RGBA images
 #   mask         how an edit's mask is explained in the prompt; without one it takes none
+#   edit_only    an edit model: it needs reference images, so it makes no text-to-image
+#   max_refs     the most reference images it handles well (1: it edits one image); none
+#                given, as many as the engine allows
+#   vision       its edits need the text encoder's vision weights: with a GGUF text encoder
+#                and no vision projector (llm_vision) it can't edit
+#   add_slots    slots its sd.cpp doc passes that the recipe leaves out ({id, label})
+#   size_multiple  what its sizes snap to, over the recipe's
 #   names        regexes on a file's name that point at the family (case-insensitive)
 #   repos        Hub repos (or "owner/" prefixes) that point at it
 #   gguf         GGUF general.architecture values that point at it
 #   sources      per slot, Hub references to get that component from, best first: a repo,
 #                a folder or file in it (owner/name/path), or owner/name:QUANT
 #
-# Families listed under hidden are edit, control and decoder recipes: out of the library's
-# scope, though an engine configured by hand may still name one.
+# Families listed under hidden are control, inpainting, decoder and community-edit recipes:
+# out of the library's scope, though an engine configured by hand may still name one.
 
 hidden:
   - anima-edit
-  - boogu-image-edit
   - cosxl-edit
-  - fibo2-edit-turbo
   - flex2
   - flux1-canny
   - flux1-depth
   - flux1-fill
-  - flux1-kontext
   - flux1-pulid
   - instruct-pix2pix
   - krea2-raw-edit
   - krea2-turbo-edit
-  - longcat-image-edit
-  - mage-flow-edit
   - pid
   - pid-15
   - pid-15-flux2
@@ -48,9 +50,6 @@ hidden:
   - pid-flux2
   - pid-qwen-image
   - pid-sd3
-  - qwen-image-edit
-  - qwen-image-edit-2509
-  - qwen-image-edit-2511
   - qwen-image-layered
   - sd1-controlnet
   - sd1-inpainting
@@ -199,6 +198,24 @@ families:
               comfyanonymous/flux_text_encoders/t5xxl_fp8_e4m3fn.safetensors]
       vae: [black-forest-labs/FLUX.1-schnell/ae.safetensors,
             Comfy-Org/z_image_turbo/split_files/vae/ae.safetensors]
+  flux1-kontext:
+    group: FLUX.1
+    lora_group: flux1-kontext
+    names: ['kontext']
+    repos: [black-forest-labs/FLUX.1-Kontext-dev, QuantStack/FLUX.1-Kontext-dev-GGUF]
+    gguf: [flux]
+    max_refs: 1
+    hint: >-
+      To edit, write one instruction ("make the car red", "change the sign to say 'OPEN'") and
+      say what must stay the same ("keep the face, pose and framing"). It edits one image.
+    sources:
+      diffusion_model: [QuantStack/FLUX.1-Kontext-dev-GGUF,
+                        black-forest-labs/FLUX.1-Kontext-dev/flux1-kontext-dev.safetensors]
+      clip_l: [comfyanonymous/flux_text_encoders/clip_l.safetensors]
+      t5xxl: [comfyanonymous/flux_text_encoders/t5xxl_fp16.safetensors,
+              comfyanonymous/flux_text_encoders/t5xxl_fp8_e4m3fn.safetensors]
+      vae: [black-forest-labs/FLUX.1-schnell/ae.safetensors,
+            Comfy-Org/z_image_turbo/split_files/vae/ae.safetensors]
   flux2-dev:
     group: FLUX.2
     lora_group: flux2-dev
@@ -338,6 +355,72 @@ families:
       llm_vision: [Qwen/Qwen3-VL-8B-Instruct-GGUF/mmproj-Qwen3VL-8B-Instruct-F16.gguf]
       vae: [Comfy-Org/Qwen-Image-2.1/vae/qwen_image_2.1_vae_bf16.safetensors]
 
+  qwen-image-edit:
+    group: Qwen Image
+    lora_group: qwen-image-edit
+    names: ['qwen[-_]?image[-_]?edit(?![-_]?(25\d\d|plus))']
+    repos: [Qwen/Qwen-Image-Edit, QuantStack/Qwen-Image-Edit-GGUF,
+            Comfy-Org/Qwen-Image-Edit_ComfyUI]
+    gguf: [qwen_image]
+    edit_only: true
+    max_refs: 1
+    vision: true
+    hint: >-
+      Write the edit as an instruction ("replace the background with a beach") and say what
+      to keep. Put any text it should write in quotation marks. It edits one image.
+    sources:
+      diffusion_model: [Comfy-Org/Qwen-Image-Edit_ComfyUI/split_files/diffusion_models/qwen_image_edit_fp8_e4m3fn.safetensors,
+                        Comfy-Org/Qwen-Image-Edit_ComfyUI/split_files/diffusion_models/qwen_image_edit_bf16.safetensors,
+                        QuantStack/Qwen-Image-Edit-GGUF]
+      llm: [Comfy-Org/Qwen-Image_ComfyUI/split_files/text_encoders/qwen_2.5_vl_7b.safetensors,
+            'mradermacher/Qwen2.5-VL-7B-Instruct-GGUF:Q4_K_M']
+      llm_vision: [mradermacher/Qwen2.5-VL-7B-Instruct-GGUF/Qwen2.5-VL-7B-Instruct.mmproj-f16.gguf]
+      vae: [Comfy-Org/Qwen-Image_ComfyUI/split_files/vae/qwen_image_vae.safetensors]
+  qwen-image-edit-2509:
+    group: Qwen Image
+    lora_group: qwen-image-edit
+    names: ['qwen[-_]?image[-_]?edit[-_]?2509', 'qwen[-_]?image[-_]?edit[-_]?plus']
+    repos: [Qwen/Qwen-Image-Edit-2509, QuantStack/Qwen-Image-Edit-2509-GGUF, Comfy-Org/Qwen-Image-Edit_ComfyUI]
+    gguf: [qwen_image]
+    edit_only: true
+    max_refs: 3
+    vision: true
+    hint: >-
+      Write the edit as an instruction and say what to keep. With several images, call them
+      Picture 1, Picture 2 and so on, in the order given ("put the cat from Picture 2 on the
+      sofa in Picture 1"). Put any text it should write in quotation marks.
+    sources:
+      diffusion_model: [Comfy-Org/Qwen-Image-Edit_ComfyUI/split_files/diffusion_models/qwen_image_edit_2509_fp8mixed.safetensors,
+                        Comfy-Org/Qwen-Image-Edit_ComfyUI/split_files/diffusion_models/qwen_image_edit_2509_int8_convrot.safetensors,
+                        Comfy-Org/Qwen-Image-Edit_ComfyUI/split_files/diffusion_models/qwen_image_edit_2509_bf16.safetensors,
+                        QuantStack/Qwen-Image-Edit-2509-GGUF]
+      llm: [Comfy-Org/Qwen-Image_ComfyUI/split_files/text_encoders/qwen_2.5_vl_7b.safetensors,
+            'mradermacher/Qwen2.5-VL-7B-Instruct-GGUF:Q4_K_M']
+      llm_vision: [mradermacher/Qwen2.5-VL-7B-Instruct-GGUF/Qwen2.5-VL-7B-Instruct.mmproj-f16.gguf]
+      vae: [Comfy-Org/Qwen-Image_ComfyUI/split_files/vae/qwen_image_vae.safetensors]
+  qwen-image-edit-2511:
+    group: Qwen Image
+    lora_group: qwen-image-edit
+    names: ['qwen[-_]?image[-_]?edit[-_]?2511']
+    repos: [Qwen/Qwen-Image-Edit-2511, unsloth/Qwen-Image-Edit-2511-GGUF, Comfy-Org/Qwen-Image-Edit_ComfyUI]
+    gguf: [qwen_image]
+    edit_only: true
+    max_refs: 3
+    vision: true
+    hint: >-
+      Write the edit as an instruction and say what to keep. With several images, call them
+      Picture 1, Picture 2 and so on, in the order given ("put the cat from Picture 2 on the
+      sofa in Picture 1"). Put any text it should write in quotation marks.
+    sources:
+      diffusion_model: [Comfy-Org/Qwen-Image-Edit_ComfyUI/split_files/diffusion_models/qwen_image_edit_2511_fp8mixed.safetensors,
+                        Comfy-Org/Qwen-Image-Edit_ComfyUI/split_files/diffusion_models/qwen_image_edit_2511_int8_convrot.safetensors,
+                        Comfy-Org/Qwen-Image-Edit_ComfyUI/split_files/diffusion_models/qwen_image_edit_2511_bf16.safetensors,
+                        unsloth/Qwen-Image-Edit-2511-GGUF]
+      llm: [Comfy-Org/Qwen-Image_ComfyUI/split_files/text_encoders/qwen_2.5_vl_7b.safetensors,
+            'mradermacher/Qwen2.5-VL-7B-Instruct-GGUF:Q4_K_M']
+      llm_vision: [mradermacher/Qwen2.5-VL-7B-Instruct-GGUF/Qwen2.5-VL-7B-Instruct.mmproj-f16.gguf]
+      vae: [Comfy-Org/Qwen-Image_ComfyUI/split_files/vae/qwen_image_vae.safetensors]
+
   # --- Z-Image -----------------------------------------------------------------------------
   z-image-turbo:
     group: Z-Image
@@ -385,10 +468,26 @@ families:
     group: Boogu Image
     lora_group: boogu-image
     names: ['boogu(?!.*edit)']
-    repos: [Comfy-Org/Boogu-Image]
+    repos: [Boogu/Boogu-Image-0.1-Base, Comfy-Org/Boogu-Image]
     sources:
       diffusion_model: [Comfy-Org/Boogu-Image]
       llm: ['unsloth/Qwen3-VL-8B-Instruct-GGUF:Q4_K_M']
+      vae: [Comfy-Org/z_image_turbo/split_files/vae/ae.safetensors]
+  boogu-image-edit:
+    group: Boogu Image
+    lora_group: boogu-image-edit
+    names: ['boogu.*edit']
+    repos: [Boogu/Boogu-Image-0.1-Edit, Boogu/Boogu-Image-0.1-Edit-Turbo, Comfy-Org/Boogu-Image]
+    edit_only: true
+    vision: true
+    hint: Write the edit as an instruction and say what to keep.
+    note: The Edit Turbo files are step-distilled; give their card fewer steps and CFG 1.
+    sources:
+      diffusion_model: [Comfy-Org/Boogu-Image/diffusion_models/boogu_image_edit_int8_convrot.safetensors,
+                        Comfy-Org/Boogu-Image/diffusion_models/boogu_image_edit_bf16.safetensors,
+                        Comfy-Org/Boogu-Image/diffusion_models/boogu_image_edit_fp8_scaled.safetensors]
+      llm: ['unsloth/Qwen3-VL-8B-Instruct-GGUF:Q4_K_M']
+      llm_vision: [unsloth/Qwen3-VL-8B-Instruct-GGUF/mmproj-F16.gguf]
       vae: [Comfy-Org/z_image_turbo/split_files/vae/ae.safetensors]
   ernie-image:
     group: ERNIE-Image
@@ -413,12 +512,34 @@ families:
     lora_group: fibo2
     names: ['fibo(?!.*edit)']
     repos: [briaai/Fibo-2.0-dev, Comfy-Org/Fibo-2.0]
-    hint: Plain prompts and structured JSON captions both work.
+    vision: true
+    hint: >-
+      Plain prompts and structured JSON captions both work. To edit, refer to the images as
+      <image_1>, <image_2> and so on, in the order given.
     sources:
-      diffusion_model: [Comfy-Org/Fibo-2.0]
-      llm: ['Qwen/Qwen3-VL-4B-Instruct-GGUF:Q4_K_M', Comfy-Org/Fibo-2.0]
-      llm_vision: [Qwen/Qwen3-VL-4B-Instruct-GGUF]
-      vae: [Comfy-Org/flux2-klein-4B/split_files/vae/flux2-vae.safetensors]
+      diffusion_model: [Comfy-Org/Fibo-2.0/diffusion_models/fibo2_dev_int8_convrot.safetensors,
+                        Comfy-Org/Fibo-2.0/diffusion_models/fibo2_dev_bf16.safetensors]
+      llm: ['Qwen/Qwen3-VL-4B-Instruct-GGUF:Q4_K_M', Comfy-Org/Fibo-2.0/text_encoders]
+      llm_vision: [Qwen/Qwen3-VL-4B-Instruct-GGUF/mmproj-Qwen3VL-4B-Instruct-F16.gguf]
+      vae: [Comfy-Org/Fibo-2.0/vae/flux2-vae.safetensors,
+            Comfy-Org/flux2-klein-4B/split_files/vae/flux2-vae.safetensors]
+  fibo2-edit-turbo:
+    group: Fibo
+    lora_group: fibo2-edit
+    names: ['fibo.*edit']
+    repos: [briaai/Fibo-2.0-edit-turbo, Comfy-Org/Fibo-2.0]
+    edit_only: true
+    vision: true
+    hint: >-
+      Write the edit as an instruction and say what to keep. With several images, refer to
+      them as <image_1>, <image_2> and so on, in the order given.
+    sources:
+      diffusion_model: [Comfy-Org/Fibo-2.0/diffusion_models/fibo2_edit_turbo_int8_convrot.safetensors,
+                        Comfy-Org/Fibo-2.0/diffusion_models/fibo2_edit_turbo_bf16.safetensors]
+      llm: ['Qwen/Qwen3-VL-4B-Instruct-GGUF:Q4_K_M', Comfy-Org/Fibo-2.0/text_encoders]
+      llm_vision: [Qwen/Qwen3-VL-4B-Instruct-GGUF/mmproj-Qwen3VL-4B-Instruct-F16.gguf]
+      vae: [Comfy-Org/Fibo-2.0/vae/flux2-vae.safetensors,
+            Comfy-Org/flux2-klein-4B/split_files/vae/flux2-vae.safetensors]
   hidream-o1-dev:
     group: HiDream
     lora_group: hidream-o1
@@ -488,11 +609,17 @@ families:
     lora_group: llada-image
     names: ['llada[-_]?image(?!.*turbo)']
     repos: [inclusionAI/LLaDA-Image, fszontagh/LLaDA-Image-GGUF]
-    note: Use the text encoder and connectors made for this model; the Turbo ones don't fit.
+    size_multiple: 32  # its edits need multiples of 32
+    max_refs: 1
+    note: >-
+      Use the text encoder and connectors made for this model; the Turbo ones don't fit. To
+      edit, use the connectors-edit file (it adds the SigVQ encoder) and keep edits at
+      1024x1024: at 512 it returns the image almost unchanged.
     sources:
       diffusion_model: [fszontagh/LLaDA-Image-GGUF]
       llm: [fszontagh/LLaDA-Image-GGUF]
-      embeddings_connectors: [fszontagh/LLaDA-Image-GGUF]
+      embeddings_connectors: [fszontagh/LLaDA-Image-GGUF/llada-image-connectors-edit.safetensors,
+                              fszontagh/LLaDA-Image-GGUF/llada-image-connectors.safetensors]
       tokenizer: [inclusionAI/LLaDA-Image]
       vae: [inclusionAI/LLaDA-Image/vae]
   llada-image-turbo:
@@ -500,11 +627,16 @@ families:
     lora_group: llada-image
     names: ['llada[-_]?image.*turbo']
     repos: [inclusionAI/LLaDA-Image-Turbo, fszontagh/LLaDA-Image-Turbo-GGUF]
-    note: Use the text encoder and connectors made for this model; the Base ones don't fit.
+    size_multiple: 32  # its edits need multiples of 32
+    max_refs: 1
+    note: >-
+      Use the text encoder and connectors made for this model; the Base ones don't fit. To
+      edit, use the connectors-edit file (it adds the SigVQ encoder).
     sources:
       diffusion_model: [fszontagh/LLaDA-Image-Turbo-GGUF]
       llm: [fszontagh/LLaDA-Image-Turbo-GGUF]
-      embeddings_connectors: [fszontagh/LLaDA-Image-Turbo-GGUF]
+      embeddings_connectors: [fszontagh/LLaDA-Image-Turbo-GGUF/llada-image-turbo-connectors-edit.safetensors,
+                              fszontagh/LLaDA-Image-Turbo-GGUF/llada-image-turbo-connectors.safetensors]
       tokenizer: [inclusionAI/LLaDA-Image-Turbo]
       vae: [inclusionAI/LLaDA-Image-Turbo/vae]
   longcat-image:
@@ -519,11 +651,32 @@ families:
       llm: [Comfy-Org/Qwen-Image_ComfyUI/split_files/text_encoders/qwen_2.5_vl_7b.safetensors,
             'mradermacher/Qwen2.5-VL-7B-Instruct-GGUF:Q4_K_M']
       vae: [Comfy-Org/z_image_turbo/split_files/vae/ae.safetensors]
+  longcat-image-edit:
+    group: LongCat-Image
+    lora_group: longcat-image-edit
+    names: ['longcat.*edit']
+    repos: [meituan-longcat/LongCat-Image-Edit, meituan-longcat/LongCat-Image-Edit-Turbo,
+            vantagewithai/LongCat-Image-Edit-GGUF, Comfy-Org/LongCat-Image]
+    edit_only: true
+    max_refs: 1
+    vision: true
+    add_slots:
+      - {id: llm_vision, label: Vision projector (required for separate GGUF text encoders)}
+    hint: >-
+      Write the edit as an instruction and say what to keep. Put any text the image should
+      show in quotation marks. It edits one image.
+    sources:
+      diffusion_model: [Comfy-Org/LongCat-Image/split_files/diffusion_models/longcat_image_edit_bf16.safetensors,
+                        vantagewithai/LongCat-Image-Edit-GGUF]
+      llm: [Comfy-Org/Qwen-Image_ComfyUI/split_files/text_encoders/qwen_2.5_vl_7b.safetensors,
+            'mradermacher/Qwen2.5-VL-7B-Instruct-GGUF:Q4_K_M']
+      llm_vision: [mradermacher/Qwen2.5-VL-7B-Instruct-GGUF/Qwen2.5-VL-7B-Instruct.mmproj-f16.gguf]
+      vae: [Comfy-Org/z_image_turbo/split_files/vae/ae.safetensors]
   mage-flow:
     group: Mage-Flow
     lora_group: mage-flow
     names: ['mage[-_]?flow(?!.*(turbo|edit))']
-    repos: [Comfy-Org/Mage-Flow]
+    repos: [microsoft/Mage-Flow, Comfy-Org/Mage-Flow]
     sources:
       diffusion_model: [Comfy-Org/Mage-Flow]
       llm: ['Qwen/Qwen3-VL-4B-Instruct-GGUF:Q4_K_M', Comfy-Org/Krea-2]
@@ -531,11 +684,29 @@ families:
   mage-flow-turbo:
     group: Mage-Flow
     lora_group: mage-flow
-    names: ['mage[-_]?flow.*turbo']
+    names: ['mage[-_]?flow(?!.*edit).*turbo']
+    repos: [microsoft/Mage-Flow-Turbo, Comfy-Org/Mage-Flow]
     sources:
       diffusion_model: [Comfy-Org/Mage-Flow]
       llm: ['Qwen/Qwen3-VL-4B-Instruct-GGUF:Q4_K_M', Comfy-Org/Krea-2]
       vae: [Comfy-Org/Mage-Flow]
+  mage-flow-edit:
+    group: Mage-Flow
+    lora_group: mage-flow-edit
+    names: ['mage[-_]?flow.*edit']
+    repos: [Comfy-Org/Mage-Flow]
+    edit_only: true
+    vision: true
+    hint: >-
+      Write the edit as an instruction and say what to keep. With several images, call them
+      Image 1, Image 2 and so on, in the order given.
+    note: The Edit Turbo file takes 4 steps at CFG 1.
+    sources:
+      diffusion_model: [Comfy-Org/Mage-Flow/diffusion_models/mage_flow_edit_int8_convrot.safetensors,
+                        Comfy-Org/Mage-Flow/diffusion_models/mage_flow_edit_bf16.safetensors]
+      llm: ['Qwen/Qwen3-VL-4B-Instruct-GGUF:Q4_K_M', Comfy-Org/Mage-Flow/text_encoders]
+      llm_vision: [Qwen/Qwen3-VL-4B-Instruct-GGUF/mmproj-Qwen3VL-4B-Instruct-F16.gguf]
+      vae: [Comfy-Org/Mage-Flow/vae/mage_flow_vae_bf16.safetensors]
   ming-image:
     group: Ming-Image
     lora_group: ming-image

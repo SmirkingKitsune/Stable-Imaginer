@@ -1,0 +1,37 @@
+# Checking an edit card with fakes: a fake sd-server launched here (tests/fakes/sd_server.py),
+# which switches between a model card and an edit card the way a real one does. No GPU needed.
+#
+#   uv run python -m tests.fakes                      # the fake chat engine (port 18080)
+#   uv run imaginer serve --profile dev-swap          # port 8702; starts the fake sd-server
+#   uv run python -m tests.fakes.seed_swap            # stub model files and two cards
+#
+# Windows: the fake is started through tests/fakes/sd-server.cmd.
+
+data_root: ./.data/dev-swap
+
+server:
+  host: 127.0.0.1
+  port: 8702
+
+logging:
+  level: INFO
+  format: console
+
+backends:
+  llama:
+    type: llamacpp
+    base_url: http://127.0.0.1:18080
+  sdcpp:
+    type: sdcpp
+    base_url: http://127.0.0.1:11240
+    concurrency: 1
+    poll_interval_s: 0.1
+    declared_capabilities: [t2i, edit, multi_ref, rgba, lora]
+    launch:
+      executable: tests/fakes/sd-server.cmd
+      extra_args: [--load-delay, "3"]
+
+routing:
+  chat: llama
+  t2i: sdcpp
+  edit: sdcpp

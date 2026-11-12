@@ -54,7 +54,7 @@ class GenerateImageTool(Tool):
         options = ctx.image_options
         args = apply_user_options(args, options)
         params = sampler_params(ctx)
-        preset = user_preset(options)
+        preset = user_preset(options, self._registry, "t2i")
         loras = user_loras(options)
         require = {Capability.RGBA} if args.transparent else set()
         if loras:

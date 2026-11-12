@@ -194,7 +194,8 @@ export function backendWork() {
     const live = [...c.jobs.values()].filter((j) => j.status === 'running' || j.status === 'queued');
     for (const j of live) {
       if (work.get(j.backend)?.word === 'generating') continue;
-      work.set(j.backend, j.status === 'queued' ? { word: 'queued' } : { word: 'generating', progress: jobProgress(j) });
+      if (j.progress?.phase === 'loading') work.set(j.backend, { word: 'loading' }); // an edit card swap
+      else work.set(j.backend, j.status === 'queued' ? { word: 'queued' } : { word: 'generating', progress: jobProgress(j) });
     }
     const chat = defaultBackend('chat')?.name;
     if (!live.length && chat) work.set(chat, { word: 'writing' });
@@ -866,9 +867,26 @@ export function requestOptions() {
 export const imageEngine = () =>
   (options.backend && imageBackends().find((b) => b.name === options.backend)) || defaultBackend('t2i') || null;
 
-/** The picked preset, if the image backend the next message will use has it. */
-export const imagePreset = () =>
-  (options.preset && imageEngine()?.image_presets?.find((p) => p.name === options.preset)) || null;
+/** The image backend an edit in the next message will use (the edit route, unless a
+ * backend is picked). */
+export const editEngine = () =>
+  (options.backend && imageBackends().find((b) => b.name === options.backend)) || defaultBackend('edit') || null;
+
+/** How the next message's edits are made (BackendInfo.edit): the edit card's presets, how
+ * many images an edit takes and whether it takes a mask. null when nothing edits. */
+export const editInfo = () => editEngine()?.edit ?? null;
+
+/** The picked preset, if the image backend the next message will use has it, for making
+ * images or (an edit card's) for edits. */
+export const imagePreset = () => {
+  if (!options.preset) return null;
+  const find = (list) => list?.find((p) => p.name === options.preset);
+  const own = find(imageEngine()?.image_presets);
+  if (own) return own;
+  const edit = editInfo();
+  const forEdits = edit?.card ? find(edit.image_presets) : null;
+  return forEdits ? { ...forEdits, edits: edit.card_name ?? 'the edit card' } : null;
+};
 
 /** The picked LoRAs the image backend the next message will use lists (others wait, picked,
  * for a backend that has them). */

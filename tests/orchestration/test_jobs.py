@@ -267,3 +267,29 @@ async def test_a_running_job_keeps_its_adapter_through_a_reconfigure(
     with pytest.raises(RuntimeError, match="closed"):
         await old.health()  # released by the job, so the old adapter was closed
     await registry.aclose()
+
+
+async def test_a_job_says_while_the_engine_loads_another_card(
+    database: Database, fake_sd: FakeSdCpp, tmp_path: Path
+) -> None:
+    from tests.fakes.fake_switcher import FakeSwitcher, two_card_engine
+
+    backend = SdCppBackend("sd", two_card_engine(fake_sd.url))
+    edit = backend.edit_face
+    assert edit is not None
+    backend.switcher = edit.switcher = FakeSwitcher()
+    await backend.health()
+    rig = Rig(database, backend, tmp_path / "store")
+    cid = await rig.conversation()
+    job_id = await rig.jobs.submit(rig.spec(cid, backend=edit, task=JobTask.T2I), rig.emit)
+    await rig.jobs.wait(job_id)
+    progress = [d.job.progress for t, d in rig.events if t is EventType.JOB_UPDATE]
+    # Loading the edit card, then not: the job doesn't stay "loading" once it runs.
+    assert {"phase": "loading", "model": "edit"} in progress
+    job = await rig.jobs.get(job_id)
+    assert job.status is JobStatus.SUCCEEDED and job.progress != {
+        "phase": "loading",
+        "model": "edit",
+    }
+    assert job.params["model_card"] == "edit"  # the card that made it
+    await backend.aclose()

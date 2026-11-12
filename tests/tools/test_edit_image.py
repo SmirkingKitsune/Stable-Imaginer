@@ -164,6 +164,7 @@ async def test_multi_reference_needs_the_capability(
     await bench.upload(cid, image_bytes())
     two = await bench.edit(cid, {"images": ["img-1", "img-2"], "prompt": "combine"})
     assert two["error"]["code"] == "capability_unavailable"
+    assert "one image at a time" in two["error"]["detail"]  # says what to do instead
     masked = await bench.edit(cid, {"images": ["img-1"], "mask": "img-2", "prompt": "x"})
     assert masked["error"]["code"] == "capability_unavailable"  # a mask is a second input
     one = await bench.edit(cid, {"images": ["img-1"], "prompt": "brighter"})

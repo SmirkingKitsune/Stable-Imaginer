@@ -61,10 +61,15 @@ _DEFAULT_KEYS = {
     "flow_shift": "flow_shift",
     "custom_sigmas": "sigmas",
     "distilled_guidance": "guidance",
+    "img_cfg_scale": "img_cfg_scale",
 }
 # Recipe defaults with no field of ours, sent as they are in sample_params.
 _SAMPLE_KEYS = {"shifted_timestep": "shifted_timestep", "eta": "eta"}
-OUR_DEFAULT_KEYS = frozenset({*_DEFAULT_KEYS.values(), "clip_skip", "negative_prompt"})
+OUR_DEFAULT_KEYS = frozenset(
+    {*_DEFAULT_KEYS.values(), "clip_skip", "negative_prompt", "ref_image_args"}
+)
+# What an edit loses without its vision projector: the text encoder can't see the images.
+_SEES_IMAGES = frozenset({Capability.EDIT, Capability.MULTI_REF})
 
 PromptStyle = Literal["natural", "tags", "json"]
 Origin = Literal["builtin", "engine"]
@@ -106,6 +111,9 @@ class Family:
     note: str | None = None
     rgba: str | None = None  # the transparent-output template, with {prompt}
     mask: str | None = None  # how an edit's mask is explained in the prompt
+    edit_only: bool = False  # an edit model: it needs reference images to make anything
+    max_refs: int | None = None  # the most reference images it handles well; None: no limit
+    vision: bool = False  # its edits need the llm's vision weights (llm_vision for a GGUF)
     names: tuple[re.Pattern[str], ...] = ()
     repos: tuple[str, ...] = ()
     gguf: tuple[str, ...] = ()
@@ -131,15 +139,30 @@ class Family:
         out += [" or ".join(group) for group in self.required_any if not filled & set(group)]
         return out
 
-    def capabilities(self) -> set[Capability]:
-        """What an engine running this family can do, at most. LoRA support still depends
-        on the engine listing LoRAs."""
-        caps = {Capability.T2I, Capability.LORA}
+    def capabilities(self, files: Mapping[str, object] | None = None) -> set[Capability]:
+        """What an engine running this family can do, at most: with ``files`` (slot ->
+        path), what those files allow (no edits without a GGUF text encoder's vision
+        projector). LoRA support still depends on the engine listing LoRAs."""
+        caps = {Capability.LORA}
+        if not self.edit_only:
+            caps.add(Capability.T2I)
         if "ref_images" in self.features:
-            caps |= {Capability.EDIT, Capability.MULTI_REF}
+            caps.add(Capability.EDIT)
+            if self.max_refs is None or self.max_refs > 1:
+                caps.add(Capability.MULTI_REF)
         if self.rgba:
             caps.add(Capability.RGBA)
+        if files is not None and self.needs_vision(files):
+            caps -= _SEES_IMAGES
         return caps
+
+    def needs_vision(self, files: Mapping[str, object]) -> bool:
+        """Whether these files (slot -> path) lack the vision projector its edits need: a
+        GGUF text encoder carries no vision weights, a safetensors one may."""
+        if not self.vision or "ref_images" not in self.features:
+            return False
+        llm = files.get("llm")
+        return bool(llm) and str(llm).lower().endswith(".gguf") and not files.get("llm_vision")
 
     @property
     def previews(self) -> bool:
@@ -186,14 +209,18 @@ def _family(
     model_args = _parse_model_args(context.get("model_args"))
     model_args.update({str(k): arg_text(v) for k, v in (notes.get("model_args") or {}).items()})
     disabled = frozenset(str(f) for f in recipe.get("disabled_features") or [])
+    listed = [slot for slot in recipe.get("slots") or [] if isinstance(slot, Mapping)]
+    have = {str(slot.get("id")) for slot in listed}
+    # Slots the recipe leaves out that its sd.cpp doc says to pass (LongCat edit's mmproj).
+    listed += [s for s in notes.get("add_slots") or [] if str(s.get("id")) not in have]
     slots = tuple(
         Slot(
             id=str(slot["id"]),
             required=bool(slot.get("required", False)),
             label=str(slot.get("label") or SLOT_WHAT.get(str(slot["id"]), slot["id"])),
         )
-        for slot in recipe.get("slots") or []
-        if isinstance(slot, Mapping) and slot.get("id")
+        for slot in listed
+        if slot.get("id")
     )
     prompt = notes.get("prompt", "natural")
     return Family(
@@ -207,7 +234,7 @@ def _family(
         ),
         defaults=defaults,
         extra_sample=extra,
-        size_multiple=int(recipe.get("size_multiple") or 8),
+        size_multiple=int(notes.get("size_multiple") or recipe.get("size_multiple") or 8),
         features=frozenset(str(f) for f in recipe.get("features") or []) - disabled,
         disabled=disabled,
         vae_format=context.get("vae_format"),
@@ -221,6 +248,9 @@ def _family(
         note=notes.get("note"),
         rgba=notes.get("rgba"),
         mask=notes.get("mask"),
+        edit_only=bool(notes.get("edit_only", False)),
+        max_refs=int(notes["max_refs"]) if notes.get("max_refs") else None,
+        vision=bool(notes.get("vision", False)),
         names=tuple(re.compile(p, re.IGNORECASE) for p in notes.get("names") or []),
         repos=tuple(str(r) for r in notes.get("repos") or []),
         gguf=tuple(str(a) for a in notes.get("gguf") or []),

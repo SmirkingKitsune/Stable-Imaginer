@@ -57,6 +57,28 @@ def test_a_ggufs_architecture_and_name_together(tmp_path: Path) -> None:
         ("v1-5-pruned-emaonly.safetensors", None, "sd1-checkpoint"),
         ("Chroma1-Radiance-v0.4-Q8_0.gguf", None, "chroma-radiance"),
         ("sd3.5_large_fp8_scaled.safetensors", None, "sd35-large"),
+        # Edit models, beside the text-to-image ones they share a repo or an architecture with.
+        ("flux1-kontext-dev-Q8_0.gguf", "QuantStack/FLUX.1-Kontext-dev-GGUF", "flux1-kontext"),
+        ("Qwen_Image_Edit-Q8_0.gguf", "QuantStack/Qwen-Image-Edit-GGUF", "qwen-image-edit"),
+        ("qwen_image_edit_2509_fp8mixed.safetensors", None, "qwen-image-edit-2509"),
+        (
+            "qwen-image-edit-2511-Q4_K_M.gguf",
+            "unsloth/Qwen-Image-Edit-2511-GGUF",
+            "qwen-image-edit-2511",
+        ),
+        (
+            "qwen_image_edit_2511_bf16.safetensors",
+            "Comfy-Org/Qwen-Image-Edit_ComfyUI",
+            "qwen-image-edit-2511",
+        ),
+        ("longcat_image_edit_bf16.safetensors", "Comfy-Org/LongCat-Image", "longcat-image-edit"),
+        ("longcat_image_bf16.safetensors", "Comfy-Org/LongCat-Image", "longcat-image"),
+        ("boogu_image_edit_int8_convrot.safetensors", "Comfy-Org/Boogu-Image", "boogu-image-edit"),
+        ("boogu_image_base_bf16.safetensors", "Comfy-Org/Boogu-Image", "boogu-image"),
+        ("mage_flow_edit_turbo_bf16.safetensors", "Comfy-Org/Mage-Flow", "mage-flow-edit"),
+        ("mage_flow_turbo_bf16.safetensors", "Comfy-Org/Mage-Flow", "mage-flow-turbo"),
+        ("fibo2_edit_turbo_bf16.safetensors", "Comfy-Org/Fibo-2.0", "fibo2-edit-turbo"),
+        ("fibo2_dev_int8_convrot.safetensors", "Comfy-Org/Fibo-2.0", "fibo2-dev"),
     ],
 )
 def test_names_and_repos(name: str, repo: str | None, family: str) -> None:
@@ -75,3 +97,30 @@ def test_the_folders_a_file_is_in_count_too(tmp_path: Path) -> None:
         tmp_path / "Comfy-Org" / "Qwen-Image-2.1" / "diffusion_models" / "model.safetensors", ["x"]
     )
     assert _top(Evidence(path=path)) == "qwen-image-21"
+
+
+def test_kontext_has_flux_dev_tensors_and_its_own_name(tmp_path: Path) -> None:
+    kontext = headers.safetensors(tmp_path / "flux1-kontext-dev.safetensors", headers.FLUX_DEV)
+    assert _top(Evidence(path=kontext)) == "flux1-kontext"
+    anonymous = headers.safetensors(tmp_path / "model.safetensors", headers.FLUX_DEV)
+    assert _top(Evidence(path=anonymous)) == "flux1-dev"  # the same tensors: dev wins a tie
+
+
+@pytest.mark.parametrize(
+    ("pipeline", "families"),
+    [
+        ("FluxKontextPipeline", {"flux1-kontext"}),
+        ("QwenImageEditPipeline", {"qwen-image-edit"}),
+        ("QwenImageEditPlusPipeline", {"qwen-image-edit-2509", "qwen-image-edit-2511"}),
+        ("LongCatImageEditPipeline", {"longcat-image-edit"}),
+    ],
+)
+def test_edit_pipelines(pipeline: str, families: set[str]) -> None:
+    guesses = detect(Evidence(pipeline=pipeline))
+    assert {g.family for g in guesses} == families
+
+
+def test_the_repo_tells_qwen_edit_2509_from_2511() -> None:
+    plus = "QwenImageEditPlusPipeline"
+    assert _top(Evidence(pipeline=plus, repo="Qwen/Qwen-Image-Edit-2511")) == "qwen-image-edit-2511"
+    assert _top(Evidence(pipeline=plus, repo="Qwen/Qwen-Image-Edit-2509")) == "qwen-image-edit-2509"

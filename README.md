@@ -541,7 +541,10 @@ It follows the "Imaginer Main Interface" design, which is built on the Industry 
   page (`#/models/<id>`) fills each slot of its family by path, by reusing another card's
   file, or from Hugging Face (curated sources first), and edits its launch arguments,
   defaults, presets, prompt note, notes, tags and cover. **Use on an engine** points an
-  sd-server at it, restarting one that is running. See [docs/models.md](docs/models.md).
+  sd-server at it, restarting one that is running. Edit models (FLUX.1 Kontext, Qwen Image
+  Edit, LongCat, Boogu, Mage-Flow, Fibo 2.0 Edit Turbo) are cards too: **Use for edits** makes
+  one an engine's edit card, which it switches to for edits and back for new images. See
+  [docs/models.md](docs/models.md).
 - **Agents** (`#/agents`, from the status line's menu): a tile per agent with its portrait as
   the cover, its model, quant and size, turns, whether it is ready and the engine it runs on;
   filters (pinned, vision, tools, running) and a table view. An agent's page (`#/agents/<id>`)

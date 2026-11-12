@@ -25,6 +25,7 @@ SIGMA_PRESETS: dict[str, list[float]] = {
 }  # fmt: skip
 PARAM_KEYS = (
     "steps", "cfg_scale", "sampler", "scheduler", "flow_shift", "sigmas", "guidance", "clip_skip",
+    "img_cfg_scale",
 )  # fmt: skip
 LORAS_SHOWN = 12  # in an error about a LoRA the engine doesn't have
 LORA_SCAN_LIMIT = 5000  # folder entries looked at before a LoRA folder's listing stops
@@ -110,6 +111,8 @@ def resolve_params(
         "sigmas": defaults.sigmas,
         "guidance": defaults.guidance,
         "clip_skip": defaults.clip_skip,
+        "img_cfg_scale": defaults.img_cfg_scale,
+        "ref_image_args": defaults.ref_image_args,
     }
     if preset is not None:
         params.update({k: getattr(preset, k) for k in PARAM_KEYS if getattr(preset, k) is not None})
@@ -396,7 +399,8 @@ async def prepare_inputs(
     if not images:
         raise InvalidRequestError("edit needs at least one input image")
     if len(inputs) > max_inputs:
-        raise InvalidRequestError(f"{backend} accepts at most {max_inputs} reference images")
+        images_word = "image" if max_inputs == 1 else "images"
+        raise InvalidRequestError(f"{backend} takes at most {max_inputs} input {images_word}")
     return [
         await asyncio.to_thread(fit_image, image.data, image.mime, max_pixels) for image in inputs
     ]

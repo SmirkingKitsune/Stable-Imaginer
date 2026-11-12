@@ -58,6 +58,8 @@ class GenProgress:
 
 ProgressCallback = Callable[[GenProgress], Awaitable[None]]
 SubmittedCallback = Callable[[str], Awaitable[None]]  # receives the engine's own job id
+# The model the engine is switching to before it can start (an edit card swap), then None.
+LoadingCallback = Callable[[str | None], Awaitable[None]]
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
@@ -77,6 +79,7 @@ class GenRequest:
     params: dict[str, Any] = field(default_factory=dict)  # per-request sampler overrides
     on_progress: ProgressCallback | None = None
     on_submitted: SubmittedCallback | None = None
+    on_loading: LoadingCallback | None = None
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)

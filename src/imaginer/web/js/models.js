@@ -120,17 +120,31 @@ function needUnits(slots, groups, main = null) {
 function onDisk(lib, slots, { except = null, family = null } = {}) {
   if (slots.some((s) => MAIN_SLOTS.includes(s))) return [];
   const cards = new Map((lib?.items ?? []).map((i) => [i.id, i]));
-  const groups = new Map((lib?.families ?? []).map((f) => [f.id, f.group]));
-  const kin = (other) => other != null && family != null
-    && (other === family || (groups.get(other) != null && groups.get(other) === groups.get(family)));
+  const fams = new Map((lib?.families ?? []).map((f) => [f.id, f]));
+  // Kin share the file a slot holds: the same family, or one of its group that labels the
+  // slot alike. Qwen-Image's text encoder ("Qwen 2.5 VL 7B") is not Qwen-Image-2.1's.
+  const kin = (other, slot) => {
+    if (other == null || family == null) return false;
+    if (other === family) return true;
+    const a = fams.get(other);
+    const b = fams.get(family);
+    if (a?.group == null || a.group !== b?.group) return false;
+    const key = slot === 'llm_vision' ? 'llm' : slot; // a vision projector goes with its encoder
+    const la = a.slot_labels?.[key];
+    const lb = b.slot_labels?.[key];
+    return la != null && la === lb;
+  };
   return (lib?.components ?? [])
     .filter((s) => s.exists && s.path !== except && s.slots.some((x) => slots.includes(x)))
-    .map((s) => ({
-      ...s,
-      slot: slots.find((x) => s.slots.includes(x)),
-      names: s.cards.map((id) => cards.get(id)?.name ?? id),
-      same: s.cards.some((id) => kin(cards.get(id)?.family)),
-    }))
+    .map((s) => {
+      const slot = slots.find((x) => s.slots.includes(x));
+      return {
+        ...s,
+        slot,
+        names: s.cards.map((id) => cards.get(id)?.name ?? id),
+        same: s.cards.some((id) => kin(cards.get(id)?.family, slot)),
+      };
+    })
     .sort((a, b) => (b.same - a.same) || (b.cards.length - a.cards.length));
 }
 
@@ -243,7 +257,7 @@ export function modelsScreen({ navigate }) {
     } else {
       img = h('span.tile-desc', item.family_name ?? 'no family yet');
     }
-    const engines = item.engines.map((u) => `${u.running ? '●' : '○'} ${u.engine}`).join('  ');
+    const engines = item.engines.map((u) => `${u.running ? '●' : '○'} ${u.engine}${u.role === 'edit' ? ' (edits)' : ''}`).join('  ');
     const line = [item.family_name, bytes(item.size_bytes), item.uses ? plural(item.uses, 'image') : 'unused',
       item.last_used_at && ago(item.last_used_at)].filter(Boolean).join(' · ');
     return h('a.tile.result.lib-tile.model-tile', { href: `#/models/${item.id}`, 'aria-label': item.name },
@@ -1030,7 +1044,10 @@ export function modelScreen({ id, navigate }) {
   // --- readiness -------------------------------------------------------------------------
 
   function units() {
-    return needUnits(d.components, fam?.required_any ?? [], d.components.find((c) => MAIN_SLOTS.includes(c.slot))?.slot);
+    // A slot the card is missing though its recipe calls it optional: an edit model's vision
+    // projector, which a GGUF text encoder needs.
+    const comps = d.components.map((c) => (d.missing.includes(c.slot) ? { ...c, required: true } : c));
+    return needUnits(comps, fam?.required_any ?? [], d.components.find((c) => MAIN_SLOTS.includes(c.slot))?.slot);
   }
   const filled = (u) => u.some((c) => c.path && !c.problem);
   const reuseFor = (u) => onDisk(lib, u.map((c) => c.slot), { family: d.family });
@@ -1075,7 +1092,8 @@ export function modelScreen({ id, navigate }) {
       value: d.name, 'aria-label': 'Name', spellcheck: false, dataset: { key: 'name' },
       onchange: () => name.value.trim() && patch({ name: name.value }), onkeydown: enter,
     });
-    const engines = d.engines.map((u) => [h('b', u.engine), ` (${u.running ? 'running' : 'stopped'})`,
+    const engines = d.engines.map((u) => [h('b', u.engine), u.role === 'edit' ? ' for edits' : '',
+      ` (${u.loaded ? 'loaded' : u.running ? 'running' : 'stopped'})`,
       u.needs_restart ? h('span.accent', ' · restart to load the changes') : null]);
     const facts = [
       d.size_bytes ? `${bytes(d.size_bytes)} on disk` : 'nothing on disk yet',
@@ -1093,6 +1111,7 @@ export function modelScreen({ id, navigate }) {
             onclick: () => patch({ pinned: !d.pinned }),
           }, icon('pin', 18))),
         h('span.mc-facts', facts.flatMap((f, i) => (i ? [' · ', f] : [f]))),
+        d.warnings?.length ? h('span.mc-facts.accent', d.warnings.join(' · ')) : null,
         other && h('span.mc-facts', 'Its file looks like ', h('button.link-btn', {
           type: 'button', title: best.reasons.join('\n'), onclick: () => patch({ family: best.family }, 'Family changed'),
         }, `${best.name} (${pct(best.score)})`), '.')),
@@ -1157,7 +1176,9 @@ export function modelScreen({ id, navigate }) {
       actions = [primary, useBtn(false)];
     } else {
       kicker = 'Ready';
-      text = d.engines.length ? `Runs on ${d.engines.map((u) => u.engine).join(', ')}.` : 'Every file it needs is here.';
+      text = d.engines.length
+        ? `Runs on ${d.engines.map((u) => (u.role === 'edit' ? `${u.engine} (for edits)` : u.engine)).join(', ')}.`
+        : 'Every file it needs is here.';
       actions = [useBtn(true)];
     }
     return h('div.mc-plate.blueprint', { class: d.ready ? 'ready' : '' }, corners(),
@@ -1173,7 +1194,8 @@ export function modelScreen({ id, navigate }) {
       toast('No sd-server engine is configured', { error: true });
       return;
     }
-    menu(anchor, engines.map((e) => ({
+    const edits = d.capabilities.includes('edit');
+    menu(anchor, engines.flatMap((e) => [{
       label: `${e.name}${e.model_card === id ? ' · runs it' : ''}${e.launchable ? (e.running ? ' · restarts' : ' · loads on start') : ' · started elsewhere'}`,
       checked: e.model_card === id,
       onclick: async () => {
@@ -1181,7 +1203,13 @@ export function modelScreen({ id, navigate }) {
         // A running engine restarts with it; a stopped one loads it when it is next started.
         save(() => api.useModel(id, { engine: e.name, start: false }), `${e.name} runs ${d.name}${e.running ? ' · restarting' : ''}`);
       },
-    })));
+    },
+    // An edit model next to the engine's own: the engine switches to it for edits.
+    edits && e.launchable && e.model_card !== id && {
+      label: `${e.name} · for edits${e.edit_card === id ? ' · uses it' : ''}`,
+      checked: e.edit_card === id,
+      onclick: () => save(() => api.useModel(id, { engine: e.name, role: 'edit' }), `${e.name} edits with ${d.name}`),
+    }].filter(Boolean)));
   }
 
   // --- the rail --------------------------------------------------------------------------
@@ -1382,6 +1410,9 @@ export function modelScreen({ id, navigate }) {
   // A family whose recipe names no size gets 1024 (library.DEFAULT_SIZE).
   const famDefault = (key) => fam?.defaults?.[key] ?? (key === 'width' || key === 'height' ? 1024 : null);
   const hasGuidance = () => famDefault('guidance') != null || d.defaults.guidance != null;
+  // Image guidance (--img-cfg-scale): only families whose recipe has image CFG use it.
+  const hasImgCfg = () => (fam?.features ?? []).includes('img_cfg') || d.defaults.img_cfg_scale != null;
+  const takesRefs = () => (fam?.features ?? []).includes('ref_images');
 
   function numInput(key, value, { step = 1, integer = true, min = null, label, className = 'mc-num', onset = null } = {}) {
     const input = h(`input.${className}`, {
@@ -1446,7 +1477,7 @@ export function modelScreen({ id, navigate }) {
       return s;
     };
     const row = (label, control, keys) => h('div.mc-srow', h('span.mc-slabel', label), h('div.mc-scontrol', control), versus(keys));
-    const advanced = ['flow_shift', 'clip_skip', 'sigmas', 'negative_prompt'];
+    const advanced = ['flow_shift', 'clip_skip', 'sigmas', 'negative_prompt', ...(takesRefs() ? ['ref_image_args'] : [])];
     const editedAdv = fam ? advanced.filter((k) => !same(k === 'negative_prompt' ? df[k] || null : df[k], k === 'negative_prompt' ? famDefault(k) || null : famDefault(k))) : [];
     const sigmas = h('input.seed-input.text', {
       value: Array.isArray(df.sigmas) ? df.sigmas.join(', ') : df.sigmas ?? '', placeholder: 'none · a list, or a preset name', spellcheck: false,
@@ -1463,6 +1494,12 @@ export function modelScreen({ id, navigate }) {
       dataset: { key: 'd-negative' }, onchange: () => setDefaults({ negative_prompt: negative.value }),
     });
     negative.value = df.negative_prompt ?? '';
+    const refArgs = takesRefs() && h('input.seed-input.text', {
+      value: df.ref_image_args ?? '', placeholder: 'none · e.g. resize_before_vae=false', spellcheck: false,
+      'aria-label': 'Reference image args', dataset: { key: 'd-ref-args' },
+      onchange: () => setDefaults({ ref_image_args: refArgs.value.trim() || null }),
+      onkeydown: enter,
+    });
     return h('section.mc-section', { id: 'mc-sampling' },
       sectionHead('Sampling', 'Every image starts here. A message\'s own settings still win.', h('span.spacer'),
         h('button.btn.btn-ghost.mc-small-btn', { type: 'button', onclick: () => patch({ reset_defaults: true }, 'Back to the family\'s defaults') }, 'Reset to family')),
@@ -1479,19 +1516,23 @@ export function modelScreen({ id, navigate }) {
         row('CFG', [numInput('cfg_scale', cfg, { step: 0.1, integer: false, label: 'CFG', className: 'mc-big' }),
           noCfg && h('span.tag.tag-neutral.mc-off', 'OFF'),
           h('span.mc-muted', noCfg ? 'Distilled model — so no negative prompt either.' : 'How strongly it follows the prompt and avoids the negative one.')], ['cfg_scale']),
+        hasImgCfg() && row('Image guidance', [numInput('img_cfg_scale', df.img_cfg_scale ?? famDefault('img_cfg_scale'), { step: 0.1, integer: false, min: 0, label: 'Image guidance', className: 'mc-big' }),
+          h('span.mc-muted', 'Edits only: how closely the result keeps to the images it is given. Empty is 1.')], ['img_cfg_scale']),
         row('Sampler', [select('sampler', SAMPLERS, 'Sampler'), h('span.mc-muted', 'with'), select('scheduler', SCHEDULERS, 'Scheduler'),
           h('span.mc-muted', 'schedule')], ['sampler', 'scheduler']),
         h('details.mc-adv', {
           open: opened.has('advanced'), ontoggle: (e) => { if (e.target.open) opened.add('advanced'); else opened.delete('advanced'); },
         },
         h('summary', h('span.mc-summary-mark', '▸'), 'Advanced',
-          h('span.mc-muted', `flow shift, CLIP skip, sigmas, negative prompt · ${editedAdv.length ? `${plural(editedAdv.length, 'edit')} over the family's` : 'all from the family'}`)),
+          h('span.mc-muted', `flow shift, CLIP skip, sigmas, negative prompt${takesRefs() ? ', reference images' : ''} · ${editedAdv.length ? `${plural(editedAdv.length, 'edit')} over the family's` : 'all from the family'}`)),
         h('div.mc-adv-body',
           h('div.model-fields',
             h('label.model-field', h('span.eyebrow', 'Flow shift'), h('span.seed-field', numInput('flow_shift', df.flow_shift, { step: 0.1, integer: false, label: 'Flow shift', className: 'seed-input' }))),
             h('label.model-field', h('span.eyebrow', 'CLIP skip'), h('span.seed-field', numInput('clip_skip', df.clip_skip, { min: 1, label: 'CLIP skip', className: 'seed-input' })))),
           h('label.model-field.wide', h('span.eyebrow', 'Sigmas'), h('span.seed-field', sigmas)),
-          h('label.model-field.wide', h('span.eyebrow', 'Negative prompt'), negative)))));
+          h('label.model-field.wide', h('span.eyebrow', 'Negative prompt'), negative),
+          refArgs && h('label.model-field.wide', { title: "sd-server's ref_image_args for edits (stable-diffusion.cpp docs/edit.md)" },
+            h('span.eyebrow', 'Reference image args'), h('span.seed-field', refArgs))))));
   }
 
   // --- 03 presets ------------------------------------------------------------------------
@@ -1500,6 +1541,7 @@ export function modelScreen({ id, navigate }) {
     const df = d.defaults;
     const names = Object.keys(d.presets);
     const rows = [['steps', 'Steps'], hasGuidance() && ['guidance', 'Guidance'], ['cfg_scale', 'CFG'],
+      hasImgCfg() && ['img_cfg_scale', 'Image guidance'],
       (df.flow_shift != null || names.some((n) => d.presets[n].flow_shift != null)) && ['flow_shift', 'Flow shift'],
       ['sampler', 'Sampler'], ['size', 'Size'], ['loras', 'LoRAs']].filter(Boolean);
     const lorasText = (list) => (list == null ? null : list.length ? list.map((l) => `${fileName(l.path).replace(/\.[^.]+$/, '')} · ${l.weight}`).join(', ') : 'none');
@@ -1581,7 +1623,7 @@ export function modelScreen({ id, navigate }) {
       input?.focus();
       input?.select();
     };
-    const label = `${name} · ${key === 'cfg_scale' ? 'CFG' : key.replace('_', ' ')}`;
+    const label = `${name} · ${key === 'cfg_scale' ? 'CFG' : key === 'img_cfg_scale' ? 'image guidance' : key.replace('_', ' ')}`;
     if (editing?.name === name && editing.key === key) {
       const integer = key === 'steps';
       const commit = () => {

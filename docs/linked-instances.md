@@ -153,7 +153,10 @@ falls back silently: an unreachable link is `engine_unavailable`, like any engin
 `GET /v1/gallery` merges this instance's conversations with each linked instance's
 `/v1/conversations` (asked in parallel, 3 seconds each). The cursor holds every source's
 position. A source that doesn't answer is reported in `sources` and skipped for the rest of
-that listing. Each item has an `origin`: `link_id`, `instance_id`, `name`, and `base_path`.
+that listing. A link last seen unreachable isn't waited for at all: it is reported as
+`unreachable` at once and checked again in the background (at most every 5 seconds), so it
+reappears once it answers. Each item has an `origin`: `link_id`, `instance_id`, `name`, and
+`base_path`.
 
 `/v1/links/{id}/r/<path>` passes a request on to the linked instance with the link's token
 and streams the answer back (server-sent events, `ETag`, `Last-Event-ID` included). Only

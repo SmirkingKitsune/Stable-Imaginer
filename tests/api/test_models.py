@@ -14,6 +14,7 @@ from fastapi import FastAPI
 from imaginer.backends.registry import Lease
 from imaginer.container import Container
 from imaginer.core.config import load_settings, local_overrides_path
+from imaginer.engines.launch import command
 from imaginer.main import create_app
 from tests.image_models import headers
 
@@ -31,6 +32,10 @@ def weights(tmp_path: Path) -> dict[str, Path]:
         "schnell": headers.safetensors(m / "my-fast-model.safetensors", headers.FLUX_SCHNELL),
         "ae": headers.safetensors(m / "ae.safetensors", ["decoder.conv_in.weight"]),
         "sdxl": headers.safetensors(m / "juggernautXL_v9.safetensors", headers.SDXL),
+        "edit": headers.gguf(m / "qwen-image-edit-2511-Q4_K_M.gguf", ["x"], arch="qwen_image"),
+        "edit_llm": headers.safetensors(m / "qwen_2.5_vl_7b.safetensors", ["x"]),
+        "edit_llm_gguf": headers.gguf(m / "Qwen2.5-VL-7B-Instruct.Q4_K_M.gguf", ["x"]),
+        "edit_vae": headers.safetensors(m / "qwen_image_vae.safetensors", ["x"]),
     }
 
 
@@ -185,7 +190,6 @@ async def test_editing_a_card_and_sharing_a_component(
 async def test_model_arguments_survive_save_and_launch(
     client: httpx.AsyncClient, app: FastAPI, weights: dict[str, Path]
 ) -> None:
-    from imaginer.engines.launch import command
 
     card = await _create(client, path=str(weights["sdxl"]))
     args = ["--model-dir", "C:\\My Models\\", "--name", "", "--separator", " "]
@@ -209,7 +213,14 @@ async def test_using_a_card_on_an_engine(
     resp = await client.post(f"/v1/models/{card['id']}/use", json={"engine": "sd", "start": False})
     assert resp.status_code == 200, resp.text
     assert resp.json()["engines"] == [
-        {"engine": "sd", "launchable": True, "running": False, "needs_restart": False}
+        {
+            "engine": "sd",
+            "role": "main",
+            "launchable": True,
+            "running": False,
+            "loaded": False,
+            "needs_restart": False,
+        }
     ]
     assert _saved(profile)["backends"]["sd"] == {"model_card": card["id"]}
     engine = (await client.get("/v1/engines/sd")).json()
@@ -249,9 +260,10 @@ async def test_a_card_describes_an_engine_started_elsewhere(
 async def test_families_and_detection(client: httpx.AsyncClient, weights: dict[str, Path]) -> None:
     families = (await client.get("/v1/models/families")).json()
     ids = {f["id"] for f in families}
-    assert "flux1-dev" in ids and "qwen-image-edit" not in ids
+    assert {"flux1-dev", "qwen-image-edit-2511", "flux1-kontext"} <= ids
+    assert "sdxl-controlnet" not in ids
     every = (await client.get("/v1/models/families", params={"hidden": True})).json()
-    assert "qwen-image-edit" in {f["id"] for f in every}
+    assert "sdxl-controlnet" in {f["id"] for f in every}
     flux = (await client.get("/v1/models/families/flux1-dev")).json()
     assert [s["id"] for s in flux["slots"] if s["required"]] == [
         "diffusion_model",
@@ -286,3 +298,81 @@ async def test_a_dropped_file_is_found_by_its_name_in_the_cards_folders(
     assert other["paths"] == [str(target)]
     nothing = (await client.post("/v1/models/locate", json={"name": "nowhere.gguf"})).json()
     assert nothing["paths"] == []
+
+
+async def _edit_card(
+    client: httpx.AsyncClient, weights: dict[str, Path], llm: str
+) -> dict[str, Any]:
+    return await _create(
+        client,
+        path=str(weights["edit"]),
+        components={"llm": str(weights[llm]), "vae": str(weights["edit_vae"])},
+    )
+
+
+async def test_an_edit_model_is_detected_and_needs_its_vision(
+    client: httpx.AsyncClient, weights: dict[str, Path]
+) -> None:
+    blind = await _edit_card(client, weights, "edit_llm_gguf")
+    assert blind["family"] == "qwen-image-edit-2511"
+    # A GGUF text encoder can't see the images without its vision projector.
+    assert "llm_vision" in blind["missing"] and not blind["ready"]
+    assert blind["capabilities"] == ["lora"]
+    seeing = await _edit_card(client, weights, "edit_llm")
+    assert seeing["ready"] and seeing["missing"] == []
+    assert set(seeing["capabilities"]) == {"edit", "multi_ref", "lora"}  # no text-to-image
+
+
+async def test_an_engine_switches_to_its_edit_card_for_edits(
+    client: httpx.AsyncClient, app: FastAPI, profile: Path, weights: dict[str, Path]
+) -> None:
+    main = await _create(client, path=str(weights["sdxl"]))
+    edit = await _edit_card(client, weights, "edit_llm")
+    await client.post(f"/v1/models/{main['id']}/use", json={"engine": "sd", "start": False})
+    resp = await client.post(f"/v1/models/{edit['id']}/use", json={"engine": "sd", "role": "edit"})
+    assert resp.status_code == 200, resp.text
+    assert [(u["engine"], u["role"]) for u in resp.json()["engines"]] == [("sd", "edit")]
+    assert _saved(profile)["backends"]["sd"] == {"model_card": main["id"], "edit_card": edit["id"]}
+    engine = (await client.get("/v1/engines/sd")).json()
+    assert engine["model_card"] == main["id"] and engine["edit_card"] == edit["id"]
+    assert engine["edit_card_name"] == edit["name"]
+    # The engine makes images with its card and edits with the edit card's settings.
+    backend = {b["name"]: b for b in (await client.get("/v1/backends")).json()}["sd"]
+    assert backend["image_defaults"]["size_multiple"] == 64  # SDXL's
+    assert backend["edit"]["card"] == edit["id"] and backend["edit"]["max_ref_images"] == 3
+    assert backend["edit"]["mask"] is False
+    container: Container = app.state.container
+    entry = container.registry._entries["sd"]
+    assert entry.backend is not None
+    face = entry.backend.edit_face  # type: ignore[union-attr]
+    assert face is not None and face.family == "qwen-image-edit-2511"
+    assert face.model_card == edit["id"]
+    view = container.engines.effective("sd").edit_view  # type: ignore[union-attr]
+    assert view is not None
+    argv = command(view, Path("sd-server"))  # what an edit restarts the engine with
+    assert str(weights["edit"]) in argv and "qwen_image_zero_cond_t=true" in argv
+    # A card used for edits can't be deleted either; nor be both cards.
+    assert (await client.delete(f"/v1/models/{edit['id']}")).status_code == 409
+    same = await client.post(f"/v1/models/{main['id']}/use", json={"engine": "sd", "role": "edit"})
+    assert same.status_code == 422
+    # A card that can't edit can't be the edit card.
+    sdxl = await client.post(
+        f"/v1/models/{main['id']}/use", json={"engine": "remote", "role": "edit"}
+    )
+    assert sdxl.status_code == 422
+    # Running the edit card for everything ends its use for edits.
+    await client.post(f"/v1/models/{edit['id']}/use", json={"engine": "sd", "start": False})
+    assert _saved(profile)["backends"]["sd"] == {"model_card": edit["id"], "edit_card": None}
+    # The engine's own Engines-screen edit: clearing it.
+    cleared = await client.patch("/v1/engines/sd", json={"edit_card": ""})
+    assert cleared.status_code == 200 and cleared.json()["edit_card"] is None
+
+
+async def test_an_edit_card_needs_an_engine_started_here(
+    client: httpx.AsyncClient, weights: dict[str, Path]
+) -> None:
+    edit = await _edit_card(client, weights, "edit_llm")
+    resp = await client.post(
+        f"/v1/models/{edit['id']}/use", json={"engine": "remote", "role": "edit"}
+    )
+    assert resp.status_code == 422 and "isn't started here" in resp.json()["detail"]

@@ -29,6 +29,7 @@ PIPELINES: Mapping[str, tuple[str, ...]] = {
     "StableDiffusionXLPipeline": ("sdxl-checkpoint", "sdxl-turbo"),
     "StableDiffusion3Pipeline": ("sd35-large", "sd35-medium", "sd3-medium"),
     "FluxPipeline": ("flux1-dev", "flux1-schnell"),
+    "FluxKontextPipeline": ("flux1-kontext",),
     "Flux2Pipeline": ("flux2-dev",),
     "Flux2KleinPipeline": (
         "flux2-klein-4b", "flux2-klein-9b", "flux2-klein-base-4b", "flux2-klein-base-9b",
@@ -36,10 +37,13 @@ PIPELINES: Mapping[str, tuple[str, ...]] = {
     "ChromaPipeline": ("chroma",),
     "QwenImagePipeline": ("qwen-image",),
     "QwenImage21Pipeline": ("qwen-image-21", "qwen-image-21-turbo"),
+    "QwenImageEditPipeline": ("qwen-image-edit",),
+    "QwenImageEditPlusPipeline": ("qwen-image-edit-2509", "qwen-image-edit-2511"),
     "ZImagePipeline": ("z-image-turbo", "z-image"),
     "PixArtSigmaPipeline": ("pixart-sigma",),
     "PixArtAlphaPipeline": ("pixart-alpha-1024", "pixart-alpha-512"),
     "LongCatImagePipeline": ("longcat-image",),
+    "LongCatImageEditPipeline": ("longcat-image-edit",),
     "OvisImagePipeline": ("ovis-image",),
 }  # fmt: skip
 _JOINT = re.compile(r"joint_blocks\.(\d+)\.")
@@ -180,6 +184,8 @@ def _from_tensors(names: list[str]) -> Iterable[tuple[str, float, str]]:
                 yield "chroma", 0.9, "Chroma tensors"
         elif "guidance_in." in has:
             yield "flux1-dev", 0.85, "FLUX.1 tensors with a guidance input"
+            # Kontext is FLUX.1 dev's architecture: its name, repo or pipeline tells them apart.
+            yield "flux1-kontext", 0.85, "FLUX.1 tensors with a guidance input"
         else:
             yield "flux1-schnell", 0.7, "FLUX.1 tensors without a guidance input"
 

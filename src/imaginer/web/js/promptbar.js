@@ -11,7 +11,7 @@ import { append, corners, h, icon, clear } from './dom.js';
 import { ASPECTS, loraName, lorasWord } from './format.js';
 import { loraItems, loraText, mentionEditor, uploadRef } from './mentions.js';
 import {
-  clearDraft, connection, defaultBackend, draft, imageBackends, imageEngine, imageLoras, imagePreset, libraryLora,
+  clearDraft, connection, defaultBackend, draft, editInfo, imageBackends, imageEngine, imageLoras, imagePreset, libraryLora,
   loadLoras, loraLibrary, on, options, requestOptions, setOption, takeQueuedLoras,
 } from './store.js';
 
@@ -285,14 +285,20 @@ export function promptBar({
         ? `rounded to ${mult} · ${mp} MP`
         : `${aw}×${ah} · ${mp} MP · ${options.aspect_ratio ? 'default area' : `${engine?.name ?? 'backend'} default`}`));
 
-    // Presets: named LoRAs + sampler settings from the backend's config.
+    // Presets: named LoRAs + sampler settings from the backend's config. An engine with an
+    // edit card has that card's too, for edits.
     const presets = engine?.image_presets ?? [];
+    const edit = editInfo();
+    const editPresets = edit?.card ? edit.image_presets.filter((p) => !presets.some((q) => q.name === p.name)) : [];
     const preset = imagePreset();
-    const presetCell = presets.length > 0 && h('div.tray-cell.span-all', h('span.eyebrow', 'Preset'),
+    const presetCell = presets.length + editPresets.length > 0 && h('div.tray-cell.span-all', h('span.eyebrow', 'Preset'),
       h('div.tray-seg.wrap',
         pick(!preset, 'None', () => setOption({ preset: null })),
-        presets.map((p) => pick(preset?.name === p.name, p.name, () => setOption({ preset: p.name })))),
-      h('span.tray-hint', preset ? presetSummary(preset) : `${engine.name} defaults`));
+        presets.map((p) => pick(preset?.name === p.name, p.name, () => setOption({ preset: p.name }))),
+        editPresets.map((p) => pick(preset?.name === p.name, `${p.name} · edits`, () => setOption({ preset: p.name })))),
+      h('span.tray-hint', preset
+        ? `${presetSummary(preset)}${preset.edits ? ` · for edits with ${preset.edits}` : ''}`
+        : `${engine?.name ?? 'backend'} defaults`));
     const loraCell = engine?.available_loras?.length > 0 && lorasCell(engine, preset);
 
     const stepChoices = [...new Set([8, 20, 40, options.steps].filter(Boolean))].sort((a, b) => a - b);
@@ -531,6 +537,7 @@ export function promptBar({
   function addFiles(files) {
     for (const file of files) {
       if (!file.type.startsWith('image/')) continue;
+      if (!roomForImage()) break;
       const ref = uploadRef(file.name, new Set(d.attachments.map(refOf)));
       d.attachments.push({ file, preview: URL.createObjectURL(file), ref });
     }
@@ -539,8 +546,19 @@ export function promptBar({
     editor.el.focus();
   }
 
+  /** Whether a raw edit has room for one more image: an edit model may take only one
+   * (FLUX.1 Kontext) or a few. Other modes let the chat model see more than it edits. */
+  function roomForImage() {
+    const max = editInfo()?.max_ref_images;
+    if (options.mode !== 'raw' || !max || d.attachments.length < max) return true;
+    toast(`${editInfo()?.card_name ?? 'The edit model'} edits at most ${max} ${max === 1 ? 'image' : 'images'} at a time`, { error: true });
+    return false;
+  }
+
   function addArtifact(artifact, { first = false, prefill = null } = {}) {
-    if (!d.attachments.some((a) => a.artifact?.id === artifact.id)) {
+    const known = d.attachments.some((a) => a.artifact?.id === artifact.id);
+    if (!known && !first && !roomForImage()) return;
+    if (!known) {
       const att = { artifact };
       if (first) d.attachments.unshift(att);
       else d.attachments.push(att);

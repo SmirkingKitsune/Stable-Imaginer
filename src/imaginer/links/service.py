@@ -433,6 +433,16 @@ class LinkService:
             await self.poll(link)
         return link
 
+    def recheck(self, link: Link, max_age_s: float) -> None:
+        """Poll the link in the background, unless a poll is under way or its status is
+        younger than ``max_age_s``. For callers that won't wait for the answer."""
+        lock = self._poll_locks.get(link.id)
+        if lock is not None and lock.locked():
+            return
+        if link.checked_at is not None and time.monotonic() - link.checked_at < max_age_s:
+            return
+        self._spawn(self.poll(link))
+
     async def poll(self, link: Link) -> None:
         """Ask the peer what it shares. Concurrent callers share one request."""
         lock = self._poll_locks.setdefault(link.id, asyncio.Lock())

@@ -7,7 +7,9 @@ conversation taken from it. Conversations stay where they are: remote ones are r
 through ``/v1/links/{link_id}/r/...`` (``Origin.base_path``).
 
 A source that doesn't answer is reported in ``sources`` and skipped for the rest of this
-listing; the next listing from the top tries it again.
+listing; the next listing from the top tries it again. A link last seen unreachable isn't
+waited for (a refused connection alone can take seconds): it is reported at once and asked
+again in the background, and listed again once it answers.
 """
 
 import asyncio
@@ -22,7 +24,7 @@ from typing import TYPE_CHECKING
 from pydantic import ValidationError
 
 from imaginer.domain import models as dto
-from imaginer.domain.errors import ImaginerError, InvalidRequestError
+from imaginer.domain.errors import EngineUnavailableError, ImaginerError, InvalidRequestError
 from imaginer.links.state import Link
 from imaginer.orchestration.event_bus import TurnManager
 from imaginer.services.conversations import ConversationService, encode_cursor
@@ -32,6 +34,7 @@ if TYPE_CHECKING:
 
 LOCAL = "local"
 REMOTE_TIMEOUT_S = 3.0
+RECHECK_AFTER_S = 5.0  # how often listings ask an unreachable link again (in the background)
 
 Position = tuple[str, str] | None  # (updated_at ISO, id); None: the source is exhausted
 
@@ -157,18 +160,25 @@ class Gallery:
     ) -> SourcePage:
         if link.status in ("unauthorized", "incompatible"):
             raise InvalidRequestError(link.detail or f"{link.peer_name} is {link.status}")
+        if link.status == "unreachable":
+            self._links.recheck(link, RECHECK_AFTER_S)
+            raise EngineUnavailableError(link.detail or f"{link.peer_name} is unreachable")
         params: dict[str, str | int] = {"limit": limit, "include_archived": include_archived}
         cursor = _source_cursor(position)
         if cursor is not None:
             params["cursor"] = cursor
-        response = await link.transport.request(
-            "GET",
-            "/v1/conversations",
-            params=params,
-            timeout_s=REMOTE_TIMEOUT_S,
-            attempts=1,
-            accept_status=frozenset({403}),
-        )
+        try:
+            response = await link.transport.request(
+                "GET",
+                "/v1/conversations",
+                params=params,
+                timeout_s=REMOTE_TIMEOUT_S,
+                attempts=1,
+                accept_status=frozenset({403}),
+            )
+        except ImaginerError:
+            self._links.recheck(link, 0)  # so the next listings know without waiting
+            raise
         if response.status_code == 403:
             raise InvalidRequestError(f"{link.peer_name} doesn't share its conversations")
         try:

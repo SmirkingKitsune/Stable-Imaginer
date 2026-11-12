@@ -51,17 +51,76 @@ Our notes on each family are in `src/imaginer/image_models/data/families.yaml`:
 - the name, repo and GGUF-architecture hints used to detect it;
 - **curated Hugging Face sources** for each slot, taken from the sd.cpp docs.
 
-Edit, control and decoder recipes (Qwen-Image-Edit, Kontext, ControlNets, PiD…) are hidden from
-the library. Video recipes are not included.
+Control, inpainting and decoder recipes (ControlNets, PiD…) and the community-LoRA edit
+recipes (Krea 2 edit, Anima edit) are hidden from the library. Video recipes are not included.
 
-What a family can do follows its recipe:
+What a family can do follows its recipe and our notes:
 
 - edit and multi-reference need its `ref_images` feature (Qwen-Image-2.1, FLUX.2, FLUX.3,
-  Fibo, P-H3…);
+  Fibo, P-H3, and the edit models below);
+- several images in one edit need a family that handles more than one (`max_refs`);
 - transparent output needs a prompt template (Qwen-Image-2.1, Ming-Image);
 - an edit with a mask needs a mask instruction (Qwen-Image-2.1).
 
 An engine running a family that lacks one of these doesn't offer it.
+
+## Edit models
+
+sd.cpp's edit models make an image from the images they are given (stable-diffusion.cpp
+`docs/edit.md`). Their cards are made like any other. Some only edit (`edit_only`): an engine
+running one offers no text-to-image, and the chat model gets no `generate_image` tool.
+
+| Family | Makes images from text | Images per edit | Notes |
+|---|---|---|---|
+| FLUX.1 Kontext dev | yes | 1 | CLIP-L, T5 and the FLUX VAE, as FLUX.1 dev; distilled guidance 2.5 |
+| Qwen Image Edit | no | 1 | Qwen 2.5 VL 7B text encoder, the Qwen Image VAE |
+| Qwen Image Edit 2509 / 2511 | no | 3 | the same files; "Picture 1, Picture 2" in prompts. 2511 gets `qwen_image_zero_cond_t=true` |
+| LongCat Image Edit | no | 1 | Qwen 2.5 VL 7B, the FLUX VAE |
+| Boogu Image Edit | no | any | Qwen3-VL 8B, the FLUX VAE |
+| Mage-Flow Edit | no | any | Qwen3-VL 4B, its own VAE; "Image 1, Image 2" |
+| Fibo 2.0 Edit Turbo | no | any | Qwen3-VL 4B, the FLUX.2 VAE; 4 steps at CFG 1 |
+| Fibo 2.0 Dev, LLaDA-Image | yes | any / 1 | LLaDA edits with its `connectors-edit` file, at sizes in multiples of 32 |
+
+How it works:
+
+- **Detection** tells an edit model from the text-to-image one it shares an architecture or a
+  Hub repo with: Kontext has FLUX.1 dev's tensors, and Comfy-Org's repos hold both. Its file
+  name, repo or Diffusers pipeline (`FluxKontextPipeline`, `QwenImageEditPlusPipeline`…) decides.
+- **The vision projector:** an edit model reads the images with its text encoder's vision
+  weights. A safetensors encoder (`qwen_2.5_vl_7b.safetensors`) has them; a GGUF one needs its
+  mmproj in `llm_vision`. Without it an edit-only card isn't ready, and a card that also makes
+  images from text can't edit (its card says so).
+- **Files are shared** with the cards of the same group only where both families' recipes name
+  the slot alike: a Qwen Image Edit card is offered Qwen-Image's 2.5-VL encoder, never
+  Qwen-Image-2.1's 3-VL one.
+- **Image guidance** (`img_cfg_scale`, sd.cpp's `--img-cfg-scale`) sets how closely an edit keeps
+  to its images, for the families with image CFG (Kontext, the Qwen edits, LongCat, Boogu,
+  Mage-Flow). Unset, it is 1.
+- **Reference image args** (`ref_image_args`) pass sd-server's per-request settings for how the
+  images are fed in, e.g. `resize_before_vae=false` or `vlm_max_size=512` (sd.cpp `docs/edit.md`).
+- **LoRAs** made for an edit model (their base model names Kontext, Qwen-Image-Edit…) are
+  grouped with it, not with the text-to-image model.
+
+### An edit card: one engine, two models
+
+An sd-server engine runs one card. To edit with an edit model next to the model you make
+images with, give the engine an **edit card** ("Use for edits on <engine>" on the card, or
+"Edits with" on the Engines screen; `edit_card` in the profile):
+
+- an edit restarts the engine with the edit card's files and waits until it answers
+  (`launch.swap_timeout_s`, 300 s by default); the job shows "Loading <card>" meanwhile. sd-server
+  reads the weights as the first image after a switch starts, so that image takes longer (on a
+  5090, about a minute for Qwen-Image-Edit-2511 Q8_0 from disk; less once it is cached);
+- the next text-to-image request switches it back. Consecutive edits (or images) don't switch;
+- each card keeps its own defaults and presets. The prompt bar offers the edit card's presets
+  too, marked "edits": a preset applies to the task its card serves;
+- the chat model is told how to prompt both;
+- only an engine launched here switches (it needs `launch`), one image at a time
+  (`concurrency: 1`). A stopped engine stays stopped: start it first. Which card is loaded is
+  not saved: the engine always starts with its model card.
+
+Each switch loads a model, which takes seconds to minutes. With the VRAM for both, a second
+engine routed for edits (`routing.edit`) avoids the switching.
 
 ## Importing a model
 
@@ -149,10 +208,12 @@ presets and default LoRAs copied, and it is pointed at that card. Nothing it doe
 | `width`, `height` | `width`, `height` (snapped to the family's size multiple) |
 | `steps`, `sampler`, `scheduler`, `flow_shift`, `sigmas` | `sample_params.sample_steps`, `sample_method`, `scheduler`, `flow_shift`, `custom_sigmas` |
 | `cfg_scale` | `sample_params.guidance.txt_cfg`. At 1, CFG is off (distilled models) and the negative prompt has no effect |
-| `guidance` | `sample_params.guidance.distilled_guidance` (FLUX.1 dev, FLUX.2 dev) |
+| `guidance` | `sample_params.guidance.distilled_guidance` (FLUX.1 dev, Kontext, FLUX.2 dev) |
+| `img_cfg_scale` | `sample_params.guidance.img_cfg`, edits only, for families with image CFG |
+| `ref_image_args` | `ref_image_args`, edits only (e.g. `resize_before_vae=false`) |
 | `clip_skip` | `clip_skip` (SD 1.x/2.x/SDXL) |
 | `extra_sample` | merged into `sample_params` (e.g. NitroSD's `shifted_timestep`) |
 | `negative_prompt` | `negative_prompt` |
 
 Presets set `steps`, `cfg_scale`, `sampler`, `scheduler`, `flow_shift`, `sigmas`,
-`guidance`, `clip_skip` and LoRAs, as before.
+`guidance`, `clip_skip`, `img_cfg_scale` and LoRAs.
