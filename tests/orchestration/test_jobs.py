@@ -14,7 +14,7 @@ from imaginer.core.ids import new_id
 from imaginer.db import models as orm
 from imaginer.db.engine import Database
 from imaginer.db.repositories import conversations as conv_repo
-from imaginer.domain.enums import ArtifactSource, Capability, JobStatus, JobTask
+from imaginer.domain.enums import ArtifactSource, BackendStatus, Capability, JobStatus, JobTask
 from imaginer.domain.errors import ConflictError, EngineError, JobCancelledError
 from imaginer.domain.events import EventType
 from imaginer.orchestration.gates import EngineGates
@@ -264,8 +264,8 @@ async def test_a_running_job_keeps_its_adapter_through_a_reconfigure(
     fake_sd.hold.set()
     assert len(await rig.jobs.wait(job_id)) == 1
     await asyncio.sleep(0)
-    with pytest.raises(RuntimeError, match="closed"):
-        await old.health()  # released by the job, so the old adapter was closed
+    health = await old.health()  # released by the job, so the old adapter was closed
+    assert health.status is BackendStatus.DOWN and "closed" in (health.detail or "")
     await registry.aclose()
 
 
@@ -293,3 +293,53 @@ async def test_a_job_says_while_the_engine_loads_another_card(
     }
     assert job.params["model_card"] == "edit"  # the card that made it
     await backend.aclose()
+
+
+async def _after_a_switch(
+    database: Database, fake_sd: FakeSdCpp, tmp_path: Path, **edit: Any
+) -> tuple[list[Any], Any]:
+    """A job on the edit card of an engine running its model card: each progress the job
+    published after it said it was loading the card, and the job once done."""
+    from tests.fakes.fake_switcher import FakeSwitcher, two_card_engine
+
+    fake_sd.step_delay_s = 0.05  # slow enough for polling to see the steps
+    fake_sd.lazy_load_s = 0.2  # sd-server reads the weights as the first image starts
+    backend = SdCppBackend("sd", two_card_engine(fake_sd.url, **edit))
+    face = backend.edit_face
+    assert face is not None
+    backend.switcher = face.switcher = FakeSwitcher()
+    await backend.health()
+    rig = Rig(database, backend, tmp_path / "store")
+    job_id = await rig.jobs.submit(
+        rig.spec(await rig.conversation(), backend=face, task=JobTask.T2I), rig.emit
+    )
+    await rig.jobs.wait(job_id)
+    await backend.aclose()
+    progress = [d.job.progress for t, d in rig.events if t is EventType.JOB_UPDATE]
+    loading = {"phase": "loading", "model": "edit"}
+    after = progress[progress.index(loading) :]
+    changes = [p for i, p in enumerate(after) if i == 0 or p != after[i - 1]]
+    return changes, await rig.jobs.get(job_id)
+
+
+async def test_a_job_says_it_loads_the_card_until_its_first_step(
+    database: Database, fake_sd: FakeSdCpp, tmp_path: Path
+) -> None:
+    progress, job = await _after_a_switch(database, fake_sd, tmp_path)
+    # The engine said it was ready before it read the weights: the label stays until the
+    # image's first step takes its place, never "starting" in between.
+    assert progress[0] == {"phase": "loading", "model": "edit"}
+    assert progress[1] is not None and progress[1]["step"] >= 1
+    assert all(p is not None and "phase" not in p for p in progress[1:])
+    assert job.status is JobStatus.SUCCEEDED
+    assert job.progress is not None and job.progress["step"] == job.progress["total_steps"]
+
+
+async def test_without_steps_the_label_ends_when_the_engine_is_ready(
+    database: Database, fake_sd: FakeSdCpp, tmp_path: Path
+) -> None:
+    # No previews, no step progress: it can't wait for one.
+    progress, job = await _after_a_switch(database, fake_sd, tmp_path, preview="none")
+    assert progress == [{"phase": "loading", "model": "edit"}, None]
+    assert job.status is JobStatus.SUCCEEDED and job.progress is None
+    assert fake_sd.requests[-1]["preview"] == "none"

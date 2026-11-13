@@ -417,6 +417,14 @@ class BackendEditInfo(BaseModel):
         default=None, description="Input images an edit takes at most (a mask counts as one)."
     )
     mask: bool = Field(default=True, description="Whether an edit can take a mask.")
+    mask_card: str | None = Field(
+        default=None,
+        description=(
+            "The card an edit with a mask runs instead, when the edit card takes no mask and "
+            "the engine's model card does."
+        ),
+    )
+    mask_card_name: str | None = None
     image_defaults: ImageDefaultsInfo | None = None
     image_presets: list[ImagePresetInfo] = Field(default_factory=list)
 

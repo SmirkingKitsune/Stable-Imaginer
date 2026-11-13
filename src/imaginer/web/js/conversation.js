@@ -26,7 +26,7 @@ import { convHash } from './origin.js';
 import { promptBar } from './promptbar.js';
 import {
   agentOfMessage, byLabel, cancelJob, connection, currentBranch, editEngine, ensureLoaded, imageEngine, images, libraryLora,
-  loraLibrary, on, pathOf, remove, rename, retry, reloadConversation, running, select, send, setArchivedFlag, siblingsOf,
+  loraLibrary, maskHint, on, pathOf, remove, rename, retry, reloadConversation, running, select, send, setArchivedFlag, siblingsOf,
   stale, stop,
 } from './store.js';
 
@@ -438,19 +438,21 @@ export function conversationScreen({ id, navigate, focusBar = false }) {
         retryButton(finished, 'Try again on a new branch')));
     }
     const inputs = name === 'edit_image' && Array.isArray(args?.images) ? args.images : [];
+    // A painted mask rides in image_options, not the call's arguments: the result names it.
+    const mask = args?.mask ?? outcome?.mask;
     // set_portrait: what the portrait is now, and the self-portrait it becomes.
     const self = name === 'set_portrait' && outcome?.status !== 'error' ? portraitLineage(agent, outcome, job) : null;
     if (gaveUp) {
       const where = stepText ? `Progress stopped at step ${stepText.replace('/', ' / ')}.` : 'Progress stopped.';
       parts.push(h('div.tool-error', h('span', `${where} Reconnect to see the result. Nothing is lost.`)));
     } else if (live) {
-      parts.push(jobPanel(job, shown, inputs, args?.mask, lost, self));
+      parts.push(jobPanel(job, shown, inputs, mask, lost, self));
     } else if (self && !outs.length) {
       parts.push(h('div.fig-with-lineage', self));
     }
     if (outs.length) {
       const figs = h('div.figures', outs.map((a, i) => figure(a, finished, i === outs.length - 1 ? attemptSwitch : null)));
-      parts.push(inputs.length ? h('div.fig-with-lineage', figs, lineage(inputs, args?.mask, outs))
+      parts.push(inputs.length ? h('div.fig-with-lineage', figs, lineage(inputs, mask, outs))
         : self ? h('div.fig-with-lineage', figs, self) : figs);
     }
     return h('div.tool', parts);
@@ -623,7 +625,7 @@ export function conversationScreen({ id, navigate, focusBar = false }) {
         type: 'button', onclick: () => bar.addArtifact(a, { first: true, prefill: `Edit @${a.label}: ` }),
       }, icon('pencil', 13), 'Edit'),
       edit?.mask !== false && edit && h('button.mini', {
-        type: 'button', title: 'Paint a mask for an edit', onclick: () => navigate(convHash(id, 'mask', a.label)),
+        type: 'button', title: maskHint(edit, 'Paint a mask for an edit'), onclick: () => navigate(convHash(id, 'mask', a.label)),
       }, icon('brush', 13), 'Mask'),
       retryButton(result, 'Run this call again on a new branch'),
       edit && !single && h('button.mini.square', {

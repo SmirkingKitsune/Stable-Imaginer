@@ -42,6 +42,7 @@ from imaginer.backends.base import (
     GenRequest,
     ImageResult,
     LoadingCallback,
+    ProgressCallback,
 )
 from imaginer.backends.common import (
     WordsSource,
@@ -130,7 +131,31 @@ def size_multiple(config: SdCppBackendConfig | None) -> int:
     return family.size_multiple if family is not None else LEGACY_SIZE_MULTIPLE
 
 
+def mask_instruction(config: SdCppBackendConfig) -> str | None:
+    """How an edit's mask is explained to the model; None when its family takes no mask."""
+    if config.mask_instruction is not None:
+        return config.mask_instruction
+    family = recipes.family(config.family)
+    return DEFAULT_MASK_INSTRUCTION if family is None else family.mask
+
+
 Face = Literal["main", "edit"]
+
+
+def mask_face(config: SdCppBackendConfig) -> Face | None:
+    """Which card an edit with a mask runs on an engine with an edit card (None without
+    one): the edit card, unless it takes no mask and the model card edits with one, as
+    Qwen-Image-2.1 does next to FLUX.1 Kontext."""
+    view = config.edit_view
+    if view is None:
+        return None
+    if (
+        mask_instruction(view) is None
+        and mask_instruction(config) is not None
+        and Capability.EDIT in expected_capabilities(config)
+    ):
+        return "main"
+    return "edit"
 
 
 class CardSwitcher(Protocol):
@@ -167,6 +192,37 @@ class _ServerState:
     preview_modes: set[str] = field(default_factory=set)
     loras: dict[str, dict[str, Any]] | None = None  # path -> entry; None: not listed
     recipes_read: bool = False
+
+
+@dataclass(slots=True)
+class _LoadingLabel:
+    """A card switch's "loading" label on the job. sd-server says it is ready before it has
+    read the weights, and reads them as it starts the first image, so the label stays until
+    that image's first step takes its place. A model that reports no steps drops it as soon
+    as the engine is ready."""
+
+    on_loading: LoadingCallback | None
+    held: bool = False  # the switch is over, and the label waits for a step
+
+    async def notify(self, card: str | None) -> None:
+        if self.on_loading is None:
+            return
+        if card is None:
+            self.held = True
+        else:
+            await self.on_loading(card)
+
+    def until_step(self, on_progress: ProgressCallback) -> ProgressCallback:
+        async def progress(step: GenProgress) -> None:
+            self.held = False  # the step is the job's progress now
+            await on_progress(step)
+
+        return progress
+
+    async def drop(self) -> None:
+        if self.held and self.on_loading is not None:
+            self.held = False
+            await self.on_loading(None)
 
 
 class SdCppBackend:
@@ -258,12 +314,7 @@ class SdCppBackend:
         return self._family is None or feature in self._family.features
 
     def _mask_instruction(self) -> str | None:
-        """How a mask is explained to the model; None when its family takes no mask."""
-        if self._config.mask_instruction is not None:
-            return self._config.mask_instruction
-        if self._family is None:
-            return DEFAULT_MASK_INSTRUCTION
-        return self._family.mask
+        return mask_instruction(self._config)
 
     def update_config(self, config: BackendConfig) -> bool:
         """Take new presets or defaults as they are: requests read them. False when
@@ -489,10 +540,11 @@ class SdCppBackend:
     async def _run(
         self, req: GenRequest, refs: list[str], base_size: tuple[int, int] | None = None
     ) -> list[ImageResult]:
+        label = _LoadingLabel(req.on_loading)
         if self._face is not None and self.switcher is not None:
             # The engine may run the other card: switch it to this face's first.
             await self.switcher.ensure(
-                self.name, self._face, self._config, notify=req.on_loading, probe=self.probe
+                self.name, self._face, self._config, notify=label.notify, probe=self.probe
             )
         params = self.resolved_params(req, base_size)
         # Only an engine launched here has its LoRA folder on this machine, the folder its
@@ -508,12 +560,18 @@ class SdCppBackend:
             )
             req = replace(req, prompt=prompt)
         body = self._body(req, params, refs)
+        if body["preview"] == "none" or req.on_progress is None:
+            await label.drop()  # no step will take its place
+        elif label.held:
+            req = replace(req, on_progress=label.until_step(req.on_progress))
         # Hashed while the image is made.
         hashing = asyncio.ensure_future(with_sha256(folder, params.get("loras", [])))
         try:
-            return await self._follow(req, params, body, hashing)
+            results = await self._follow(req, params, body, hashing)
         finally:
             hashing.cancel()
+        await label.drop()  # polling saw none of its steps
+        return results
 
     async def _follow(
         self,

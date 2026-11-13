@@ -2,12 +2,14 @@
 face (its card's family, presets and limits), text-to-image the main one, and each makes
 sure the engine runs its card first (the engine service switches it; faked here)."""
 
+from pathlib import Path
+
 import pytest
 
 from imaginer.backends.base import EditRequest, GenRequest, ImageInput
 from imaginer.backends.registry import BackendRegistry
-from imaginer.backends.sdcpp import SdCppBackend
-from imaginer.core.config import ImagePreset, RoutingConfig
+from imaginer.backends.sdcpp import SdCppBackend, mask_face
+from imaginer.core.config import ImagePreset, RoutingConfig, SdCppLaunch
 from imaginer.domain.enums import BackendStatus, Capability
 from imaginer.domain.errors import EngineUnavailableError, InvalidRequestError
 from tests.conftest import SettingsFactory, sd_config
@@ -87,6 +89,61 @@ async def test_the_registry_leases_the_face_a_task_needs(
     assert [p.name for p in info.image_presets] == ["draft"]
     assert Capability.MULTI_REF in info.capabilities  # the engine edits with several images
     await registry.aclose()
+
+
+async def test_a_masked_edit_runs_on_the_model_card_when_only_it_takes_a_mask(
+    make_settings: SettingsFactory, fake_sd: FakeSdCpp
+) -> None:
+    # Qwen-Image-Edit-2511 takes no mask; Qwen-Image-2.1 edits with one.
+    settings = make_settings(
+        backends={"sd": two_card_engine(fake_sd.url)}, routing=RoutingConfig(t2i="sd", edit="sd")
+    )
+    registry = BackendRegistry.from_settings(settings)
+    switcher = FakeSwitcher()
+    registry.set_switcher(switcher)
+    lease = await registry.image_backend("edit", require={Capability.MULTI_REF}, mask=True)
+    assert isinstance(lease.backend, SdCppBackend) and lease.backend.face == "main"
+    await lease.backend.edit(EditRequest(prompt="a red sky", seed=1, images=(PHOTO,), mask=PHOTO))
+    lease.release()
+    assert [face for _, face, _ in switcher.calls] == ["main"]  # the engine runs the model card
+    body = fake_sd.requests[-1]
+    assert len(body["ref_images"]) == 2 and "mask" in body["prompt"]  # Qwen-Image-2.1's way
+    # Its presets are the model card's; the edit card's are for edits without a mask.
+    assert registry.image_preset("edit", None, "draft", mask=True) is not None
+    assert registry.image_preset("edit", None, "lightning", mask=True) is None
+    with pytest.raises(InvalidRequestError, match="lightning"):
+        await registry.image_backend("edit", preset="lightning", mask=True)
+    plain = await registry.image_backend("edit")
+    assert isinstance(plain.backend, SdCppBackend) and plain.backend.face == "edit"
+    plain.release()
+    info = (await registry.describe())[0]
+    assert info.edit is not None and info.edit.mask  # the engine can still mask
+    assert (info.edit.mask_card, info.edit.mask_card_name) == ("main", "Card main")
+    await registry.aclose()
+
+
+def test_a_masked_edit_stays_on_the_edit_card_unless_only_the_model_card_takes_masks() -> None:
+    url = dead_url()
+    assert mask_face(two_card_engine(url)) == "main"
+    # An edit card that takes a mask (here, by its config) keeps masked edits.
+    masking = two_card_engine(url, mask_instruction="White is the area to change.")
+    assert mask_face(masking) == "edit"
+    # A model card that takes none either: the edit card refuses the mask, as it would alone.
+    flux = sd_config(
+        url,
+        family="flux1-dev",
+        model_card="main",
+        edit_card="edit",
+        launch=SdCppLaunch(diffusion_model=Path("main.gguf")),
+    )
+    kontext = sd_config(
+        url,
+        family="flux1-kontext",
+        model_card="edit",
+        launch=SdCppLaunch(diffusion_model=Path("edit.gguf")),
+    )
+    assert mask_face(flux.model_copy(update={"edit_view": kontext})) == "edit"
+    assert mask_face(sd_config(url, family="qwen-image-21")) is None  # no edit card
 
 
 async def test_work_waits_for_a_switching_engine_but_not_a_stopped_one(

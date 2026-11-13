@@ -14,8 +14,9 @@ last lease on it is released, so a long job keeps its client.
 
 An sd-server with an edit card has two faces, one per card (``SdCppBackend.edit_face``):
 an edit gets the edit face, with that card's presets and capabilities, and the face
-switches the engine to its card when the job runs. A lease on either face counts as one on
-the engine's adapter.
+switches the engine to its card when the job runs. An edit with a mask gets the model
+card's face instead when only that card takes a mask (FLUX.1 Kontext takes none,
+Qwen-Image-2.1 does). A lease on either face counts as one on the engine's adapter.
 """
 
 import asyncio
@@ -29,6 +30,7 @@ from imaginer.backends.common import WordsSource, find_preset, preset_loras
 from imaginer.backends.diffusers_inproc import DiffusersBackend, missing_dependencies
 from imaginer.backends.llamacpp import LlamaCppBackend
 from imaginer.backends.sdcpp import CardSwitcher, SdCppBackend
+from imaginer.backends.sdcpp import mask_face as sdcpp_mask_face
 from imaginer.backends.sdcpp import size_multiple as sdcpp_size_multiple
 from imaginer.core.clock import utcnow
 from imaginer.core.config import (
@@ -323,12 +325,15 @@ class BackendRegistry:
         *,
         require: Iterable[Capability] = (),
         preset: str | None = None,
+        mask: bool = False,
     ) -> Lease[ImageBackend]:
         """A lease on the ready image backend; release it when the job is over. ``preset``
-        must be one of its presets; with LoRAs to apply it must also offer ``lora``."""
+        must be one of its presets; with LoRAs to apply it must also offer ``lora``. An edit
+        with a ``mask`` may get the engine's model card rather than its edit card."""
         base = Capability.T2I if task == "t2i" else Capability.EDIT
-        entry = await self._ready(task, name, BackendKind.IMAGE, {base, *require}, preset)
-        return Lease(self, cast(ImageBackend, _face(entry, task)), owner=entry.backend)
+        entry = await self._ready(task, name, BackendKind.IMAGE, {base, *require}, preset, mask)
+        face = _face(entry, _route(entry, task, mask))
+        return Lease(self, cast(ImageBackend, face), owner=entry.backend)
 
     async def _ready(
         self,
@@ -337,17 +342,19 @@ class BackendRegistry:
         kind: BackendKind,
         required: set[Capability],
         preset: str | None = None,
+        mask: bool = False,
     ) -> _Entry:
         """The selected backend once it is healthy and capable. If it is reconfigured while
         being probed, the new one is checked instead: no lease starts on a retired adapter."""
         while True:
             entry = self._select(task, name, kind)
+            card = _route(entry, task, mask)
             needs = set(required)
             if kind is BackendKind.IMAGE:
-                chosen = find_preset(_card_label(entry, task), _presets(entry, task), preset)
-                if _loras(entry, chosen, task):
+                chosen = find_preset(_card_label(entry, card), _presets(entry, card), preset)
+                if _loras(entry, chosen, card):
                     needs.add(Capability.LORA)
-            await self._ensure_ready(entry, needs, task)
+            await self._ensure_ready(entry, needs, card)
             if self._entries.get(entry.name) is entry:
                 return entry
 
@@ -385,12 +392,13 @@ class BackendRegistry:
             )
 
     def image_preset(
-        self, task: Literal["t2i", "edit"], name: str | None, preset: str
+        self, task: Literal["t2i", "edit"], name: str | None, preset: str, *, mask: bool = False
     ) -> ImagePreset | None:
-        """The preset as the backend a ``task`` call would use has it; None if it doesn't."""
+        """The preset as the card a ``task`` call would run has it (for an edit with a
+        ``mask``, maybe the model card); None if it doesn't."""
         try:
             entry = self._select(task, name, BackendKind.IMAGE)
-            return find_preset("", _presets(entry, task), preset)
+            return find_preset("", _presets(entry, _route(entry, task, mask)), preset)
         except ImaginerError:
             return None
 
@@ -510,15 +518,23 @@ class BackendRegistry:
             return None
         config = _face_config(entry, "edit")
         card = getattr(entry.config, "edit_card", None) if face is not entry.backend else None
+        # An edit card that takes no mask leaves masked edits to the model card, if it can.
+        masked_on_model_card = _route(entry, "edit", mask=True) == "t2i"
+        mask_card = getattr(entry.config, "model_card", None) if masked_on_model_card else None
         return BackendEditInfo(
             card=card,
-            card_name=self._switcher.card_name(card) if card and self._switcher else None,
+            card_name=self._card_name(card),
             capabilities=sorted(caps),
             max_ref_images=getattr(face, "max_ref_images", None),
-            mask=bool(getattr(face, "takes_mask", True)),
+            mask=masked_on_model_card or bool(getattr(face, "takes_mask", True)),
+            mask_card=mask_card,
+            mask_card_name=self._card_name(mask_card),
             image_defaults=_image_defaults(config, face),
             image_presets=_preset_infos(_presets(entry, "edit")),
         )
+
+    def _card_name(self, card: str | None) -> str | None:
+        return self._switcher.card_name(card) if card and self._switcher else None
 
     async def aclose(self) -> None:
         """Close every adapter, retired ones still leased included (this is shutdown)."""
@@ -559,6 +575,15 @@ def _face(entry: _Entry, task: Task) -> Backend:
     assert entry.backend is not None
     edit = getattr(entry.backend, "edit_face", None)
     return edit if task == "edit" and edit is not None else entry.backend
+
+
+def _route(entry: _Entry, task: Task, mask: bool = False) -> Task:
+    """Whose card serves a request, named by the task that card is for: an edit with a mask
+    runs on an engine's model card ("t2i") when its edit card takes no mask and the model
+    card edits with one."""
+    if task == "edit" and mask and isinstance(entry.config, SdCppBackendConfig):
+        return "t2i" if sdcpp_mask_face(entry.config) == "main" else task
+    return task
 
 
 def _face_config(entry: _Entry, task: Task) -> BackendConfig:

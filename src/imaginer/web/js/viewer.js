@@ -28,7 +28,7 @@ import { convHash } from './origin.js';
 import { promptBar } from './promptbar.js';
 import {
   agentOf, agentOfMessage, attacherOf, branchAt, byLabel, cancelJob, currentBranch, editEngine, ensureLoaded, imageEngine,
-  images, lineageOf, on, onPath, pathOf, retry, running, select, send, stop,
+  images, lineageOf, maskHint, on, onPath, pathOf, retry, running, select, send, stop,
 } from './store.js';
 
 const SOURCE_WORD = { upload: 'upload', generated: 'generated', edited: 'edited', derived: 'derived' };
@@ -151,6 +151,7 @@ export function viewerScreen({ id, label, navigate }) {
     const edit = engine ? engine.edit : {}; // the backends aren't loaded yet: offer them
     editBtn.hidden = !edit;
     maskBtn.hidden = !edit || edit.mask === false;
+    maskBtn.title = maskHint(edit, 'Mask: paint the area to change');
   };
   editActions();
   const actions = h('div.side-actions',

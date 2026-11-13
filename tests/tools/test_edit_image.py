@@ -26,6 +26,7 @@ from imaginer.tools.base import ToolContext, ToolRegistry
 from imaginer.tools.edit_image import EditImageTool
 from tests.conftest import SettingsFactory, sd_config
 from tests.fakes.fake_sdcpp import FakeSdCpp
+from tests.fakes.fake_switcher import FakeSwitcher, two_card_engine
 from tests.helpers import image_bytes
 
 
@@ -220,6 +221,34 @@ async def test_user_mask_and_sampler_overrides(bench: Bench, fake_sd: FakeSdCpp)
     child = await bench.artifacts.get_by_label(cid, output["label"])
     lineage = await bench.artifacts.lineage(child.id)
     assert ("mask-2", "mask") in [(p.label, p.relation.value) for p in lineage.parents]
+
+
+async def test_a_masked_edit_runs_on_the_model_card_when_the_edit_card_takes_no_mask(
+    database: Database, make_settings: SettingsFactory, fake_sd: FakeSdCpp, tmp_path: Path
+) -> None:
+    # Qwen-Image-2.1 makes images and edits with masks; Qwen-Image-Edit-2511 edits without.
+    bench = Bench(database, two_card_engine(fake_sd.url), make_settings, tmp_path / "s")
+    switcher = FakeSwitcher()
+    bench.registry.set_switcher(switcher)
+    cid = await bench.conversation()
+    await bench.upload(cid, image_bytes(320, 256, color=(200, 100, 50)))
+    await bench.upload(cid, image_bytes(320, 256, color=(255, 255, 255)), ArtifactKind.MASK)
+
+    # The edit card's preset is for its edits: a masked edit runs without it.
+    options = ImageRequestOptions(mask="mask-2", preset="lightning")
+    content = await bench.edit(cid, {"images": ["img-1"], "prompt": "stormy sky"}, options)
+    assert content["status"] == "succeeded" and content["mask"] == "mask-2"
+    assert switcher.calls[-1][1:] == ("main", "main")  # the model card's face, and card
+    body = fake_sd.requests[-1]
+    assert len(body["ref_images"]) == 2 and "mask" in body["prompt"]
+    assert body["sample_params"].get("sample_steps") != 4
+
+    plain = ImageRequestOptions(preset="lightning")
+    content = await bench.edit(cid, {"images": ["img-1"], "prompt": "brighter"}, plain)
+    assert content["status"] == "succeeded"
+    assert switcher.calls[-1][1:] == ("edit", "edit")
+    assert fake_sd.requests[-1]["sample_params"]["sample_steps"] == 4  # lightning
+    await bench.registry.aclose()
 
 
 async def test_a_mask_is_not_an_image_to_edit(bench: Bench, fake_sd: FakeSdCpp) -> None:

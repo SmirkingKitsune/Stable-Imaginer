@@ -58,7 +58,9 @@ class GenProgress:
 
 ProgressCallback = Callable[[GenProgress], Awaitable[None]]
 SubmittedCallback = Callable[[str], Awaitable[None]]  # receives the engine's own job id
-# The model the engine is switching to before it can start (an edit card swap), then None.
+# The model the engine is switching to before it can start (an edit card swap), then None
+# once it has loaded. sd-server's adapter skips the None when a step will follow, which then
+# takes its place: the engine reads the weights as it starts the image.
 LoadingCallback = Callable[[str | None], Awaitable[None]]
 
 

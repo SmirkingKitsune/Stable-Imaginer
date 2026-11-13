@@ -298,6 +298,8 @@ export function promptBar({
         editPresets.map((p) => pick(preset?.name === p.name, `${p.name} · edits`, () => setOption({ preset: p.name })))),
       h('span.tray-hint', preset
         ? `${presetSummary(preset)}${preset.edits ? ` · for edits with ${preset.edits}` : ''}`
+          // A masked edit runs the model card when the edit card takes no mask: not with this.
+          + (preset.edits && maskLabel() && edit?.mask_card_name ? ` · not this masked edit (it runs ${edit.mask_card_name})` : '')
         : `${engine?.name ?? 'backend'} defaults`));
     const loraCell = engine?.available_loras?.length > 0 && lorasCell(engine, preset);
 

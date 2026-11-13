@@ -37,6 +37,7 @@ from PIL import UnidentifiedImageError
 from pydantic import ValidationError
 
 from imaginer.backends.common import expand_path
+from imaginer.backends.sdcpp import mask_face as sdcpp_mask_face
 from imaginer.core.clock import utcnow
 from imaginer.core.config import (
     BackendConfig,
@@ -285,7 +286,8 @@ class ModelLibrary:
         how to prompt that too, for edit_image."""
         if self._engines is None:
             return None
-        hint = _card_hint(self.engine_card(engine))
+        main = self.engine_card(engine)
+        hint = _card_hint(main)
         with contextlib.suppress(NotFoundError):
             config = self._engines.effective(engine)
             if hint is None:
@@ -293,10 +295,16 @@ class ModelLibrary:
                 hint = family.prompt_hint() if family is not None else None
             edit_card = getattr(self._engines.own_config(engine), "edit_card", None)
             if edit_card and getattr(config, "edit_view", None) is not None:
+                notes = []
                 edit_hint = _card_hint(self.card(edit_card))
                 if edit_hint and edit_hint != hint:
-                    edit = f"For edit_image (it runs {self.card_name(edit_card)}): {edit_hint}"
-                    hint = f"{hint} {edit}" if hint else edit
+                    edits = self.card_name(edit_card)
+                    notes.append(f"For edit_image (it runs {edits}): {edit_hint}")
+                if isinstance(config, SdCppBackendConfig) and sdcpp_mask_face(config) == "main":
+                    # The edit card takes no mask, so a masked edit runs on the model card.
+                    who = main.name if main is not None else "the model card"
+                    notes.append(f"An edit_image call with a mask runs {who} instead.")
+                hint = " ".join([*([hint] if hint else []), *notes]) or None
         return hint
 
     def _sdcpp_engines(self) -> list[tuple[str, SdCppBackendConfig]]:

@@ -244,7 +244,9 @@ class PeerEngines:
         async for state in self._ensure_ready(name):
             yield "status", state
         task: Literal["t2i", "edit"] = "edit" if body.op == "edit" else "t2i"
-        lease = await self._registry.image_backend(task, name, require=require, preset=body.preset)
+        lease = await self._registry.image_backend(
+            task, name, require=require, preset=body.preset, mask=body.mask is not None
+        )
         request_id = new_id()
         try:
             if self._gates.queue_depth(name):

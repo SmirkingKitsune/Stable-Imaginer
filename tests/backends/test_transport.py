@@ -134,6 +134,25 @@ async def test_invalid_json_marks_backend_down(kind: str) -> None:
         await backend.aclose()
 
 
+async def test_a_probe_of_a_closed_adapter_finds_the_engine_down() -> None:
+    # A reconfigured engine's old adapter is closed once released; a health probe holds no
+    # lease, so one can still reach it.
+    transport = _transport(
+        "http://engine",
+        client=httpx.AsyncClient(
+            base_url="http://engine",
+            transport=httpx.MockTransport(lambda _: httpx.Response(200, json={})),
+        ),
+    )
+    backend = SdCppBackend("engine", sd_config("http://engine"), transport=transport)
+    await backend.aclose()
+    health = await backend.health()
+    assert health.status is BackendStatus.DOWN and "closed" in (health.detail or "")
+    with pytest.raises(EngineUnavailableError, match="closed"):
+        async with transport.stream("POST", "/r"):
+            pass
+
+
 @pytest.fixture
 def url(_server: tuple[Scripted, LiveServer]) -> str:
     return _server[1].url

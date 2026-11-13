@@ -88,6 +88,7 @@ class HttpTransport:
         if timeout_s is not None:
             extra["timeout"] = timeout_s
         for attempt in range(1, max_attempts + 1):
+            self._check_open()
             try:
                 response = await self._client.request(
                     method, path, json=json, params=params, **extra
@@ -132,6 +133,7 @@ class HttpTransport:
         """
         method = method.upper()
         for attempt in range(1, self._retry.attempts + 1):
+            self._check_open()
             request = self._client.build_request(method, path, json=json)
             try:
                 response = await self._client.send(request, stream=True)
@@ -156,6 +158,16 @@ class HttpTransport:
                 return
             finally:
                 await response.aclose()
+
+    def _check_open(self) -> None:
+        """A reconfigured engine's old adapter is closed once nothing holds it. A health
+        probe still on its way to it (probes hold no lease) gets an engine error, not
+        httpx's RuntimeError."""
+        if self._client.is_closed:
+            raise EngineUnavailableError(
+                f"{self.name}'s connection was closed (the engine was reconfigured)",
+                backend=self.name,
+            )
 
     # --- policy ---------------------------------------------------------------
 

@@ -53,6 +53,9 @@ class FakeSdCpp:
     started: threading.Event = field(default_factory=threading.Event)  # a job began generating
     model_name: str = "qwen_image_2.1-Q4_K.gguf"  # the loaded model it reports
     color_salt: int = 0  # shifts every image's colour: tells two loaded models' images apart
+    # Seconds its first job spends reading the weights before step 1, as sd-server does
+    # without --eager-load: it answers ready before it has read them.
+    lazy_load_s: float = 0.0
 
     def reset(self) -> None:
         self.state = "ready"
@@ -71,6 +74,7 @@ class FakeSdCpp:
         self.requests.clear()
         self.cancels.clear()
         self.started = threading.Event()
+        self.lazy_load_s = 0.0
 
     def app(self) -> Starlette:
         return Starlette(
@@ -182,6 +186,9 @@ class FakeSdCpp:
             return
         job.update(status="generating", started=1, queue_position=0)
         self.started.set()
+        if self.lazy_load_s:
+            reading, self.lazy_load_s = self.lazy_load_s, 0.0
+            await asyncio.sleep(reading)
         steps = (body.get("sample_params") or {}).get("sample_steps") or self.default_steps
         for step in range(1, steps + 1):
             if body.get("preview", "none") != "none":

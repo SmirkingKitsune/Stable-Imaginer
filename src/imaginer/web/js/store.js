@@ -876,6 +876,11 @@ export const editEngine = () =>
  * many images an edit takes and whether it takes a mask. null when nothing edits. */
 export const editInfo = () => editEngine()?.edit ?? null;
 
+/** A Mask button's tooltip: which card a masked edit runs when the edit card takes no mask
+ * (FLUX.1 Kontext) and the engine's model card does (Qwen-Image-2.1). */
+export const maskHint = (edit, text) =>
+  edit?.mask_card_name ? `${text} (masked edits run ${edit.mask_card_name})` : text;
+
 /** The picked preset, if the image backend the next message will use has it, for making
  * images or (an edit card's) for edits. */
 export const imagePreset = () => {

@@ -103,7 +103,7 @@ class EditImageTool(Tool):
             # The user painted this mask for the edit; the model doesn't have to name it.
             args = args.model_copy(update={"mask": options.mask})
         params = sampler_params(ctx)
-        preset = user_preset(options, self._registry, "edit")
+        preset = user_preset(options, self._registry, "edit", mask=bool(args.mask))
         loras = user_loras(options)
         labels = [*args.images, *([args.mask] if args.mask else [])]
         resolved = await self._resolve(ctx.conversation_id, labels, mask=args.mask)
@@ -116,8 +116,13 @@ class EditImageTool(Tool):
         if loras:
             require.add(Capability.LORA)
         try:
+            # A masked edit may run on the engine's model card: its edit card may take no mask.
             lease = await self._registry.image_backend(
-                "edit", options.backend if options else None, require=require, **preset
+                "edit",
+                options.backend if options else None,
+                require=require,
+                mask=bool(args.mask),
+                **preset,
             )
         except CapabilityUnavailableError as exc:
             if exc.extra.get("missing") == [Capability.MULTI_REF]:

@@ -108,12 +108,17 @@ images with, give the engine an **edit card** ("Use for edits on <engine>" on th
 "Edits with" on the Engines screen; `edit_card` in the profile):
 
 - an edit restarts the engine with the edit card's files and waits until it answers
-  (`launch.swap_timeout_s`, 300 s by default); the job shows "Loading <card>" meanwhile. sd-server
-  reads the weights as the first image after a switch starts, so that image takes longer (on a
-  5090, about a minute for Qwen-Image-Edit-2511 Q8_0 from disk; less once it is cached);
+  (`launch.swap_timeout_s`, 300 s by default). sd-server answers before it has read the
+  weights, and reads them as the first image starts, so the job shows "Loading <card>" until
+  that image's first step (on a 5090, about a minute for Qwen-Image-Edit-2511 Q8_0 from disk;
+  seconds once it is cached). A family without previews reports no steps: its label ends when
+  the engine answers;
 - the next text-to-image request switches it back. Consecutive edits (or images) don't switch;
 - each card keeps its own defaults and presets. The prompt bar offers the edit card's presets
   too, marked "edits": a preset applies to the task its card serves;
+- an edit with a mask runs on the model card when the edit card takes no mask and the model
+  card does: Qwen-Image-2.1 next to Kontext or Qwen-Image-Edit keeps Mask available. That edit
+  uses the model card's presets, and the Mask button's tooltip names the card;
 - the chat model is told how to prompt both;
 - only an engine launched here switches (it needs `launch`), one image at a time
   (`concurrency: 1`). A stopped engine stays stopped: start it first. Which card is loaded is

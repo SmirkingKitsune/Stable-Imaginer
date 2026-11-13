@@ -340,7 +340,8 @@ async def test_an_engine_switches_to_its_edit_card_for_edits(
     backend = {b["name"]: b for b in (await client.get("/v1/backends")).json()}["sd"]
     assert backend["image_defaults"]["size_multiple"] == 64  # SDXL's
     assert backend["edit"]["card"] == edit["id"] and backend["edit"]["max_ref_images"] == 3
-    assert backend["edit"]["mask"] is False
+    assert backend["edit"]["mask"] is False  # SDXL takes no mask either
+    assert backend["edit"]["mask_card"] is None
     container: Container = app.state.container
     entry = container.registry._entries["sd"]
     assert entry.backend is not None
@@ -366,6 +367,26 @@ async def test_an_engine_switches_to_its_edit_card_for_edits(
     # The engine's own Engines-screen edit: clearing it.
     cleared = await client.patch("/v1/engines/sd", json={"edit_card": ""})
     assert cleared.status_code == 200 and cleared.json()["edit_card"] is None
+
+
+async def test_masked_edits_run_the_model_card_when_the_edit_card_takes_no_mask(
+    client: httpx.AsyncClient, app: FastAPI, weights: dict[str, Path]
+) -> None:
+    (main,) = (await client.get("/v1/models")).json()["items"]  # "old" runs Qwen-Image-2.1
+    edit = await _edit_card(client, weights, "edit_llm")
+    resp = await client.post(f"/v1/models/{edit['id']}/use", json={"engine": "old", "role": "edit"})
+    assert resp.status_code == 200, resp.text
+    backend = {b["name"]: b for b in (await client.get("/v1/backends")).json()}["old"]
+    assert backend["edit"]["card"] == edit["id"]
+    # Qwen-Image-Edit-2511 takes no mask and Qwen-Image-2.1 does: masked edits run that.
+    assert backend["edit"]["mask"] is True
+    assert (backend["edit"]["mask_card"], backend["edit"]["mask_card_name"]) == (
+        main["id"],
+        main["name"],
+    )
+    container: Container = app.state.container
+    hint = container.models.prompt_hint("old") or ""
+    assert f"An edit_image call with a mask runs {main['name']} instead." in hint
 
 
 async def test_an_edit_card_needs_an_engine_started_here(

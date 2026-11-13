@@ -74,17 +74,22 @@ def user_preset(
     options: ImageRequestOptions | None,
     registry: "BackendRegistry | None" = None,
     task: Literal["t2i", "edit"] = "t2i",
+    *,
+    mask: bool = False,
 ) -> dict[str, Any]:
     """The backend preset the user picked, as keyword arguments for the lease and the job
     (only the user picks one: its LoRAs and settings aren't offered to the model). A preset
-    of an engine's edit card is for its edits, and one of its model card for the rest: the
-    other task goes without it."""
+    of an engine's edit card is for its edits, and one of its model card for the rest (and
+    for edits with a ``mask``, when only the model card takes one): a request the other card
+    runs goes without it."""
     if options is None or not options.preset:
         return {}
     if registry is not None:
-        other: Literal["t2i", "edit"] = "edit" if task == "t2i" else "t2i"
-        mine = registry.image_preset(task, options.backend, options.preset)
-        if mine is None and registry.image_preset(other, options.backend, options.preset):
+        mine = registry.image_preset(task, options.backend, options.preset, mask=mask)
+        tasks: tuple[Literal["t2i", "edit"], ...] = ("t2i", "edit")
+        if mine is None and any(
+            registry.image_preset(card, options.backend, options.preset) for card in tasks
+        ):
             return {}
     return {"preset": options.preset}
 
