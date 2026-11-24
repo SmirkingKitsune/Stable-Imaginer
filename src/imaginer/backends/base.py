@@ -18,6 +18,7 @@ __all__ = [
     "ChatDelta",
     "ChatRequest",
     "EditRequest",
+    "EngineReport",
     "GenProgress",
     "GenRequest",
     "ImageBackend",
@@ -36,6 +37,18 @@ class BackendHealth:
     latency_ms: float | None = None
     detail: str | None = None
     probed_at: datetime | None = None
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class EngineReport:
+    """What the process of an engine this server started showed when work on it failed
+    (engines/diagnostics.py): enough for the chat model to say why, and what might fix it."""
+
+    state: str  # its process: running, exited (on its own), stopped (by us)
+    summary: str | None = None  # the log line that best says what went wrong
+    exit: str | None = None  # how it exited: "exit code 3, aborted"
+    exited_at: datetime | None = None
+    details: dict[str, Any] = field(default_factory=dict)  # for the model: files, log, hints
 
 
 # --- images -------------------------------------------------------------------

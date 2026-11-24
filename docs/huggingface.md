@@ -130,6 +130,12 @@ needs nothing else:
   writes (`$HF_TOKEN_PATH`, else `$HF_HOME/token`). It is read for each request, so logging
   in takes effect without a restart. It is sent to the Hub only (not to its CDN), and never
   logged or returned by the API.
+- **Setting it in the app:** the Hugging Face dialog's footer shows which account the token
+  belongs to, with **Set token**, **Change token** and **Log out**. A token pasted there is
+  checked with the Hub first, then saved to that same file, as `hf auth login` would save it,
+  so the `hf` CLI and Diffusers on this machine use it too. **Log out** removes the file, as
+  `hf auth logout` does. A read token is enough. When `$HF_TOKEN` is set, it wins, and the
+  dialog can't replace it: change it where the server starts.
 - **Gated repos** (marked GATED) need their terms accepted on the Hub, by the account whose
   token the server uses.
 - **Mirrors:** `hub.endpoint`, else `$HF_ENDPOINT`. Links from a mirror can be pasted too.
@@ -147,8 +153,9 @@ hub:
 
 | Route | |
 |---|---|
-| `GET /v1/hub` | Endpoint, whether a token is set (never the token), the models folder and HF cache |
+| `GET /v1/hub` | Endpoint, whether a token is set (never the token), its account and whether the Hub accepts it, the models folder and HF cache |
 | `PATCH /v1/hub` | `{"models_dir": ...}` |
+| `PUT /v1/hub/token`, `DELETE /v1/hub/token` | `{"token": ...}`: checked with the Hub, then saved where `hf auth login` saves it; or removed. 409 when `$HF_TOKEN` is set |
 | `GET /v1/hub/search` | `q`, `format` (`gguf`/`diffusers`/`safetensors`/`any`), `task` (a pipeline tag), `sort` (`downloads`/`trending`/`likes`/`updated`), `base_model` with `relation=quantized` for a model's GGUF versions |
 | `GET /v1/hub/repo?ref=...&engine=...` | The repo's layout, local copies, and each of the engine's settings with its candidates and suggestion |
 | `POST /v1/hub/downloads` | `{"repo", "variant", "engine", "key"}`; without `variant`, the Diffusers pipeline, for a diffusers backend's `model_id` |

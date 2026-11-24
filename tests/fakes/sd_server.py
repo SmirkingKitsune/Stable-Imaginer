@@ -6,22 +6,44 @@ It takes sd-server's command line (``--listen-ip``, ``--listen-port``, ``--model
 (``--load-delay`` seconds) during its first image, after it has said it is ready, or with
 ``--eager-load`` before it opens its port. It reports the main file it was given as its
 model, and colours its images by it, so the images of an engine's model card and its edit
-card tell apart.
+card tell apart. With ``--crash-on WORD``, a prompt with that word in it crashes it the
+way a real one crashes on files that don't fit together: a failed check in its log, then
+exit code 3.
 
     tests/fakes/sd-server.cmd  # what config/dev-swap.yaml launches
 """
 
 import argparse
+import asyncio
 import os
 import threading
 import time
 import zlib
+from dataclasses import dataclass
 from pathlib import PurePath
+from typing import Any
 
 import psutil  # type: ignore[import-untyped]
 import uvicorn
 
 from tests.fakes.fake_sdcpp import FakeSdCpp
+
+CRASH_LINE = "ggml.c:3378: GGML_ASSERT(ggml_can_mul_mat(a, b)) failed"
+
+
+@dataclass
+class CrashingSdCpp(FakeSdCpp):
+    """The fake API, crashing the process on a prompt with ``crash_on`` in it."""
+
+    crash_on: str | None = None
+
+    async def _execute(self, job: dict[str, Any], body: dict[str, Any]) -> None:
+        if self.crash_on and self.crash_on.casefold() in str(body.get("prompt", "")).casefold():
+            print(f"[I] generating image: 1/1 - seed {body.get('seed')}", flush=True)  # noqa: T201
+            await asyncio.sleep(0.3)
+            print(CRASH_LINE, flush=True)  # noqa: T201
+            os._exit(3)
+        await super()._execute(job, body)
 
 
 def _exit_with_the_engine() -> None:
@@ -49,13 +71,15 @@ def main(argv: list[str] | None = None) -> None:
         action="store_true",
         help="read the weights before opening the port, not during the first image",
     )
+    parser.add_argument("--crash-on", help="crash on a prompt with this word in it")
     args, _ = parser.parse_known_args(argv)
     threading.Thread(target=_exit_with_the_engine, daemon=True).start()
     name = PurePath(args.diffusion_model or args.model or "model.gguf").name
     print(f"loading {name}" + (" (eager)" if args.eager_load else ""), flush=True)  # noqa: T201
     time.sleep(args.load_delay if args.eager_load else 0.5)
     url = f"http://{args.listen_ip}:{args.listen_port}"
-    sd = FakeSdCpp(
+    sd = CrashingSdCpp(
+        crash_on=args.crash_on,
         url=url,
         step_delay_s=args.step_delay,
         model_name=name,

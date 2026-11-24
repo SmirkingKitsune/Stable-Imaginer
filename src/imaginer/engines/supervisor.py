@@ -93,6 +93,15 @@ class EngineProcess:
     def alive(self) -> bool:
         return self.state in ("starting", "running", "stopping")
 
+    async def wait_exit(self, timeout_s: float) -> bool:
+        """Whether the run has ended, waiting up to ``timeout_s`` for it: an engine that
+        stopped answering may have crashed, and its exit (with its last output) takes a
+        moment to be seen."""
+        if self.alive:
+            with contextlib.suppress(TimeoutError):
+                await asyncio.wait_for(self._exited.wait(), timeout_s)
+        return not self.alive
+
     async def start(self, argv: list[str], log_path: Path) -> None:
         """Start the engine. If the caller is cancelled while the process is being created,
         it is still recorded once it exists, then ended: never left running unreachable."""

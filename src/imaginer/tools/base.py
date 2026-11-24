@@ -46,6 +46,24 @@ class ToolOutcome:
     def error(cls, code: str, detail: str, **extra: Any) -> "ToolOutcome":
         return cls(content={"status": "error", "error": {"code": code, "detail": detail, **extra}})
 
+    @classmethod
+    def failed(cls, exc: ImaginerError, **extra: Any) -> "ToolOutcome":
+        """An application error as the LLM sees it: with what the engine's process showed,
+        when it has a report, so it can say why and suggest a fix."""
+        report = exc.extra.get("engine_report")
+        if isinstance(report, dict) and report:
+            extra |= {"engine_report": report, "note": ENGINE_REPORT_NOTE}
+        return cls.error(exc.code, exc.detail, **extra)
+
+
+ENGINE_REPORT_NOTE = (
+    "engine_report is what the image engine's own log showed. Tell the user plainly what "
+    "went wrong and what would fix it, from its errors, hints and files: name the file or "
+    "setting at fault when the report points to one. Try again only if a different request "
+    "could avoid the failure (e.g. a smaller image when memory ran out) and the engine is "
+    "still running; one that crashed must be started again first."
+)
+
 
 class Tool(ABC):
     name: ClassVar[str]
@@ -104,7 +122,7 @@ class ToolRegistry:
         try:
             return await tool.run(args, ctx)
         except ImaginerError as exc:
-            return ToolOutcome.error(exc.code, exc.detail)
+            return ToolOutcome.failed(exc)
         except Exception:
             log.exception("tool.crashed", tool=name)
             return ToolOutcome.error("internal_error", "the tool failed unexpectedly")

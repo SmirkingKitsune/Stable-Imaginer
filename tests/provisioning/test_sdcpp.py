@@ -289,3 +289,20 @@ def test_cli_and_engine_isolation(tmp_path, capsys):
     (tmp_path / "active-runtime.json").write_text('{"version": "b42", "accelerator": "cpu"}')
     assert main(["sdcpp", "provision", "--accelerator", "cpu", "--cache-dir", str(tmp_path)]) == 1
     assert "different engine" in capsys.readouterr().err
+
+
+def test_a_current_cpu_fallback_still_offers_the_gpu_build(tmp_path, monkeypatch):
+    monkeypatch.setattr(
+        sd, "fetch_releases", lambda: [{"tag_name": TAG, "assets": [{"name": n} for n in ASSETS]}]
+    )
+    cfg = config(tmp_path, accelerator="cuda", cuda_arch="120")
+    status = sd.check_for_update(cfg, TAG, installed_accelerator="cpu")
+    assert (status.fallback, status.update_available, status.action) == ("cpu", True, "release")
+    assert "cpu fallback: cuda was asked for" in status.warning
+    assert not sd.check_for_update(cfg, TAG, installed_accelerator="cuda").update_available
+
+
+def test_a_windows_cuda_source_build_loads_msvc_first(tmp_path):
+    steps = sd.build_source_plan(config(tmp_path, accelerator="cuda", cuda_arch="120"))
+    assert steps[0].label == "Finding an MSVC compiler nvcc accepts"
+    assert all(step.env is steps[0].env for step in steps)

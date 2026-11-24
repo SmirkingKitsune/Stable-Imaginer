@@ -256,10 +256,23 @@ def _describe(artifact: orm.Artifact) -> str:
         parts.append(f"{artifact.width}x{artifact.height}")
     if artifact.has_alpha:
         parts.append("transparent background")
-    filename = (artifact.metadata_json or {}).get("original_filename")
+    metadata = artifact.metadata_json or {}
+    filename = metadata.get("original_filename")
     if filename:
         parts.append(f'file "{filename}"')
+    imported = metadata.get("imported_from")
+    if isinstance(imported, dict):
+        prompt = imported.get("prompt")
+        if isinstance(prompt, str) and prompt.strip():
+            parts.append(f'from the artifact library, made with the prompt "{_clip(prompt)}"')
+        else:
+            parts.append("from the artifact library")
     return f"- {artifact.label}: {', '.join(parts)}"
+
+
+def _clip(text: str, limit: int = 160) -> str:
+    text = " ".join(text.split())
+    return text if len(text) <= limit else text[: limit - 1].rstrip() + "…"
 
 
 def _answered_calls(history: list[orm.Message]) -> set[str]:

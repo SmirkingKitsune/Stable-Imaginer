@@ -538,6 +538,7 @@ class HubConfig(_Strict):
 
     The token is never configured here. It comes from ``$HF_TOKEN`` (or the env var
     ``token_env`` names), else from ``hf auth login``'s token file, as the ``hf`` CLI reads it.
+    The Hugging Face dialog sets that file.
     """
 
     enabled: bool = True

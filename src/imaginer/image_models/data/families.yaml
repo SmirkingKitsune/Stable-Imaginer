@@ -329,6 +329,7 @@ families:
     repos: [Qwen/Qwen-Image-2.1, Comfy-Org/Qwen-Image-2.1, leejet/Qwen-Image-2.1-GGUF,
             unsloth/Qwen-Image-2.1-FP8]
     gguf: [qwen_image]
+    max_refs: 10
     rgba: 'This is an RGBA image with transparency. {prompt}. The image has alpha channel and the background is transparent.'
     mask: 'The last image is a mask: change only the area that is white in the mask and keep everything else exactly as it is.'
     sources:
@@ -345,6 +346,7 @@ families:
     native: [2048, 2048]
     names: ['qwen[-_]?image[-_.]?2[._]?1.*turbo']
     gguf: [qwen_image]
+    max_refs: 10
     rgba: 'This is an RGBA image with transparency. {prompt}. The image has alpha channel and the background is transparent.'
     mask: 'The last image is a mask: change only the area that is white in the mask and keep everything else exactly as it is.'
     sources:

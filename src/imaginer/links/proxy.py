@@ -2,8 +2,9 @@
 
 This is how a conversation that lives on a linked instance is opened, continued and
 edited from here: the browser only ever talks to (and holds the token of) its own
-instance. Only conversation, artifact and job routes pass, plus the backend list; the
-linked instance still applies its own ``links.gallery`` rules to them.
+instance. Only conversation, artifact and job routes pass, plus the backend list and the
+images pinned in its artifact library; the linked instance still applies its own
+``links.gallery`` rules to them.
 """
 
 import re
@@ -17,7 +18,8 @@ from imaginer.domain.errors import EngineUnavailableError, ForbiddenError
 from imaginer.links.state import Link
 
 _ALLOWED = re.compile(
-    r"v1/(conversations(/[\w.-]+)*|artifacts(/[\w.-]+)+|jobs(/[\w.-]+)+|backends)"
+    r"v1/(conversations(/[\w.-]+)*|artifacts(/[\w.-]+)+|jobs(/[\w.-]+)+|backends"
+    r"|artifact-library/pins/[\w.-]+/content)"
 )
 _WITH_BODY = frozenset({"POST", "PUT", "PATCH"})
 _REQUEST_HEADERS = (

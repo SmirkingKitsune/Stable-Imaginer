@@ -9,11 +9,17 @@
 // its portrait (from the Hub uploader, a self-portrait it paints with set_portrait, or an
 // upload), its persona (name, system prompt, what the viewer's thought bubble shows), the
 // tools it may call, its files, and its sampling. Every edit saves as you leave its field.
+//
+// Adding one takes three steps, like importing a model: where its model is (a GGUF here, or
+// Hugging Face, where only models that see images are listed), whether it can be an agent
+// (it must see images: a vision projector; it should call tools: a chat template that takes
+// them), and who it is (name, engine, system prompt).
 
 import { api, setImageUrl } from './api.js';
 import { connectionStrip, dialog, menu, modal, modelName, statusLine, toast } from './chrome.js';
 import { append, corners, h, icon, iconButton, clear } from './dom.js';
 import { ago, plural } from './format.js';
+import { agentTarget, hubDialog, looksLikeRef } from './hub.js';
 import { lastPlace, loadAgents, loadBackends, imageEngine } from './store.js';
 
 const VIEW_KEY = 'imaginer.agents';
@@ -268,71 +274,475 @@ async function downloadInto(agentId, ref, keys = ['model', 'mmproj']) {
   return started;
 }
 
+/** Make an agent in three steps, like importing a model: where its model is, whether it can
+ * be an agent (it must see images; it should call tools), and who it is. */
 function addAgent(lib, navigate) {
   const engines = lib?.engines ?? [];
   const def = engines.find((e) => e.default) ?? engines[0];
+  const elsewhere = engines.filter((e) => !e.launchable);
+  const st = {
+    step: 1,
+    text: '', // the path field
+    source: null, // {kind: 'path'|'ref'|'engine', text, name}
+    note: null, // {text, warn, title} under the drop zone
+    found: [], // paths a dropped file's name matched
+    busy: false,
+    detected: null, // what /v1/agents/detect said
+    model: null, // the model option picked (its id)
+    projector: null, // the projector option picked (its id)
+    template: '', // a chat template file replacing the model's own
+    all: new Set(), // choice lists shown in full
+    name: '',
+    named: false,
+    engine: def?.name ?? '',
+    prompt: '',
+  };
+  const d = () => st.detected;
+  const option = (list, id) => list?.find((o) => o.id === id) ?? null;
+  const pickedModel = () => option(d()?.models, st.model);
+  const pickedProjector = () => option(d()?.projectors, st.projector);
+  const canMake = () => !!d()?.fit.allowed && (d().kind === 'engine' || (!!pickedModel() && !!pickedProjector()));
+  const isRef = (value) => looksLikeRef(value)
+    || (/^[\w.-]+\/[\w.-]+$/.test(value) && !/^[A-Za-z]:/.test(value) && !value.startsWith('/'));
+
+  let box;
   modal((close) => {
-    const name = h('input.input', { placeholder: 'Defaults to the model’s name', 'aria-label': 'Name' });
-    const engine = h('select.input', { 'aria-label': 'Engine' }, engines.map((e) => h('option', {
-      value: e.name, selected: e === def,
-    }, `${e.name}${e.link ? ` · on ${e.link}` : ''}${e.launchable ? '' : ' · started elsewhere'}`)));
-    const model = h('input.input', { placeholder: 'D:\\models\\…\\model-Q4_K_M.gguf, or Qwen/Qwen3-VL-8B-Instruct-GGUF:Q4_K_M', 'aria-label': 'Model' });
-    const mmproj = h('input.input', { placeholder: 'mmproj-F16.gguf (optional: for a vision model)', 'aria-label': 'Vision projector' });
-    const hint = h('span.mc-muted');
-    const sync = () => {
-      const e = engines.find((x) => x.name === engine.value);
-      const ref = /^[\w.-]+\/[\w.-]+(:[\w.-]+)?$/.test(model.value.trim()) || /huggingface\.co|hf\.co/.test(model.value);
-      mmproj.disabled = ref;
-      hint.textContent = !e ? 'Configure a chat engine first, on the Engines screen.'
-        : !e.launchable ? `${e.name} is started elsewhere: leave the model empty to use whatever it runs (${e.model ? modelName(e.model) : 'its model'}).`
-          : ref ? 'From Hugging Face: its GGUF and vision projector download into the agent.'
-            : `${e.name} restarts with this model when you use the agent.`;
-    };
-    engine.addEventListener('change', sync);
-    model.addEventListener('input', sync);
-    sync();
-    const go = h('button.btn.btn-primary', {
-      type: 'button',
-      onclick: async () => {
-        const text = model.value.trim();
-        const isRef = text && (/^[\w.-]+\/[\w.-]+(:[\w.-]+)?$/.test(text) || /huggingface\.co|hf\.co/.test(text));
-        go.disabled = true;
-        try {
-          const body = { name: name.value.trim() || null, engine: engine.value || null };
-          if (isRef) body.ref = text;
-          else if (text) {
-            body.path = text;
-            if (mmproj.value.trim()) body.mmproj = mmproj.value.trim();
-          }
-          const made = await api.createAgent(body);
-          if (isRef) {
-            try {
-              const n = await downloadInto(made.id, text);
-              if (n) toast(`Downloading ${plural(n, 'file')} into ${made.name}`);
-            } catch (err) {
-              toast(`Made ${made.name}, but: ${err.message}`, { error: true });
-            }
-          }
-          close();
-          await loadAgents();
-          navigate(`#/agents/${made.id}`);
-        } catch (err) {
-          go.disabled = false;
-          toast(err.message, { error: true });
-        }
-      },
-    }, 'Add the agent');
-    return h('div.dialog.blueprint.agent-add', { role: 'dialog', 'aria-modal': 'true', 'aria-label': 'Add an agent' },
-      corners(),
-      h('div.dialog-title', 'Add an agent'),
-      h('div.dialog-body', 'A chat model plus a persona. Its portrait comes from whoever uploaded the model to Hugging Face, until it paints its own.'),
-      h('label.field', h('span.eyebrow', 'Model'), model),
-      h('label.field', h('span.eyebrow', 'Vision projector'), mmproj),
-      h('label.field', h('span.eyebrow', 'Runs on'), engine),
-      h('label.field', h('span.eyebrow', 'Name'), name),
-      hint,
-      h('div.dialog-actions', h('button.btn.btn-secondary', { type: 'button', onclick: () => close() }, 'Cancel'), go));
+    box = h('div.dialog.blueprint.mi.ag-wizard', { role: 'dialog', 'aria-modal': 'true', 'aria-label': 'Add an agent' });
+    box.close = close;
+    render();
+    return box;
   });
+
+  function render() {
+    if (!box) return;
+    keepFocus(box, () => {
+      clear(box).append(...corners());
+      const body = st.step === 1 ? sourceStep() : st.step === 2 ? checkStep() : personaStep();
+      append(box, [steps(), h('div.mi-main', body), foot()]);
+    });
+  }
+
+  // --- the step bar ------------------------------------------------------------------------
+
+  function fitWords() {
+    const f = d()?.fit;
+    if (!f) return '';
+    const sees = f.vision === false ? 'Blind' : f.vision ? 'Sees images' : 'Vision unknown';
+    const calls = f.tools ? 'calls tools' : f.tools === false ? 'no tools' : 'tools unknown';
+    return `${sees} · ${calls}`;
+  }
+
+  function steps() {
+    const cells = [
+      { word: 'Source', ask: 'Where is the model?', done: st.source?.name ?? '', mono: st.source?.kind !== 'engine' },
+      { word: 'Check', ask: 'Can it see and call tools?', done: fitWords() },
+      { word: 'Persona', ask: 'Who is it?' },
+    ];
+    return h('div.mi-steps', cells.map((c, i) => {
+      const n = i + 1;
+      const now = st.step === n;
+      const past = st.step > n;
+      return h(past ? 'button.mi-step.done' : 'div.mi-step', {
+        class: now ? 'now' : '', type: past ? 'button' : null, 'aria-current': now ? 'step' : null,
+        title: past ? `Back to ${c.word.toLowerCase()}` : null, onclick: past ? () => { st.step = n; render(); } : null,
+      },
+      h('span.mi-step-n', `0${n}${past ? ' ✓' : ''} ${c.word.toUpperCase()}`),
+      h(past && c.mono ? 'span.mi-step-v.mono' : 'span.mi-step-v', past ? c.done : c.ask));
+    }));
+  }
+
+  function foot() {
+    const cancel = h('button.btn.btn-ghost.mi-btn', { type: 'button', onclick: () => box.close() }, 'Cancel');
+    const back = (n) => h('button.btn.btn-ghost.mi-btn', { type: 'button', onclick: () => { st.step = n; render(); } }, 'Back');
+    const primary = (label, onclick, disabled = false) => h('button.btn.btn-primary.blueprint.mi-btn.mi-go', {
+      type: 'button', disabled: disabled || st.busy, onclick,
+    }, corners(), label);
+    if (st.step === 1) {
+      const other = elsewhere.find((e) => e.default) ?? elsewhere[0];
+      return h('div.mi-foot',
+        other && h('span.mi-foot-text', 'Or ', h('button.link-btn', { type: 'button', onclick: () => fromEngine(other.name) },
+          `use what ${other.name} runs`), ', an engine started elsewhere.'),
+        h('span.spacer'), cancel,
+        primary(st.busy ? 'Checking…' : 'Next: check it', () => next(), !st.text.trim()));
+    }
+    if (st.step === 2) {
+      return h('div.mi-foot', back(1),
+        h('span.mi-foot-text.mi-status', { class: canMake() ? 'ok' : '' }, checkStatus()),
+        cancel,
+        primary(st.busy ? 'Checking…' : 'Next: persona', () => { st.step = 3; render(); }, !canMake()));
+    }
+    const s = summary();
+    return h('div.mi-foot', back(2),
+      h('span.mi-foot-text.mi-status', { class: s.ready ? 'ok' : '' }, s.text),
+      primary(st.busy ? 'Making it…' : s.button, () => create(), !canMake()));
+  }
+
+  function checkStatus() {
+    const f = d()?.fit;
+    if (!f) return '';
+    if (!f.allowed) return 'It can’t be an agent';
+    if (d().kind !== 'engine' && !pickedProjector()) return 'Pick its vision projector';
+    return f.tools === false ? 'It can be an agent, but makes no images itself' : 'It can be an agent';
+  }
+
+  // --- 01 source -----------------------------------------------------------------------------
+
+  function sourceStep() {
+    const picker = h('input', {
+      type: 'file', accept: '.gguf', hidden: true,
+      onchange: () => { if (picker.files[0]) dropped(picker.files[0]); },
+    });
+    const zone = h('div.mi-drop', {
+      tabindex: '0', role: 'button', 'aria-label': 'Drop a GGUF model here, or choose one',
+      class: st.busy ? 'busy' : '',
+      ondragenter: (e) => { if (hasFiles(e)) { e.preventDefault(); zone.classList.add('over'); } },
+      ondragover: (e) => { if (hasFiles(e)) { e.preventDefault(); e.dataTransfer.dropEffect = 'copy'; } },
+      ondragleave: (e) => { if (!zone.contains(e.relatedTarget)) zone.classList.remove('over'); },
+      ondrop: (e) => {
+        e.preventDefault();
+        zone.classList.remove('over');
+        const file = e.dataTransfer.files[0];
+        if (file) dropped(file);
+      },
+      onclick: () => picker.click(),
+      onkeydown: (e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); picker.click(); } },
+    },
+    icon('upload', 28),
+    h('span.mi-drop-title', 'Drop a chat model’s .gguf'),
+    h('span.mi-drop-sub', 'Its vision projector (mmproj) is looked for beside it.'));
+    const path = h('input.seed-input.path-input', {
+      type: 'text', value: st.text, spellcheck: false, placeholder: 'or paste a path — D:\\models\\…\\model-Q4_K_M.gguf', 'aria-label': 'A model file on this machine',
+      dataset: { key: 'ag-path' },
+      oninput: () => { st.text = path.value; st.found = []; syncNext(); },
+      onkeydown: (e) => { if (e.key === 'Enter') { e.preventDefault(); next(); } },
+    });
+    const found = st.found.length > 1 && h('div.mi-found', { role: 'radiogroup', 'aria-label': 'Which file' },
+      st.found.map((p) => h('button.mi-found-row', {
+        type: 'button', role: 'radio', 'aria-checked': String(st.text === p), class: st.text === p ? 'on' : '',
+        onclick: () => { st.text = p; render(); },
+      }, h('span.mi-radio'), h('span.mono-meta.wrap', p))));
+    return h('div.mi-source',
+      h('div.mi-source-here',
+        h('span.mi-kicker', 'On this machine'),
+        zone,
+        st.note && h('span.mi-note', { class: st.note.warn ? 'warn' : '', title: st.note.title ?? null }, st.note.text),
+        found,
+        h('div.mi-path', h('label.seed-field', icon('folder', 13), path),
+          h('button.btn.btn-secondary.mi-btn', { type: 'button', onclick: () => picker.click() }, 'Browse…'), picker)),
+      h('div.mi-source-hub',
+        h('span.mi-kicker', 'Not downloaded yet'),
+        h('span.mi-copy', 'Find one on Hugging Face. Only models that see images are listed, and those that call tools come first.'),
+        h('button.btn.btn-secondary.mi-btn.mi-hub-btn', { type: 'button', onclick: searchHub }, icon('search', 14), 'Search Hugging Face'),
+        h('span.spacer'),
+        h('span.mi-small', 'Its model and projector download into the new agent.')));
+  }
+
+  function syncNext() {
+    const go = box.querySelector('.mi-go');
+    if (go) go.disabled = !st.text.trim() || st.busy;
+  }
+
+  async function dropped(file) {
+    if (!/\.gguf$/i.test(file.name)) {
+      st.note = { warn: true, text: `${file.name} isn't a GGUF: llama-server loads .gguf models.` };
+      render();
+      return;
+    }
+    st.busy = true;
+    st.found = [];
+    st.note = { text: `Looking for ${file.name} on this machine…` };
+    render();
+    let res = null;
+    try {
+      res = await api.locateAgentModel({ name: file.name, size_bytes: file.size });
+    } catch (err) {
+      st.note = { warn: true, text: err.message };
+    }
+    st.busy = false;
+    if (res?.paths.length === 1) {
+      st.text = res.paths[0];
+      st.note = null;
+      next();
+      return;
+    }
+    if (res) {
+      st.found = res.paths;
+      if (res.paths.length) st.text = res.paths[0];
+      st.note = res.paths.length
+        ? { text: `${res.paths.length} files here are called ${file.name}. Pick one, then Next.` }
+        : { warn: true, text: `${file.name} isn't in the model folders here. Paste its full path below.`, title: `Looked in:\n${res.searched.join('\n')}` };
+    }
+    render();
+    if (!res?.paths.length) box.querySelector('[data-key="ag-path"]')?.focus();
+  }
+
+  function searchHub() {
+    hubDialog(agentTarget(), {
+      onPick: (p) => {
+        st.text = p.ref;
+        next();
+      },
+    });
+  }
+
+  /** Check what the source field names, and go on to the check. */
+  async function next() {
+    const value = st.text.trim();
+    if (!value || st.busy) return;
+    const ref = isRef(value);
+    st.source = { kind: ref ? 'ref' : 'path', text: value, name: ref ? value.replace(/^hf:\/\//, '') : fileName(value) };
+    st.template = '';
+    await check(ref ? { ref: value } : { path: value }, { fresh: true });
+  }
+
+  async function fromEngine(engine) {
+    st.source = { kind: 'engine', text: engine, name: `What ${engine} runs` };
+    st.template = '';
+    st.engine = engine;
+    await check({ engine }, { fresh: true });
+  }
+
+  /** Ask the server; fresh: a new source (its picks and name start over). */
+  async function check(body, { fresh = false } = {}) {
+    st.busy = true;
+    render();
+    try {
+      const found = await api.detectAgent(body);
+      // A file here checked again keeps the models its folder offered (a dropped projector's).
+      const was = st.detected;
+      if (!fresh && was?.kind === 'path' && found.kind === 'path' && was.models.length > found.models.length) found.models = was.models;
+      const keep = (list, id) => (!fresh && list.some((o) => o.id === id) ? id : list[0]?.id ?? null);
+      st.model = keep(found.models, st.model);
+      st.projector = keep(found.projectors, st.projector);
+      st.detected = found;
+      // A dropped projector: the source is named after the model picked beside it.
+      if (fresh && found.kind === 'path' && found.models[0]) st.source.name = found.models[0].name;
+      if (fresh) st.all.clear();
+      if (!st.named) st.name = found.name;
+      st.step = 2;
+    } catch (err) {
+      toast(err.message, { error: true });
+    }
+    st.busy = false;
+    render();
+  }
+
+  /** Check again with the picks so far (a file here: its model, projector and template). */
+  function recheck(changes = {}) {
+    Object.assign(st, changes);
+    const cur = d();
+    if (cur.kind === 'path') {
+      check({ path: pickedModel()?.id ?? st.source.text, mmproj: pickedProjector()?.id ?? null, chat_template: st.template || null });
+    } else if (cur.kind === 'ref') {
+      check({ ref: st.source.text, chat_template: st.template || null });
+    } else render();
+  }
+
+  // --- 02 check ------------------------------------------------------------------------------
+
+  function checkStep() {
+    const cur = d();
+    if (!cur) return h('div.ag-check', h('span.mi-copy.muted', 'Checking…'));
+    const f = cur.fit;
+    const model = pickedModel();
+    const facts = [f.params, f.architecture, f.context_length && `${Math.round(f.context_length / 1024)}k context`,
+      cur.repo && cur.kind === 'path' ? `from ${cur.repo}` : null].filter(Boolean).join(' · ');
+    const title = cur.kind === 'ref' ? cur.repo : cur.kind === 'engine' ? (cur.models[0]?.name ?? st.source.name) : (model?.name ?? st.source.name);
+    const other = f.problems.filter((p) => !/vision projector|see images/.test(p));
+    return h('div.ag-check',
+      h('div.ag-model', h('b', title), facts && h('span.mono-meta', facts)),
+      h('div.ag-reqs', visionRow(f), toolsRow(f)),
+      other.map((p) => h('span.mi-note.warn', p)),
+      f.notes.map((n) => h('span.mi-note', n)),
+      cur.kind !== 'engine' && cur.models.length > 1 && choices('model', 'Model file', cur.models, st.model, (id) => {
+        if (cur.kind === 'path') recheck({ model: id });
+        else { st.model = id; render(); }
+      }),
+      cur.kind !== 'engine' && (cur.projectors.length > 0 || cur.kind === 'path') && choices('projector', 'Vision projector', cur.projectors, st.projector,
+        (id) => {
+          if (cur.kind === 'path') recheck({ projector: id });
+          else { st.projector = id; render(); }
+        },
+        cur.kind === 'path' ? () => typeProjector() : null));
+  }
+
+  function requirement({ state, title, flag, text, action = null }) {
+    const mark = state === 'ok' ? icon('check', 14) : state === 'bad' ? icon('x', 14) : h('span', '?');
+    return h('div.ag-req', { class: state },
+      h('span.mc-mark', { class: state === 'ok' ? 'ok' : state === 'bad' ? 'bad' : 'dashed' }, mark),
+      h('span.ag-req-text', h('b', title, h('span.mono-meta', flag)), h('span', text), action),
+      h('span.tag.ag-req-tag', { class: state === 'ok' ? 'tag-accent' : 'tag-outline' }, flag === '--mmproj' ? 'MUST' : 'SHOULD'));
+  }
+
+  function visionRow(f) {
+    const cur = d();
+    const p = pickedProjector();
+    let text;
+    if (cur.kind === 'engine') {
+      text = f.vision ? `${st.source.text} reports vision: it was started with a projector.`
+        : f.vision === false ? f.problems.find((x) => /see images/.test(x)) : `${st.source.text} isn't answering, so whether it sees images is unknown.`;
+    } else if (p) {
+      text = `With ${p.name}: it reads the images it makes and the ones you give it.`;
+    } else {
+      text = f.problems.find((x) => /vision projector/.test(x)) ?? 'Pick its vision projector below.';
+    }
+    let state = p ? 'ok' : 'bad';
+    if (cur.kind === 'engine') state = f.vision ? 'ok' : f.vision === false ? 'bad' : 'unknown';
+    return requirement({ state, title: 'Sees images', flag: '--mmproj', text });
+  }
+
+  function toolsRow(f) {
+    const cur = d();
+    const fix = cur.kind !== 'engine' && h('div.ag-req-actions',
+      h('button.mc-link', { type: 'button', onclick: () => typeTemplate() }, st.template ? 'Change the chat template file' : 'Use a chat template file that takes tools…'),
+      st.template && h('button.mc-link', { type: 'button', onclick: () => recheck({ template: '' }) }, 'Use the model’s own'));
+    const own = st.template ? `${fileName(st.template)} takes` : 'Its chat template takes';
+    const text = f.tools ? `${own} tools: it can make and edit images itself (generate_image, edit_image).`
+      : f.tools === false ? `${st.template ? `${fileName(st.template)} takes` : 'Its chat template takes'} no tools: it can talk about images but can't make them. A model that calls tools, or a chat template that takes them, can.`
+        : cur.kind === 'engine' ? 'Unknown until the engine answers.' : 'There is no chat template to read here; llama-server says once it runs.';
+    return requirement({ state: f.tools ? 'ok' : f.tools === false ? 'bad' : 'unknown', title: 'Calls tools', flag: 'chat template', text, action: (f.tools !== true || st.template) && fix });
+  }
+
+  function choices(key, word, list, current, pick, other = null) {
+    const all = st.all.has(key);
+    const shown = all ? list : list.slice(0, 6);
+    const rows = shown.map((o, i) => {
+      const on = o.id === current;
+      const where = o.local ? (d().kind === 'ref' ? 'On disk · used as is' : o.local) : 'Downloads into the agent';
+      return h('button.mi-choice', { type: 'button', role: 'radio', 'aria-checked': String(on), class: on ? 'on' : '', onclick: () => !on && pick(o.id) },
+        h('span.mi-radio'),
+        h('span.mi-choice-text', h('b', { title: o.id }, o.name, o.shards > 1 ? ` · ${o.shards} shards` : ''), h('span', where)),
+        h('span.mi-choice-size', bytes(o.size_bytes)),
+        i === 0 ? h('span.tag.tag-accent.mi-best', 'BEST') : h('span'));
+    });
+    return h('div.mi-choices',
+      h('div.mi-choices-head', h('b', word), h('span.mono-meta', key === 'projector' ? '--mmproj' : '-m')),
+      h('div.mi-choice-list', { role: 'radiogroup', 'aria-label': word }, rows,
+        list.length > 6 && h('button.mi-choice.quiet', { type: 'button', onclick: () => { if (all) st.all.delete(key); else st.all.add(key); render(); } },
+          h('span'), h('span.mi-choice-text', h('b', all ? 'Show fewer' : `Show all ${list.length}`)), h('span'), h('span')),
+        other && h('button.mi-choice.quiet', { type: 'button', onclick: other },
+          h('span.mi-radio.square'), h('span.mi-choice-text', h('b', 'Another file on this machine…'), h('span', 'A path')), h('span'), h('span'))));
+  }
+
+  async function typeProjector() {
+    const value = (await dialog({
+      title: 'Vision projector', body: 'An mmproj .gguf on this machine, made for this model.',
+      input: { value: pickedProjector()?.id ?? '', placeholder: 'D:\\models\\…\\mmproj-F16.gguf' }, confirm: 'Use it',
+    }))?.trim();
+    if (!value) return;
+    st.projector = value;
+    check({ path: pickedModel()?.id ?? st.source.text, mmproj: value, chat_template: st.template || null });
+  }
+
+  async function typeTemplate() {
+    const value = (await dialog({
+      title: 'Chat template file',
+      body: 'A Jinja template (.jinja) for --chat-template-file. It replaces the one in the model; one that takes tools lets it call them.',
+      input: { value: st.template, placeholder: 'D:\\templates\\…\\tool-use.jinja' }, confirm: 'Use it',
+    }))?.trim();
+    if (value == null || value === st.template) return;
+    recheck({ template: value });
+  }
+
+  // --- 03 persona ----------------------------------------------------------------------------
+
+  function personaStep() {
+    const cur = d();
+    const name = h('input.seed-input.text', {
+      value: st.name, placeholder: cur?.name ?? 'Its name', 'aria-label': 'Name', spellcheck: false, dataset: { key: 'ag-name' },
+      oninput: () => { st.name = name.value; st.named = true; },
+      onkeydown: (e) => { if (e.key === 'Enter') { e.preventDefault(); create(); } },
+    });
+    const engine = h('select.seed-input', {
+      'aria-label': 'Runs on', dataset: { key: 'ag-engine' }, disabled: cur?.kind === 'engine',
+      onchange: () => { st.engine = engine.value; render(); },
+    }, engines.map((e) => h('option', { value: e.name, selected: e.name === st.engine },
+      `${e.name}${e.link ? ` · on ${e.link}` : ''}${e.launchable ? '' : ' · started elsewhere'}`)));
+    const prompt = h('textarea.seed-input.text.lib-notes.agent-prompt', {
+      rows: 4, placeholder: 'Leave it empty for the built-in one: an image director that plans, makes and edits images.',
+      'aria-label': 'System prompt', dataset: { key: 'ag-prompt' },
+      oninput: () => { st.prompt = prompt.value; },
+    });
+    prompt.value = st.prompt;
+    const e = engines.find((x) => x.name === st.engine);
+    const runs = !e ? 'Configure a chat engine first, on the Engines screen.'
+      : cur?.kind === 'engine' ? `It answers as whatever ${e.name} runs.`
+        : e.launchable ? `${e.name} restarts with its model when you use it.`
+          : `${e.name} is started elsewhere and runs its own model: these files are kept for an engine launched here.`;
+    const portrait = cur?.owner ? `Its portrait: ${cur.owner}’s avatar from Hugging Face, until it paints its own.`
+      : 'Its portrait: its monogram, until it paints its own or you upload one.';
+    return h('div.ag-persona',
+      h('label.ag-field', h('span.eyebrow', 'Name'), h('span.seed-field', name)),
+      h('label.ag-field', h('span.eyebrow', 'Runs on'), h('span.seed-field', engine), h('span.mi-small', runs)),
+      h('label.ag-field', h('span.eyebrow', 'System prompt'), prompt, h('span.mi-small', 'What it is told before every conversation. You can change it later.')),
+      h('span.mi-small', portrait));
+  }
+
+  function summary() {
+    const cur = d();
+    if (!cur || cur.kind === 'engine') return { ready: true, text: 'Nothing to download', button: 'Make the agent' };
+    const files = [pickedModel(), pickedProjector()].filter(Boolean);
+    const gets = cur.kind === 'ref' ? files.filter((o) => !o.local) : [];
+    const total = gets.reduce((n, o) => n + (o.size_bytes ?? 0), 0);
+    return gets.length
+      ? { ready: false, text: `${bytes(total) || plural(gets.length, 'file')} to download once it’s made`, button: `Make it · get ${bytes(total) || plural(gets.length, 'file')}` }
+      : { ready: true, text: 'Ready to run · nothing to download', button: 'Make the agent' };
+  }
+
+  async function create() {
+    if (st.busy || !canMake()) return;
+    const cur = d();
+    const model = pickedModel();
+    const projector = pickedProjector();
+    const body = { name: st.name.trim() || null, engine: st.engine || null, system_prompt: st.prompt.trim() || null };
+    if (st.template) body.chat_template = st.template;
+    if (cur.kind === 'path') Object.assign(body, { path: model.id, mmproj: projector.id });
+    else if (cur.kind === 'ref') body.ref = model.quant ? `${cur.repo}:${model.quant}` : `hf://${cur.repo}/${model.id}`;
+    st.busy = true;
+    render();
+    let made;
+    try {
+      made = await api.createAgent(body);
+    } catch (err) {
+      toast(err.message, { error: true });
+      st.busy = false;
+      render();
+      return;
+    }
+    let started = 0;
+    const failed = [];
+    if (cur.kind === 'ref') {
+      for (const [key, o] of [['model', model], ['mmproj', projector]]) {
+        try {
+          if (o.local) await api.updateAgent(made.id, { files: { [key]: o.local } });
+          else {
+            await api.hubDownload({ repo: cur.repo, revision: cur.sha ?? undefined, variant: o.id, agent: made.id, key });
+            started += 1;
+          }
+        } catch (err) {
+          failed.push(`${o.name}: ${err.message}`);
+        }
+      }
+    }
+    box.close();
+    await loadAgents();
+    navigate(`#/agents/${made.id}`);
+    if (failed.length) toast(`Made ${made.name}, but: ${failed.join('; ')}`, { error: true });
+    else toast(started ? `Made ${made.name} · downloading ${plural(started, 'file')}` : `Made ${made.name}`);
+  }
+}
+
+/** Rebuild root with build(), keeping focus (and the caret) on the field with the same data-key. */
+function keepFocus(root, build) {
+  const active = document.activeElement;
+  const key = root.contains(active) ? active?.dataset?.key : null;
+  const caret = key && typeof active.selectionStart === 'number' ? [active.selectionStart, active.selectionEnd] : null;
+  build();
+  if (!key) return;
+  const el = root.querySelector(`[data-key="${CSS.escape(key)}"]`);
+  if (!el) return;
+  el.focus({ preventScroll: true });
+  if (caret) try { el.setSelectionRange(...caret); } catch { /* not a text field */ }
 }
 
 // --- one agent (1b) --------------------------------------------------------------------------

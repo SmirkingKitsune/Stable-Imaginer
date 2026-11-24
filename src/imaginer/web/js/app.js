@@ -9,10 +9,12 @@
 //   #/loras            the LoRA library   #/loras/<id>         one LoRA
 //   #/models           the model library  #/models/<id>        one model card
 //   #/agents           the agents         #/agents/<id>        one agent
+//   #/artifacts        the artifact library: every image, here and on linked instances
 //   #/l/<link>/c/...   the same conversation routes, for one that lives on a linked instance
 
 import { agentScreen, agentsScreen } from './agents.js';
 import { setToken, whenUnauthorized } from './api.js';
+import { artifactsScreen } from './artifacts.js';
 import { dialog } from './chrome.js';
 import { h } from './dom.js';
 import { conversationScreen } from './conversation.js';
@@ -53,6 +55,7 @@ function parse(hash) {
   if (parts[0] === 'loras') return parts[1] ? { name: 'lora', id: parts[1] } : { name: 'loras' };
   if (parts[0] === 'models') return parts[1] ? { name: 'model', id: parts[1] } : { name: 'models' };
   if (parts[0] === 'agents') return parts[1] ? { name: 'agent', id: parts[1] } : { name: 'agents' };
+  if (parts[0] === 'artifacts') return { name: 'artifacts' };
   if (parts[0] === 'c' && parts[1]) {
     if (parts[2] === 'chat') return { name: 'conversation', id: parts[1], link };
     if (parts[2] === 'mask' && parts[3]) return { name: 'mask', id: parts[1], label: parts[3], link };
@@ -89,10 +92,13 @@ function route() {
   else if (r.name === 'model') screen = modelScreen({ id: r.id, navigate });
   else if (r.name === 'agents') screen = agentsScreen({ navigate });
   else if (r.name === 'agent') screen = agentScreen({ id: r.id, navigate });
+  else if (r.name === 'artifacts') screen = artifactsScreen({ navigate });
   else if (r.name === 'viewer') screen = viewerScreen({ id: r.id, label: r.label, navigate });
   else screen = galleryScreen({ archived: r.archived, navigate });
   mounted = r;
-  if (['gallery', 'conversation', 'viewer'].includes(r.name)) notePlace(location.hash);
+  if (['gallery', 'conversation', 'viewer'].includes(r.name)) {
+    notePlace(location.hash, r.name === 'gallery' ? 'new' : r.id);
+  }
   root.append(screen.el);
 }
 

@@ -31,6 +31,7 @@ from imaginer.provisioning.llamacpp import (
     release_accelerators,
     release_asset_patterns,
     release_build_number,
+    requested_target,
     select_release_assets,
     select_release_candidate,
     validate_server,
@@ -169,6 +170,66 @@ class TestReleaseAssetMatrix(unittest.TestCase):
                 without_cudart,
                 config(platform="windows", accelerator="cuda"),
                 driver_version=(12, 6),
+            )
+
+    # What upstream publishes since b12527: CUDA 12.4 and 13.5, while this RTX 5090's
+    # driver reports 13.4.
+    WINDOWS_13_5: ClassVar[list[str]] = [
+        "llama-b12532-bin-win-cpu-x64.zip",
+        "llama-b12532-bin-win-cuda-12.4-x64.zip",
+        "llama-b12532-bin-win-cuda-13.5-x64.zip",
+        "cudart-llama-bin-win-cuda-12.4-x64.zip",
+        "cudart-llama-bin-win-cuda-13.5-x64.zip",
+    ]
+
+    def test_blackwell_takes_a_newer_minor_of_the_drivers_cuda_major(self):
+        # CUDA's minor version compatibility runs 13.5 on a 13.4 driver, and the release
+        # carries compiled sm_120a code, so nothing asks the older driver to JIT newer PTX.
+        selected = select_release_assets(
+            self.WINDOWS_13_5,
+            config(platform="windows", accelerator="cuda", cuda_arch="120"),
+            driver_version=(13, 4),
+        )
+        self.assertEqual(
+            selected,
+            [
+                "llama-b12532-bin-win-cpu-x64.zip",
+                "llama-b12532-bin-win-cuda-13.5-x64.zip",
+                "cudart-llama-bin-win-cuda-13.5-x64.zip",
+            ],
+        )
+
+    def test_a_build_that_fits_the_driver_still_wins(self):
+        choice = choose_cuda_release(
+            ["llama-bin-cuda-13.1-x64.zip", "llama-bin-cuda-13.5-x64.zip"],
+            (13, 4),
+            minor_compatible=True,
+        )
+        self.assertEqual(choice, "llama-bin-cuda-13.1-x64.zip")
+
+    def test_the_newer_minor_closest_to_the_driver_is_taken(self):
+        choice = choose_cuda_release(
+            ["llama-bin-cuda-13.6-x64.zip", "llama-bin-cuda-13.5-x64.zip"],
+            (13, 4),
+            minor_compatible=True,
+        )
+        self.assertEqual(choice, "llama-bin-cuda-13.5-x64.zip")
+
+    def test_a_gpu_the_release_runs_as_ptx_needs_a_driver_as_new_as_the_build(self):
+        # Hopper (sm_90) gets the release's PTX, which a 13.4 driver cannot JIT from 13.5.
+        with self.assertRaises(ProvisionError):
+            select_release_assets(
+                ["llama-b1-bin-ubuntu-cuda-13.5-x64.tar.gz"],
+                config(accelerator="cuda", cuda_arch="90"),
+                driver_version=(13, 4),
+            )
+
+    def test_a_newer_cuda_major_never_loads(self):
+        with self.assertRaises(ProvisionError):
+            select_release_assets(
+                self.WINDOWS_13_5,
+                config(platform="windows", accelerator="cuda", cuda_arch="120"),
+                driver_version=(12, 9),
             )
 
     def test_release_variant_pins_the_cuda_major(self):
@@ -551,6 +612,77 @@ class TestUpdateCheck(unittest.TestCase):
             config(accelerator="cuda"), "b10800", releases=[{"tag_name": "", "assets": []}]
         )
         self.assertFalse(status.ok)
+
+
+class TestFallbackUpdates(unittest.TestCase):
+    """A fallback runtime is checked against what was asked for, not against itself."""
+
+    ASSETS: ClassVar[list[dict[str, str]]] = [
+        {"name": n} for n in TestReleaseAssetMatrix.WINDOWS_13_5
+    ]
+
+    def _check(self, installed: str, installed_accelerator: str) -> UpdateStatus:
+        releases = [{"tag_name": "b12532", "assets": self.ASSETS}]
+        cfg = config(platform="windows", accelerator="cuda", cuda_arch="120")
+        with patch("imaginer.provisioning.llamacpp.fetch_releases", return_value=releases):
+            return check_for_update(cfg, installed, installed_accelerator=installed_accelerator)
+
+    def test_the_newest_cpu_fallback_is_not_up_to_date(self):
+        status = self._check("b12532", "cpu")
+        self.assertEqual(status.behind, 0)
+        self.assertEqual(status.fallback, "cpu")
+        self.assertTrue(status.update_available)
+        self.assertFalse(status.is_current)
+        self.assertEqual(status.action, "release")
+        self.assertIn("cpu fallback: cuda was asked for", status.warning)
+        self.assertIn("b12532 has a cuda release", status.warning)
+
+    def test_a_fallback_ignores_the_staleness_floor(self):
+        status = self._check("b12531", "cpu")  # one build behind, far under the threshold
+        self.assertTrue(status.update_available)
+
+    def test_the_runtime_asked_for_is_held_to_the_floor_as_before(self):
+        status = self._check("b12531", "cuda")
+        self.assertEqual(status.fallback, "")
+        self.assertFalse(status.update_available)
+        self.assertTrue(status.below_threshold)
+
+
+class TestRequestedTarget(unittest.TestCase):
+    def test_a_recorded_request_is_read_back(self):
+        active = {
+            "method": "release",
+            "accelerator": "cpu",
+            "requested_method": "auto",
+            "requested_accelerator": "cuda",
+        }
+        self.assertEqual(requested_target(active), ("auto", "cuda"))
+
+    def test_an_older_record_is_read_from_its_ladder(self):
+        # active-runtime.json as the CPU fallback of 2026-11-18 wrote it.
+        active = {
+            "method": "release",
+            "accelerator": "cpu",
+            "ladder": [
+                {"method": "release", "accelerator": "cuda", "ok": False},
+                {"method": "source", "accelerator": "cuda", "ok": False},
+                {"method": "release", "accelerator": "cpu", "ok": True},
+            ],
+        }
+        self.assertEqual(requested_target(active), ("auto", "cuda"))
+
+    def test_a_single_rung_keeps_its_method(self):
+        active = {
+            "method": "source",
+            "accelerator": "cuda",
+            "ladder": [{"method": "source", "accelerator": "cuda", "ok": True}],
+        }
+        self.assertEqual(requested_target(active), ("source", "cuda"))
+
+    def test_a_record_without_a_ladder_is_its_own_request(self):
+        self.assertEqual(
+            requested_target({"method": "release", "accelerator": "vulkan"}), ("release", "vulkan")
+        )
 
 
 class TestProgressParsing(unittest.TestCase):

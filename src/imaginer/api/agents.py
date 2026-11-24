@@ -28,8 +28,23 @@ async def list_agents(container: ContainerDep) -> dto.AgentLibraryView:
 @router.post("", status_code=status.HTTP_201_CREATED)
 async def create_agent(body: dto.AgentCreate, container: ContainerDep) -> dto.AgentDetail:
     """A new agent: from a GGUF here, from a Hub reference (download its files into it
-    next), or for whatever an engine runs."""
+    next), or for whatever an engine runs. Its model must see images (422 otherwise)."""
     return await container.agents.create(body)
+
+
+@router.post("/detect")
+async def detect_agent(body: dto.AgentDetect, container: ContainerDep) -> dto.AgentDetected:
+    """Whether a model can be an agent: it must see images (a vision projector), and it
+    should call tools (its chat template takes them). With the model files and projectors
+    to pick from: a GGUF here (path), a Hub repo (ref), or what an engine runs (engine)."""
+    return await container.agents.detect(body)
+
+
+@router.post("/locate")
+async def locate_agent_model(body: dto.ModelLocate, container: ContainerDep) -> dto.ModelLocated:
+    """Where a GGUF dropped in the browser is on this machine: the browser tells its name
+    and size, not its folder."""
+    return await container.agents.locate(body)
 
 
 @router.get("/{agent_id}")

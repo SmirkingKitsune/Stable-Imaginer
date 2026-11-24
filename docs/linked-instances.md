@@ -91,8 +91,12 @@ Everything below needs the link's token, and answers 404 while linking is off.
 | `POST` | `/v1/peer/engines/{name}/images` | one image (generate or edit), as server-sent events |
 
 With `links.gallery` set to `full` (or `read`, GET only), a linked instance may also use the
-conversation, message, artifact and job routes, and `GET /v1/backends`. It may never use the
-Engines or Links routes, the merged gallery, or the proxy, so nothing is transitive.
+conversation, message, artifact and job routes, `GET /v1/backends`, and the artifact library's
+listing of this instance's own images and pins (`/v1/artifact-library/local...`,
+`/v1/artifact-library/pins/{id}/content`; see [artifact-library.md](artifact-library.md)). It
+may never use the Engines or Links routes, the merged gallery or library, or the proxy, so
+nothing is transitive. An instance from before the artifact library answers its listing with 404:
+the library reports it as `unsupported` and lists the others.
 
 ### Shared engines and fit
 
@@ -143,8 +147,8 @@ a GPU never runs more than it is set to, whoever asked. When the caller disconne
 sharing side cancels the work, and with it the engine's job.
 
 On the calling side the `linked` adapter maps errors back to the same kinds
-(`engine_unavailable`, `engine_timeout`, `capability_unavailable`, `invalid_request`, else
-`engine_error`), by code rather than by message. A stream is retried only until its response
+(`engine_unavailable`, `engine_timeout`, `engine_crashed`, `capability_unavailable`,
+`invalid_request`, else `engine_error`), by code rather than by message. A stream is retried only until its response
 headers arrive, never after it has started, so a reply can't be duplicated. Routing never
 falls back silently: an unreachable link is `engine_unavailable`, like any engine that is down.
 
@@ -160,7 +164,8 @@ reappears once it answers. Each item has an `origin`: `link_id`, `instance_id`, 
 
 `/v1/links/{id}/r/<path>` passes a request on to the linked instance with the link's token
 and streams the answer back (server-sent events, `ETag`, `Last-Event-ID` included). Only
-`v1/conversations/...`, `v1/artifacts/...`, `v1/jobs/...` and `GET v1/backends` pass, and
+`v1/conversations/...`, `v1/artifacts/...`, `v1/jobs/...`, `GET v1/backends` and a pinned
+image's `v1/artifact-library/pins/{id}/content` pass, and
 the linked instance still applies its own `links.gallery`. The browser only ever holds its
 own server's token. The UI's routes for a remote conversation start with `#/l/<link id>`.
 

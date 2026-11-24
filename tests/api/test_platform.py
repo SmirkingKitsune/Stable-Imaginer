@@ -94,6 +94,12 @@ async def test_healthz_and_openapi(client: httpx.AsyncClient) -> None:
         "/v1/artifacts/{artifact_id}",
         "/v1/artifacts/{artifact_id}/content",
         "/v1/artifacts/{artifact_id}/lineage",
+        "/v1/artifact-library",
+        "/v1/artifact-library/pins",
+        "/v1/artifact-library/pins/{pin_id}",
+        "/v1/artifact-library/pins/{pin_id}/content",
+        "/v1/artifact-library/import",
+        "/v1/artifact-library/local",
         "/v1/backends",
     ]:
         assert path in spec["paths"], path

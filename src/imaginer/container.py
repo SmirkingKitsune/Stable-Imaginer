@@ -5,6 +5,7 @@ import contextlib
 from dataclasses import dataclass, field
 
 from imaginer.agents.library import AgentLibrary
+from imaginer.artifact_library.library import ArtifactLibrary
 from imaginer.backends.registry import FACTORIES, BackendRegistry
 from imaginer.core.config import BackendConfig, Settings, backend_kind, is_loopback_host
 from imaginer.core.logging import get_logger
@@ -59,6 +60,7 @@ class Container:
     loras: LoraLibrary
     models: ModelLibrary
     agents: AgentLibrary
+    artifact_library: ArtifactLibrary
     _tasks: list[asyncio.Task[None]] = field(default_factory=list)
 
     @classmethod
@@ -134,6 +136,7 @@ class Container:
         conversations.add_delete_hook(stop_work)
         engines = EngineService(settings, registry, raw=raw, view=view)
         registry.set_switcher(engines)  # an sd-server's edit card swaps per task
+        registry.set_reporter(engines)  # a failed sd-server says why, from its log
         hub = HubService(settings, engines)
         models.attach(engines=engines, hub=hub, artifacts=artifacts)
         agents.attach(
@@ -170,6 +173,8 @@ class Container:
         registry.set_lora_words(loras.words_for)
         context.set_lora_lookup(loras.briefs)
         hub.on_lora_install = loras.note_source
+        artifact_library = ArtifactLibrary(settings, db, artifacts, links)
+        await artifact_library.start()
         container = cls(
             settings=settings,
             db=db,
@@ -191,6 +196,7 @@ class Container:
             loras=loras,
             models=models,
             agents=agents,
+            artifact_library=artifact_library,
         )
         # Probe engines in the background: the API must come up even when they are down.
         probed = asyncio.create_task(registry.refresh())

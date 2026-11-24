@@ -14,7 +14,7 @@
 
 import { portrait } from './agents.js';
 import { setImage } from './api.js';
-import { announce, connectionStrip, dialog, menu, modelName, statusLine, toast } from './chrome.js';
+import { announce, connectionStrip, dialog, menu, modelName, statusLine, toast, toastRefusal } from './chrome.js';
 import { corners, h, icon, iconButton, clear } from './dom.js';
 import {
   argsLine, clock, imagesSummary, loraName, lorasWord, parseArgs, plural, ratioOf, specOf, truncate,
@@ -26,8 +26,8 @@ import { convHash } from './origin.js';
 import { promptBar } from './promptbar.js';
 import {
   agentOfMessage, byLabel, cancelJob, connection, currentBranch, editEngine, ensureLoaded, imageEngine, images, libraryLora,
-  loraLibrary, maskHint, on, pathOf, remove, rename, retry, reloadConversation, running, select, send, setArchivedFlag, siblingsOf,
-  stale, stop,
+  loraLibrary, maskHint, on, pathOf, refsHint, remove, rename, retry, reloadConversation, running, select, send, setArchivedFlag,
+  siblingsOf, stale, stop,
 } from './store.js';
 
 /** The image engine's LoRAs, with what the library knows of each (display names). */
@@ -615,7 +615,7 @@ export function conversationScreen({ id, navigate, focusBar = false }) {
   }
 
   /** Edit, Mask, Retry, reference: what the image engine's edits allow (an edit model may
-   * take no mask, or one image only). */
+   * take no mask, or one image only, unless the engine's model card takes more). */
   function figActions(a, result) {
     const engine = editEngine();
     const edit = engine ? engine.edit : {}; // the backends aren't loaded yet: offer them all
@@ -629,7 +629,7 @@ export function conversationScreen({ id, navigate, focusBar = false }) {
       }, icon('brush', 13), 'Mask'),
       retryButton(result, 'Run this call again on a new branch'),
       edit && !single && h('button.mini.square', {
-        type: 'button', title: 'Add to the bar as a reference', 'aria-label': `Use ${a.label} as a reference`,
+        type: 'button', title: refsHint(edit, 'Add to the bar as a reference'), 'aria-label': `Use ${a.label} as a reference`,
         onclick: () => bar.addArtifact(a),
       }, icon('plus', 13)));
   }
@@ -706,12 +706,12 @@ export function conversationScreen({ id, navigate, focusBar = false }) {
       editing = null;
       render();
     } catch (err) {
-      toast(err.status === 409 ? 'A turn is already running here.' : err.message);
+      toastRefusal(err); // the editor stays open with the text
     }
   }
 
   function doRetry(result) {
-    retry(id, result.id).catch((err) => toast(err.status === 409 ? 'A turn is already running here.' : err.message));
+    retry(id, result.id).catch((err) => toastRefusal(err));
   }
 
   async function toggleArchive() {

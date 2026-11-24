@@ -119,7 +119,12 @@ images with, give the engine an **edit card** ("Use for edits on <engine>" on th
 - an edit with a mask runs on the model card when the edit card takes no mask and the model
   card does: Qwen-Image-2.1 next to Kontext or Qwen-Image-Edit keeps Mask available. That edit
   uses the model card's presets, and the Mask button's tooltip names the card;
-- the chat model is told how to prompt both;
+- likewise an edit with more images than the edit card takes (a mask counts as one) runs on
+  the model card when it takes them: next to Qwen-Image-2.1 (up to 10), FLUX.1 Kontext keeps
+  the one-image edits and Qwen-Image-2.1 combines several. The engine's edit limit
+  (`edit.max_ref_images`) is then the model card's, `edit.refs_card` names the card, and the
+  reference button's tooltip says so;
+- the chat model is told how to prompt both, and which edits run on the model card;
 - only an engine launched here switches (it needs `launch`), one image at a time
   (`concurrency: 1`). A stopped engine stays stopped: start it first. Which card is loaded is
   not saved: the engine always starts with its model card.

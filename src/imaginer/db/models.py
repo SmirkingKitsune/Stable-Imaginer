@@ -121,6 +121,8 @@ class Artifact(Base):
         sa.UniqueConstraint("conversation_id", "label"),
         sa.Index("ix_artifact_conv", "conversation_id", "created_at"),
         sa.Index("ix_artifact_conv_kind_source", "conversation_id", "kind", "source"),
+        # The artifact library shows each distinct image once and imports dedupe by it.
+        sa.Index("ix_artifact_sha256", "sha256"),
     )
 
 
@@ -344,3 +346,47 @@ class AgentRecord(Base):
     pinned: Mapped[bool] = mapped_column(sa.Boolean, default=False, server_default=sa.false())
     created_at: Mapped[datetime] = mapped_column(UTCDateTime)
     updated_at: Mapped[datetime] = mapped_column(UTCDateTime)
+
+
+# --- the artifact library (docs/artifact-library.md) -------------------------------------
+
+
+class ArtifactPin(Base):
+    """An image kept in the artifact library: a copy of its bytes under
+    ``<data_root>/artifact_library/`` and a snapshot of where it came from. No foreign keys:
+    a pin outlives its conversation, and its instance when it came from a linked one."""
+
+    __tablename__ = "artifact_pin"
+
+    id: Mapped[str] = mapped_column(_ID, primary_key=True)
+    # The image's original artifact id (UUIDv7): orders the pin with the live images.
+    sort_id: Mapped[str] = mapped_column(_ID)
+    sha256: Mapped[str] = mapped_column(sa.String(64))
+    kind: Mapped[str] = mapped_column(sa.String(16))  # an ArtifactKind value
+    source: Mapped[str] = mapped_column(sa.String(16))  # an ArtifactSource value
+    mime: Mapped[str] = mapped_column(sa.String(127))
+    storage_key: Mapped[str] = mapped_column(sa.String(64))  # "<id>.<ext>"
+    size_bytes: Mapped[int] = mapped_column(sa.BigInteger)
+    width: Mapped[int | None] = mapped_column(sa.Integer)
+    height: Mapped[int | None] = mapped_column(sa.Integer)
+    has_alpha: Mapped[bool | None] = mapped_column(sa.Boolean)
+    label: Mapped[str | None] = mapped_column(sa.String(32))
+    prompt: Mapped[str | None] = mapped_column(sa.Text)
+    conversation_title: Mapped[str | None] = mapped_column(sa.Text)
+    # {"metadata", "generation", "original_filename"} as they were when it was pinned.
+    snapshot: Mapped[dict[str, Any] | None] = mapped_column(JSONType)
+    source_instance_id: Mapped[str] = mapped_column(_ID)
+    source_instance_name: Mapped[str | None] = mapped_column(sa.String(64))
+    source_conversation_id: Mapped[str | None] = mapped_column(_ID)
+    source_artifact_id: Mapped[str | None] = mapped_column(_ID)
+    name: Mapped[str | None] = mapped_column(sa.Text)
+    notes: Mapped[str | None] = mapped_column(sa.Text)
+    tags: Mapped[list[str] | None] = mapped_column(JSONType)
+    image_created_at: Mapped[datetime] = mapped_column(UTCDateTime)
+    created_at: Mapped[datetime] = mapped_column(UTCDateTime)
+    updated_at: Mapped[datetime] = mapped_column(UTCDateTime)
+
+    __table_args__ = (
+        sa.UniqueConstraint("sha256"),
+        sa.Index("ix_artifact_pin_sort", "sort_id"),
+    )

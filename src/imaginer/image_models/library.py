@@ -37,7 +37,9 @@ from PIL import UnidentifiedImageError
 from pydantic import ValidationError
 
 from imaginer.backends.common import expand_path
+from imaginer.backends.sdcpp import edit_ref_limit as sdcpp_edit_ref_limit
 from imaginer.backends.sdcpp import mask_face as sdcpp_mask_face
+from imaginer.backends.sdcpp import ref_limit as sdcpp_ref_limit
 from imaginer.core.clock import utcnow
 from imaginer.core.config import (
     BackendConfig,
@@ -300,10 +302,8 @@ class ModelLibrary:
                 if edit_hint and edit_hint != hint:
                     edits = self.card_name(edit_card)
                     notes.append(f"For edit_image (it runs {edits}): {edit_hint}")
-                if isinstance(config, SdCppBackendConfig) and sdcpp_mask_face(config) == "main":
-                    # The edit card takes no mask, so a masked edit runs on the model card.
-                    who = main.name if main is not None else "the model card"
-                    notes.append(f"An edit_image call with a mask runs {who} instead.")
+                if isinstance(config, SdCppBackendConfig):
+                    notes += _model_card_edits(config, main.name if main is not None else None)
                 hint = " ".join([*([hint] if hint else []), *notes]) or None
         return hint
 
@@ -720,7 +720,7 @@ class ModelLibrary:
 
     async def locate(self, body: dto.ModelLocate) -> dto.ModelLocated:
         roots = self._search_roots()
-        found = await asyncio.to_thread(_find_named, roots, body.name.strip(), body.size_bytes)
+        found = await asyncio.to_thread(find_named, roots, body.name.strip(), body.size_bytes)
         return dto.ModelLocated(paths=[str(p) for p in found], searched=[str(r) for r in roots])
 
     def _search_roots(self) -> list[Path]:
@@ -1127,6 +1127,26 @@ def _card_hint(card: Card | None) -> str | None:
     return family.prompt_hint() if family is not None else None
 
 
+def _model_card_edits(config: SdCppBackendConfig, main: str | None) -> list[str]:
+    """Which edit_image calls an engine with an edit card runs on its model card instead:
+    ones with a mask, or more images than the edit card takes, when only the model card
+    makes them (FLUX.1 Kontext next to Qwen-Image-2.1)."""
+    if config.edit_view is None:
+        return []
+    who = main or "the model card"
+    notes = []
+    if sdcpp_mask_face(config) == "main":
+        notes.append(f"An edit_image call with a mask runs {who} instead.")
+    own, most = sdcpp_ref_limit(config.edit_view), sdcpp_edit_ref_limit(config)
+    if most > own:
+        some = "one image" if own == 1 else f"{own} images"
+        notes.append(
+            f"An edit_image call with more than {some} (a mask counts as one) runs {who} "
+            f"instead, which takes up to {most}."
+        )
+    return notes
+
+
 def _family_brief(family: recipes.Family) -> dto.ModelFamilyBrief:
     caps = family.capabilities()
     return dto.ModelFamilyBrief(
@@ -1160,7 +1180,7 @@ _LOCATE_BUDGET = 200_000  # entries looked at, over every root
 _LOCATE_MAX = 10
 
 
-def _find_named(roots: list[Path], name: str, size: int | None) -> list[Path]:
+def find_named(roots: list[Path], name: str, size: int | None) -> list[Path]:
     """Files called ``name`` (any case) under the roots, same size first. Blocking."""
     want = name.casefold()
     found: list[tuple[bool, Path]] = []

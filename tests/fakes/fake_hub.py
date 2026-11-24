@@ -1,12 +1,14 @@
 """A fake Hugging Face Hub: the REST endpoints ``imaginer.hub.client`` uses, over real HTTP.
 
 * ``GET /api/models``: search, by ``search`` (in the id), repeated ``filter`` (tags) and
-  ``pipeline_tag``.
+  ``pipeline_tag``; ``expand[]=siblings`` and ``expand[]=gguf`` add each repo's files and
+  what the Hub read from its GGUF (a repo's ``chat_template``, ``architecture``, ``params``).
 * ``GET /api/models/{owner}/{name}/revision/{rev}?blobs=true``: model info with siblings,
-  their sizes and LFS SHA-256s.
+  their sizes and LFS SHA-256s; with ``expand[]=gguf``, only its GGUF block.
 * ``GET /{owner}/{name}/resolve/{rev}/{path}``: a file, honouring ``Range`` (206, or 416 past
   the end), with ``X-Repo-Commit``. Model weights redirect to ``/cdn/...`` first, as the real
   Hub sends LFS files to its CDN.
+* ``GET /api/whoami-v2``: the account ``TOKEN`` belongs to; any other token is a 401.
 * Gated repos answer ``X-Error-Code: GatedRepo`` without the right token, unknown repos
   ``RepoNotFound`` and unknown files ``EntryNotFound``, in headers as the Hub does.
 
@@ -26,6 +28,7 @@ from starlette.responses import JSONResponse, RedirectResponse, Response, Stream
 from starlette.routing import Route
 
 TOKEN = "hf_fake_token"
+ACCOUNT = "acme-user"  # whose TOKEN is
 SHA = "c0ffee" + "0" * 34
 LFS_SUFFIXES = (".gguf", ".safetensors")
 
@@ -50,6 +53,19 @@ class FakeRepo:
     base_model: str | None = None
     downloads: int = 1000
     likes: int = 10
+    chat_template: str | None = None  # what the Hub read from its GGUF (expand[]=gguf)
+    architecture: str | None = None
+    params: int | None = None
+
+    def gguf(self) -> dict[str, Any] | None:
+        if self.chat_template is None and self.architecture is None:
+            return None
+        block: dict[str, Any] = {"total": self.params or 0, "context_length": 32768}
+        if self.architecture:
+            block["architecture"] = self.architecture
+        if self.chat_template is not None:
+            block["chat_template"] = self.chat_template
+        return block
 
 
 @dataclass
@@ -64,6 +80,7 @@ class FakeHub:
     def app(self) -> Starlette:
         return Starlette(
             routes=[
+                Route("/api/whoami-v2", self._whoami),
                 Route("/api/organizations/{name}/avatar", self._avatar),
                 Route("/api/users/{name}/avatar", self._no_avatar),
                 Route("/avatars/{name}.png", self._avatar_file),
@@ -73,6 +90,13 @@ class FakeHub:
                 Route("/cdn/{owner}/{name}/{rev}/{path:path}", self._cdn),
             ]
         )
+
+    # --- the token's account ----------------------------------------------------------
+
+    async def _whoami(self, request: Request) -> Response:
+        if request.headers.get("authorization") != f"Bearer {TOKEN}":
+            return JSONResponse({"error": "Invalid credentials in Authorization header"}, 401)
+        return JSONResponse({"type": "user", "name": ACCOUNT, "auth": {"type": "access_token"}})
 
     # --- avatars ------------------------------------------------------------------------
 
@@ -98,6 +122,7 @@ class FakeHub:
         filters = request.query_params.getlist("filter")
         task = request.query_params.get("pipeline_tag")
         limit = int(request.query_params.get("limit", 30))
+        expand = set(request.query_params.getlist("expand[]"))
         found: list[dict[str, Any]] = []
         for repo_id, repo in self.repos.items():
             tags = self._tags(repo)
@@ -119,6 +144,10 @@ class FakeHub:
                     "tags": tags,
                 }
             )
+            if "siblings" in expand:
+                found[-1]["siblings"] = [{"rfilename": path} for path in repo.files]
+            if "gguf" in expand and repo.gguf() is not None:
+                found[-1]["gguf"] = repo.gguf()
         found.sort(key=lambda r: -r["downloads"])
         return JSONResponse(found[:limit])
 
@@ -133,6 +162,9 @@ class FakeHub:
         repo = self.repos.get(repo_id)
         if repo is None:
             return _error(401, "RepoNotFound", "Repository not found")
+        if "gguf" in request.query_params.getlist("expand[]"):
+            block = repo.gguf()
+            return JSONResponse({"id": repo_id, **({"gguf": block} if block else {})})
         siblings = []
         for path, data in repo.files.items():
             sibling: dict[str, Any] = {"rfilename": path, "size": len(data)}

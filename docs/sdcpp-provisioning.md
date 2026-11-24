@@ -45,7 +45,8 @@ the requested accelerator and do not fall back to CPU.
 `latest` reuses a matching local installation until `--force` is given. `check-update`
 uses sd.cpp's `master-<count>-<hash>` tags, and reports any newer release without llama's
 100-build notification threshold. It reports whether the update needs a download,
-compilation, or is unavailable under a release-only policy. An update check never installs.
+compilation, or is unavailable under a release-only policy. A CPU fallback for a GPU
+request is reported as an update whatever its version. An update check never installs.
 
 ## Releases and source builds
 
@@ -66,8 +67,10 @@ and [build workflow](https://github.com/leejet/stable-diffusion.cpp/blob/master/
 - Unix archives' internal library symlinks are copied as regular library files. External
   links and unsafe paths are rejected. Validation runs before replacing the active binary.
 
-Source builds need Git, CMake, and a C++ compiler. On Windows, use a Visual Studio developer
-terminal with the C++ workload installed. CUDA requires a full CUDA Toolkit (`nvcc`),
+Source builds need Git, CMake, and a C++ compiler. On Windows, install Visual Studio or its
+Build Tools with the C++ workload; a CUDA build loads an MSVC toolset nvcc accepts, as
+[llama.cpp's](llama-provisioning.md#source-builds-and-releases) does. CUDA requires a full
+CUDA Toolkit (`nvcc`),
 ROCm requires the HIP SDK/compiler, Vulkan requires its SDK (`glslc`), and SYCL requires
 the oneAPI compiler (`icpx`). Use the SDK's environment setup before running the command.
 `CUDACXX` can select a particular CUDA compiler. AMD target overrides can be supplied with

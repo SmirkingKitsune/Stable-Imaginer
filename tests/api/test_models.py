@@ -384,9 +384,19 @@ async def test_masked_edits_run_the_model_card_when_the_edit_card_takes_no_mask(
         main["id"],
         main["name"],
     )
+    # It takes 3 images too; edits with more run on Qwen-Image-2.1, which takes 10.
+    assert (backend["edit"]["max_ref_images"], backend["edit"]["card_max_ref_images"]) == (10, 3)
+    assert (backend["edit"]["refs_card"], backend["edit"]["refs_card_name"]) == (
+        main["id"],
+        main["name"],
+    )
     container: Container = app.state.container
     hint = container.models.prompt_hint("old") or ""
     assert f"An edit_image call with a mask runs {main['name']} instead." in hint
+    assert (
+        f"An edit_image call with more than 3 images (a mask counts as one) runs {main['name']} "
+        "instead, which takes up to 10." in hint
+    )
 
 
 async def test_an_edit_card_needs_an_engine_started_here(

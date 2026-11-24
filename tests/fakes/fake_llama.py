@@ -269,7 +269,10 @@ class FakeLlama:
             if result.get("status") == "succeeded":
                 labels = ", ".join(i["label"] for i in result["images"])
                 return FakeLlama.text(f"Here you go: {labels}.")
-            return FakeLlama.text(f"That didn't work: {result['error']['detail']}")
+            error = result["error"]
+            hints = (error.get("engine_report") or {}).get("hints") or []
+            why = f" The engine's log says: {hints[0]}" if hints else ""
+            return FakeLlama.text(f"That didn't work: {error['detail']}.{why}")
         if body.get("tools") and body.get("tool_choice") != "none" and final["role"] == "user":
             text = final["content"] if isinstance(final["content"], str) else ""
             offered = {t["function"]["name"] for t in body["tools"]}

@@ -236,8 +236,9 @@ export function enginesScreen({ name: wanted = null, navigate }) {
     const r = e.runtime;
     const job = e.install;
     const busy = job?.state === 'running';
+    const fallback = r.requested_accelerator && `fallback for ${r.requested_accelerator}`;
     const line = r.installed
-      ? [r.version, r.accelerator, r.method].filter(Boolean).join(' · ')
+      ? [r.version, r.accelerator, fallback, r.method].filter(Boolean).join(' · ')
       : 'not installed';
     return h('div.tray-cell.row-cell',
       h('div.cell-grow',
@@ -664,12 +665,14 @@ export function enginesScreen({ name: wanted = null, navigate }) {
   async function checkUpdate(e) {
     try {
       const u = await api.checkUpdate(e.name);
+      const installed = u.current_version || u.installed_version || e.runtime.version;
+      const update = { label: 'Update…', onclick: () => installDialog(e, refresh, { force: true }) };
       if (u.error) toast(`Update check failed: ${u.error}`, { error: true });
-      else if (u.update_available) {
-        toast(`${u.latest_version} is available (installed ${u.current_version})`, {
-          error: true, action: { label: 'Update…', onclick: () => installDialog(e, refresh, { force: true }) },
-        });
-      } else toast(`Up to date · ${u.current_version || e.runtime.version}`);
+      else if (u.fallback) toast(u.warning || `${installed} is the ${u.fallback} fallback`, { error: true, action: update });
+      else if (u.update_available) toast(`${u.latest_version} is available (installed ${installed})`, { error: true, action: update });
+      // Behind, but not far enough to press for an update: say so rather than "up to date".
+      else if (u.behind > 0) toast(`${installed} · ${u.behind} build${u.behind === 1 ? '' : 's'} behind ${u.latest_version}`, { action: update });
+      else toast(`Up to date · ${installed}`);
     } catch (err) {
       toast(err.message, { error: true });
     }
@@ -945,6 +948,8 @@ export async function enginePopover(anchor) {
     icon('layers', 15), 'Model library', h('span.spacer'), icon('arrowRight', 15)),
   h('button.menu-item.pop-settings', { type: 'button', onclick: () => go('#/loras') },
     icon('puzzle', 15), 'LoRA library', h('span.spacer'), icon('arrowRight', 15)),
+  h('button.menu-item.pop-settings', { type: 'button', onclick: () => go('#/artifacts') },
+    icon('image', 15), 'Artifact library', h('span.spacer'), icon('arrowRight', 15)),
   h('button.menu-item.pop-settings', { type: 'button', onclick: () => go('#/links') },
     icon('link', 15), 'Linked instances', h('span.spacer'), icon('arrowRight', 15)));
   document.body.append(sheet);

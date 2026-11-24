@@ -31,13 +31,15 @@ import asyncio
 import base64
 import contextlib
 import time
-from collections.abc import Awaitable, Callable
+from collections.abc import AsyncIterator, Awaitable, Callable
 from dataclasses import dataclass, field, replace
+from datetime import datetime
 from typing import Any, Literal, Protocol
 
 from imaginer.backends.base import (
     BackendHealth,
     EditRequest,
+    EngineReport,
     GenProgress,
     GenRequest,
     ImageResult,
@@ -69,7 +71,14 @@ from imaginer.core.config import (
 )
 from imaginer.core.logging import get_logger
 from imaginer.domain.enums import BackendStatus, Capability
-from imaginer.domain.errors import EngineError, ImaginerError, InvalidRequestError
+from imaginer.domain.errors import (
+    EngineCrashedError,
+    EngineError,
+    EngineTimeoutError,
+    EngineUnavailableError,
+    ImaginerError,
+    InvalidRequestError,
+)
 from imaginer.image_models import recipes
 from imaginer.services.media import inspect_image_bytes
 
@@ -142,20 +151,52 @@ def mask_instruction(config: SdCppBackendConfig) -> str | None:
 Face = Literal["main", "edit"]
 
 
-def mask_face(config: SdCppBackendConfig) -> Face | None:
-    """Which card an edit with a mask runs on an engine with an edit card (None without
-    one): the edit card, unless it takes no mask and the model card edits with one, as
-    Qwen-Image-2.1 does next to FLUX.1 Kontext."""
+def takes_edit(config: SdCppBackendConfig, *, images: int = 1, mask: bool = False) -> bool:
+    """Whether the card ``config`` runs makes an edit of ``images`` images, with a mask if
+    ``mask`` (one more input)."""
+    caps = expected_capabilities(config)
+    inputs = images + int(mask)
+    return (
+        Capability.EDIT in caps
+        and (inputs == 1 or Capability.MULTI_REF in caps)
+        and inputs <= ref_limit(config)
+        and (not mask or mask_instruction(config) is not None)
+    )
+
+
+def edit_face(config: SdCppBackendConfig, *, images: int = 1, mask: bool = False) -> Face | None:
+    """Which card an edit runs on an engine with an edit card (None without one): the edit
+    card, unless it can't make this edit and the model card can. FLUX.1 Kontext takes one
+    image and no mask, Qwen-Image-2.1 up to ten and a mask: next to it, Kontext keeps the
+    one-image edits and Qwen-Image-2.1 makes the rest. An edit card that can't edit at all
+    keeps every edit, and so fails them as it would alone."""
     view = config.edit_view
     if view is None:
         return None
     if (
-        mask_instruction(view) is None
-        and mask_instruction(config) is not None
-        and Capability.EDIT in expected_capabilities(config)
+        Capability.EDIT in expected_capabilities(view)
+        and not takes_edit(view, images=images, mask=mask)
+        and takes_edit(config, images=images, mask=mask)
     ):
         return "main"
     return "edit"
+
+
+def mask_face(config: SdCppBackendConfig) -> Face | None:
+    """Which card an edit of one image with a mask runs on (see :func:`edit_face`)."""
+    return edit_face(config, mask=True)
+
+
+def edit_ref_limit(config: SdCppBackendConfig) -> int:
+    """The most input images an edit on the engine takes, on whichever card runs it: more
+    than its edit card takes, when its model card takes them."""
+    view = config.edit_view
+    if view is None:
+        return ref_limit(config)
+    most = ref_limit(config)
+    if most > ref_limit(view) and edit_face(config, images=most) == "main":
+        return most
+    return ref_limit(view)
 
 
 class CardSwitcher(Protocol):
@@ -179,6 +220,18 @@ class CardSwitcher(Protocol):
         """Return once the engine runs ``config``'s files, restarting it with them first if
         it runs the other card's."""
         ...
+
+
+class FailureReporter(Protocol):
+    """What an engine's process showed when work on it failed (EngineService)."""
+
+    async def failure_report(
+        self, engine: str, *, family: str | None, since: datetime, unreachable: bool
+    ) -> EngineReport | None: ...
+
+
+# What the engine (or reaching it) can fail with: these get its process's report.
+ENGINE_ERRORS = (EngineError, EngineUnavailableError, EngineTimeoutError)
 
 
 @dataclass(slots=True)
@@ -232,6 +285,7 @@ class SdCppBackend:
     image, so an edit switches the engine to the edit card and text-to-image switches back."""
 
     lora_words: WordsSource | None = None  # the LoRA library's trigger words, if it has any
+    reporter: FailureReporter | None = None  # what its process showed, if started here
 
     def __init__(
         self,
@@ -327,9 +381,15 @@ class SdCppBackend:
             assert config.edit_view is not None
             if not self.edit_face._takes_config(config.edit_view):
                 return False
-            self.edit_face._config = config.edit_view
-        self._config = config
+            self.edit_face._take(config.edit_view)
+        self._take(config)
         return True
+
+    def _take(self, config: SdCppBackendConfig) -> None:
+        """Use ``config`` from now on: its files decide what a card switch starts, and what
+        the face can do (an edit needs the text encoder's vision projector)."""
+        self._config = config
+        self._declared = frozenset(expected_capabilities(config))
 
     def _takes_config(self, config: SdCppBackendConfig) -> bool:
         try:
@@ -540,12 +600,14 @@ class SdCppBackend:
     async def _run(
         self, req: GenRequest, refs: list[str], base_size: tuple[int, int] | None = None
     ) -> list[ImageResult]:
+        since = utcnow()
         label = _LoadingLabel(req.on_loading)
         if self._face is not None and self.switcher is not None:
             # The engine may run the other card: switch it to this face's first.
-            await self.switcher.ensure(
-                self.name, self._face, self._config, notify=label.notify, probe=self.probe
-            )
+            async with self._explaining(since, "while it loaded its model"):
+                await self.switcher.ensure(
+                    self.name, self._face, self._config, notify=label.notify, probe=self.probe
+                )
         params = self.resolved_params(req, base_size)
         # Only an engine launched here has its LoRA folder on this machine, the folder its
         # listed paths are relative to: their trigger phrases and hashes come from there.
@@ -567,11 +629,62 @@ class SdCppBackend:
         # Hashed while the image is made.
         hashing = asyncio.ensure_future(with_sha256(folder, params.get("loras", [])))
         try:
-            results = await self._follow(req, params, body, hashing)
+            async with self._explaining(since, "while it made the image"):
+                results = await self._follow(req, params, body, hashing)
         finally:
             hashing.cancel()
         await label.drop()  # polling saw none of its steps
         return results
+
+    @contextlib.asynccontextmanager
+    async def _explaining(self, since: datetime, doing: str) -> AsyncIterator[None]:
+        """An engine failure inside comes out with what the engine's log showed."""
+        try:
+            yield
+        except ENGINE_ERRORS as exc:
+            explained = await self.explained(exc, since=since, doing=doing)
+            if explained is exc:
+                raise
+            raise explained from exc
+
+    async def explained(
+        self, exc: ImaginerError, *, since: datetime | None = None, doing: str | None = None
+    ) -> ImaginerError:
+        """``exc``, an engine failure of work that started at ``since``, with the report of
+        the engine's process (``engine_report``) when this server started it. An engine
+        that has exited makes it an ``engine_crashed`` error that says why; one stopped on
+        the Engines screen says so."""
+        if self.reporter is None:
+            return exc
+        started = since or utcnow()
+        try:
+            report = await self.reporter.failure_report(
+                self.name,
+                family=self.family,
+                since=started,
+                unreachable=isinstance(exc, EngineUnavailableError),
+            )
+        except Exception:
+            log.exception("sdcpp.report_failed", backend=self.name)
+            return exc
+        if report is None:
+            return exc
+        extra = {**exc.extra, "backend": self.name, "engine_report": report.details}
+        if report.state == "stopped":
+            return EngineUnavailableError(
+                f"{self.name} is stopped: start it on the Engines screen", **extra
+            )
+        if report.state != "exited":
+            return type(exc)(exc.detail, **extra)
+        earlier = report.exited_at is not None and report.exited_at < started
+        what = f"{self.name} crashed" + (f" ({report.exit})" if report.exit else "")
+        if earlier:
+            what = f"{self.name} isn't running: it crashed earlier" + (
+                f" ({report.exit})" if report.exit else ""
+            )
+        elif doing:
+            what += f" {doing}"
+        return EngineCrashedError(f"{what}: {report.summary or 'see its log'}", **extra)
 
     async def _follow(
         self,

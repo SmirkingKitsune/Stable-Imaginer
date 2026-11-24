@@ -25,6 +25,7 @@ import os
 import tempfile
 import time
 from collections.abc import Awaitable, Callable
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlsplit, urlunsplit
@@ -33,7 +34,7 @@ import yaml
 from pydantic import TypeAdapter, ValidationError
 
 from imaginer.backends import diffusers_inproc
-from imaginer.backends.base import BackendHealth, LoadingCallback
+from imaginer.backends.base import BackendHealth, EngineReport, LoadingCallback
 from imaginer.backends.registry import BackendRegistry
 from imaginer.backends.sdcpp import Face
 from imaginer.core.config import (
@@ -58,7 +59,7 @@ from imaginer.domain.errors import (
     InvalidRequestError,
     NotFoundError,
 )
-from imaginer.engines import launch
+from imaginer.engines import diagnostics, launch
 from imaginer.engines.installer import (
     Installer,
     InstallJob,
@@ -84,6 +85,7 @@ CardSettings = Callable[
     [str, dict[str, dict[str, Any]] | None, list[dict[str, Any]] | None], Awaitable[None]
 ]
 SWITCH_POLL_S = 1.0  # how often a switching engine is asked whether it has loaded
+EXIT_WAIT_S = 3.0  # how long an engine that stopped answering gets to be seen exiting
 
 
 class EngineService:
@@ -385,11 +387,16 @@ class EngineService:
         module, _ = engine_module(engine_type)
         active = module.read_active_runtime(root)
         exe = active.get("executable")
+        from imaginer.provisioning.llamacpp import requested_target
+
+        _, requested = requested_target(active)
+        fell_back = requested != active.get("accelerator")
         return dto.EngineRuntime(
             installed=bool(exe and Path(str(exe)).is_file()),
             version=_str(active.get("version")),
             method=_str(active.get("method")),
             accelerator=_str(active.get("accelerator")),
+            requested_accelerator=_str(requested) if fell_back else None,
             executable=_str(exe),
             installed_at=_str(active.get("installed_at")),
             directory=str(root),
@@ -410,6 +417,24 @@ class EngineService:
         self._require(name)
         proc = self.supervisor.peek(name)
         return proc.run.log_path if proc is not None and proc.run is not None else None
+
+    async def failure_report(
+        self, engine: str, *, family: str | None, since: datetime, unreachable: bool
+    ) -> EngineReport | None:
+        """What the engine's process shows about work that failed on it (started at
+        ``since``, on a card of ``family``); None when it wasn't started here. An engine
+        that stopped answering (``unreachable``) gets a moment to be seen exiting."""
+        proc = self.supervisor.peek(engine)
+        if proc is None or proc.run is None:
+            return None
+        if unreachable:
+            await proc.wait_exit(EXIT_WAIT_S)
+        return diagnostics.report(
+            proc,
+            family=recipes.family(family),
+            models_dir=self._settings.models_dir,
+            since=since,
+        )
 
     # --- process -------------------------------------------------------------------
 
@@ -667,14 +692,20 @@ class EngineService:
             return {"installed": False}
         from dataclasses import asdict
 
+        from imaginer.provisioning.llamacpp import requested_target
+
+        # What was asked for, not what a fallback installed: a CPU runtime standing in
+        # for CUDA is not up to date because it is the newest CPU build.
+        method, accelerator = requested_target(active)
         config = module.ProvisionConfig(
-            provision_dir=root,
-            install_method=str(active.get("method", "auto")),
-            accelerator=str(active.get("accelerator", "")),
+            provision_dir=root, install_method=method, accelerator=accelerator
         ).normalized()
         try:
             status = await asyncio.to_thread(
-                module.check_for_update, config, str(active["version"])
+                module.check_for_update,
+                config,
+                str(active["version"]),
+                installed_accelerator=str(active.get("accelerator") or ""),
             )
         except Exception as exc:
             return {"installed": True, "error": str(exc)}

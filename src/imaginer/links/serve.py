@@ -123,7 +123,7 @@ class PeerEngines:
             detail=info.detail,
             capabilities=capabilities,
             max_ref_images=(
-                sdcpp.ref_limit(config)
+                sdcpp.edit_ref_limit(config)  # either card's: edits run where they fit
                 if isinstance(config, SdCppBackendConfig)
                 else getattr(config, "max_ref_images", None)
             ),
@@ -245,7 +245,12 @@ class PeerEngines:
             yield "status", state
         task: Literal["t2i", "edit"] = "edit" if body.op == "edit" else "t2i"
         lease = await self._registry.image_backend(
-            task, name, require=require, preset=body.preset, mask=body.mask is not None
+            task,
+            name,
+            require=require,
+            preset=body.preset,
+            mask=body.mask is not None,
+            images=len(body.images),
         )
         request_id = new_id()
         try:

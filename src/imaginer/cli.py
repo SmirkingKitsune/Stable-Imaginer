@@ -190,14 +190,17 @@ def _provision_engine(args: argparse.Namespace) -> int:
             return 0
         if args.runtime_command == "check-update":
             active = engine.read_active_runtime(config.provision_dir)
+            method, accelerator = llamacpp.requested_target(active)
             config = replace(
                 config,
-                accelerator=args.accelerator or str(active.get("accelerator", config.accelerator)),
-                install_method=(
-                    str(active.get("method", "auto")) if args.method == "auto" else args.method
-                ),
+                accelerator=args.accelerator or accelerator or config.accelerator,
+                install_method=method if args.method == "auto" else args.method,
             )
-            status = engine.check_for_update(config, str(active.get("version", "")))
+            status = engine.check_for_update(
+                config,
+                str(active.get("version", "")),
+                installed_accelerator=str(active.get("accelerator") or ""),
+            )
             print(json.dumps(asdict(status), indent=2))
             return 0 if status.ok else 1
         binary = provisioner.ensure_runtime()

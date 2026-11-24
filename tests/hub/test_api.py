@@ -16,7 +16,7 @@ from fastapi import FastAPI
 from imaginer.core.config import load_settings, local_overrides_path
 from imaginer.hub import downloads
 from imaginer.main import create_app
-from tests.fakes.fake_hub import SHA, TOKEN, FakeHub, gguf
+from tests.fakes.fake_hub import ACCOUNT, SHA, TOKEN, FakeHub, gguf
 from tests.fakes.live import LiveServer
 from tests.hub.conftest import (
     GATED_REPO,
@@ -107,10 +107,62 @@ async def test_status_says_whether_a_token_is_set_but_never_shows_it(
     _log_in(isolated_hf, "hf_from_login")
     status = (await client.get("/v1/hub")).json()
     assert (status["token"], status["token_source"]) == (True, "hf auth login")
+    # The fake Hub knows TOKEN only: this one is rejected, and says so.
+    assert (status["token_valid"], status["account"]) == (False, None)
     monkeypatch.setenv("HF_TOKEN", "hf_secret_value")
     resp = await client.get("/v1/hub")
     assert (resp.json()["token"], resp.json()["token_source"]) == (True, "$HF_TOKEN")
     assert "hf_secret_value" not in resp.text and "hf_from_login" not in resp.text
+
+
+async def test_a_token_set_here_is_checked_then_saved_where_hf_reads_it(
+    client: httpx.AsyncClient, hub: FakeHub, isolated_hf: Path
+) -> None:
+    status = (await client.get("/v1/hub")).json()
+    assert (status["token_editable"], status["token_file"]) == (True, str(isolated_hf / "token"))
+    for bad, fragment in [
+        ("  ", "paste a Hub token"),
+        ("hf_two words", "not a Hub token"),
+        ("hf_revoked", "did not accept"),
+    ]:
+        resp = await client.put("/v1/hub/token", json={"token": bad})
+        assert resp.status_code == 422 and fragment in resp.json()["detail"], resp.text
+        if bad.strip():
+            assert bad.strip() not in resp.text  # never echoed back
+    assert not (isolated_hf / "token").exists()
+
+    resp = await client.put("/v1/hub/token", json={"token": f" {TOKEN}\n"})
+    assert resp.status_code == 200, resp.text
+    status = resp.json()
+    assert (status["token"], status["token_source"]) == (True, "hf auth login")
+    assert (status["token_valid"], status["account"]) == (True, ACCOUNT)
+    assert TOKEN not in resp.text
+    assert (isolated_hf / "token").read_text(encoding="utf-8") == TOKEN
+    # Used at once: a gated repo comes down with it.
+    body = {"repo": GATED_REPO, "variant": "g-Q4_K_M.gguf", "engine": "llama", "key": "model"}
+    assert (await _download(client, **body))["state"] == "succeeded"
+    assert hub.requests[-1]["auth"] == f"Bearer {TOKEN}"
+
+    resp = await client.delete("/v1/hub/token")
+    assert resp.status_code == 200, resp.text
+    assert (resp.json()["token"], resp.json()["account"]) == (False, None)
+    assert not (isolated_hf / "token").exists()
+    assert (await client.delete("/v1/hub/token")).status_code == 200  # already logged out
+
+
+async def test_a_token_from_the_environment_wins_and_is_not_replaced_here(
+    client: httpx.AsyncClient, monkeypatch: pytest.MonkeyPatch, isolated_hf: Path
+) -> None:
+    monkeypatch.setenv("HF_TOKEN", TOKEN)
+    status = (await client.get("/v1/hub")).json()
+    assert (status["token_source"], status["token_editable"]) == ("$HF_TOKEN", False)
+    assert (status["token_valid"], status["account"]) == (True, ACCOUNT)
+    for resp in (
+        await client.put("/v1/hub/token", json={"token": "hf_other"}),
+        await client.delete("/v1/hub/token"),
+    ):
+        assert resp.status_code == 409 and "$HF_TOKEN" in resp.json()["detail"], resp.text
+    assert not (isolated_hf / "token").exists()
 
 
 async def test_search_filters_by_format_task_and_base_model(client: httpx.AsyncClient) -> None:

@@ -133,6 +133,11 @@ def test_edit_families_say_what_they_take() -> None:
     assert longcat.slot("llm_vision") is not None and not longcat.slot("llm_vision").required  # type: ignore[union-attr]
     llada = recipes.family("llada-image")
     assert llada is not None and llada.size_multiple == 32 and llada.max_refs == 1
+    # Qwen-Image-2.1 takes up to ten reference images.
+    for family_id in ("qwen-image-21", "qwen-image-21-turbo"):
+        qwen21 = recipes.family(family_id)
+        assert qwen21 is not None and qwen21.max_refs == 10
+        assert Capability.MULTI_REF in qwen21.capabilities()
 
 
 def test_an_edit_needs_the_text_encoders_vision() -> None:

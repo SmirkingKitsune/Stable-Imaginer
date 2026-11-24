@@ -5,17 +5,19 @@
 // the message itself. Typing "@" picks one of the attached images, or one of the image
 // backend's LoRAs for this message only, and puts it in the text as a chip (see mentions.js).
 
-import { setImage } from './api.js';
-import { toast } from './chrome.js';
+import { setImage, setLibraryImage } from './api.js';
+import { libraryPicker } from './artifacts.js';
+import { menu, toast, turnRefusal } from './chrome.js';
 import { append, corners, h, icon, clear } from './dom.js';
 import { ASPECTS, loraName, lorasWord } from './format.js';
 import { loraItems, loraText, mentionEditor, uploadRef } from './mentions.js';
 import {
-  clearDraft, connection, defaultBackend, draft, editInfo, imageBackends, imageEngine, imageLoras, imagePreset, libraryLora,
-  loadLoras, loraLibrary, on, options, requestOptions, setOption, takeQueuedLoras,
+  addLibraryToDraft, clearDraft, connection, defaultBackend, draft, editInfo, imageBackends, imageEngine, imageLoras, imagePreset,
+  libraryLora, loadLoras, loraLibrary, on, options, requestOptions, runsRefsCard, setOption, takeQueuedLoras,
 } from './store.js';
 
 const MAX_LORAS = 8; // ImageRequestOptions.loras
+const MAX_ATTACHMENTS = 16; // MessageCreate.attachments
 const LORA_FILTER_FROM = 12; // listed LoRAs before the cell gets a filter field
 
 const STATUS_WORD = { ok: 'ready', degraded: 'loading', down: 'down', unavailable: 'off', unknown: '…' };
@@ -80,16 +82,20 @@ export function promptBar({
   const actions = h('div.pbar-actions');
   const tray = h('div.pbar-tray.blueprint', { hidden: true });
   const errorLine = h('div.pbar-error', { hidden: true });
+  // One paperclip for both ways in: a new file (which joins the artifact library once the
+  // message is sent, like every image of a conversation) or an image already there.
+  const attachBtn = h('button.pbar-attach', {
+    type: 'button', title: 'Attach images', 'aria-label': 'Attach images',
+    'aria-haspopup': 'menu', 'aria-expanded': 'false',
+    onclick: () => menu(attachBtn, [
+      { label: 'Upload from this device', icon: 'upload', hint: 'Joins the artifact library once sent', onclick: () => fileInput.click() },
+      { label: 'From the artifact library', icon: 'image', hint: 'Anything uploaded or made before', onclick: () => pickFromLibrary() },
+    ]),
+  }, icon('paperclip'));
 
   const bar = compact
     ? h('div.pbar.blueprint.compact', corners(), h('div.pbar-row', icon('chat', 16), editor.el, atts, actions))
-    : h('div.pbar.blueprint', corners(), atts, editor.el, h('div.pbar-row',
-      h('button.pbar-attach', {
-        type: 'button', title: 'Attach images', 'aria-label': 'Attach images',
-        onclick: () => fileInput.click(),
-      }, icon('paperclip')),
-      chips, optionsBtn, actions,
-    ));
+    : h('div.pbar.blueprint', corners(), atts, editor.el, h('div.pbar-row', attachBtn, chips, optionsBtn, actions));
   const el = h('div.pbar-wrap', !compact && [tray, errorLine], bar, fileInput);
   if (onFocus) el.addEventListener('focusin', () => onFocus());
 
@@ -100,6 +106,10 @@ export function promptBar({
   const refOf = (att) => att.artifact?.label ?? att.ref;
 
   function sourceOf(att) {
+    if (att.library) {
+      const where = att.library.origin?.link_id ? ` · ${att.library.origin.name}` : '';
+      return `${att.library.kind === 'mask' ? 'mask · ' : ''}library${where}`;
+    }
     const maskFor = att.artifact?.metadata?.mask_for;
     return att.artifact?.kind === 'mask' ? `mask${maskFor ? ` · ${maskFor}` : ''}`
       : att.artifact ? SOURCE_WORD[att.artifact.source] ?? att.artifact.source : 'upload';
@@ -107,6 +117,7 @@ export function promptBar({
 
   function fillThumb(img, att) {
     if (att.artifact) setImage(img, att.artifact);
+    else if (att.library) setLibraryImage(img, att.library);
     else img.src = att.preview;
   }
 
@@ -188,7 +199,8 @@ export function promptBar({
 
   /** The painted mask attached to this draft, if any: it rides in image_options.mask. */
   function maskLabel() {
-    return d.attachments.find((a) => a.artifact?.kind === 'mask')?.artifact.label ?? null;
+    const mask = d.attachments.find((a) => (a.artifact ?? a.library)?.kind === 'mask');
+    return mask ? mask.artifact?.label ?? mask.ref : null; // store.send renames a library one
   }
 
   function pick(selected, label, onclick, kind = '') {
@@ -300,6 +312,9 @@ export function promptBar({
         ? `${presetSummary(preset)}${preset.edits ? ` · for edits with ${preset.edits}` : ''}`
           // A masked edit runs the model card when the edit card takes no mask: not with this.
           + (preset.edits && maskLabel() && edit?.mask_card_name ? ` · not this masked edit (it runs ${edit.mask_card_name})` : '')
+          // So does one with more images than the edit card takes (FLUX.1 Kontext takes one).
+          + (preset.edits && !(maskLabel() && edit?.mask_card_name) && options.mode === 'raw' && runsRefsCard(edit, d.attachments.length)
+            ? ` · not this edit of ${d.attachments.length} images (it runs ${edit.refs_card_name})` : '')
         : `${engine?.name ?? 'backend'} defaults`));
     const loraCell = engine?.available_loras?.length > 0 && lorasCell(engine, preset);
 
@@ -499,12 +514,16 @@ export function promptBar({
   function renderError() {
     const down = connection().status === 'offline';
     if (!down) offlineDismissed = false;
-    const text = error ?? (down && !offlineDismissed
+    const text = error?.text ?? (down && !offlineDismissed
       ? 'Offline. Your draft is kept, and Send works again when the connection is back.' : null);
     errorLine.hidden = !text;
     if (!text) return;
+    const action = error?.action;
     clear(errorLine).append(
       h('span', text),
+      action && h('button.btn-line', {
+        type: 'button', onclick: () => { error = null; renderError(); action.onclick(); },
+      }, action.label),
       h('button.att-x', {
         type: 'button', title: 'Dismiss', 'aria-label': 'Dismiss',
         onclick: () => { if (error) error = null; else offlineDismissed = true; renderError(); },
@@ -549,12 +568,34 @@ export function promptBar({
   }
 
   /** Whether a raw edit has room for one more image: an edit model may take only one
-   * (FLUX.1 Kontext) or a few. Other modes let the chat model see more than it edits. */
+   * (FLUX.1 Kontext) or a few, unless the engine's model card takes more (Qwen-Image-2.1).
+   * Other modes let the chat model see more than it edits. */
   function roomForImage() {
-    const max = editInfo()?.max_ref_images;
+    const edit = editInfo();
+    const max = edit?.max_ref_images;
     if (options.mode !== 'raw' || !max || d.attachments.length < max) return true;
-    toast(`${editInfo()?.card_name ?? 'The edit model'} edits at most ${max} ${max === 1 ? 'image' : 'images'} at a time`, { error: true });
+    const who = edit.refs_card_name ?? edit.card_name ?? 'The edit model';
+    toast(`${who} edits at most ${max} ${max === 1 ? 'image' : 'images'} at a time`, { error: true });
     return false;
+  }
+
+  /** Images from the artifact library: copied into the conversation when it is sent. */
+  function pickFromLibrary() {
+    let room = MAX_ATTACHMENTS - d.attachments.length;
+    const max = editInfo()?.max_ref_images;
+    if (options.mode === 'raw' && max) room = Math.min(room, max - d.attachments.length);
+    if (room <= 0) {
+      if (!roomForImage()) return;
+      toast(`A message takes at most ${MAX_ATTACHMENTS} images`, { error: true });
+      return;
+    }
+    libraryPicker({
+      room,
+      onPick: (items) => {
+        addLibraryToDraft(draftKey, items, { max: d.attachments.length + room });
+        editor.focusEnd();
+      },
+    });
   }
 
   function addArtifact(artifact, { first = false, prefill = null } = {}) {
@@ -611,6 +652,13 @@ export function promptBar({
   const unsubscribe = [
     on('options', render), on('backends', render), on('loras', render),
     on('conn', () => { renderActions(); renderError(); }),
+    // Images put in this draft from elsewhere (the artifact library).
+    on(`draft:${draftKey}`, () => {
+      if (editor.text() !== d.text) setText(d.text);
+      renderAtts();
+      if (!compact) renderChips();
+      renderActions();
+    }),
   ];
   setText(d.text);
   if (!compact) {
@@ -649,8 +697,8 @@ export function promptBar({
   };
 }
 
+/** A failed send as {text, action}: see turnRefusal. */
 function describe(err) {
-  if (err.status === 409) return 'A turn is already running here. Stop it or wait for it to finish.';
-  if (err.status === 401) return 'The server needs an access token.';
-  return err.message || 'Something went wrong.';
+  if (err.status === 401) return { text: 'The server needs an access token.', action: null };
+  return turnRefusal(err, { running: 'A turn is already running here. Stop it or wait for it to finish.' });
 }

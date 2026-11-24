@@ -88,6 +88,17 @@ manager loops for `n`, so every output has its own seed.
   (502). Never let a raw library exception escape. `backends/openai_http/transport.py` maps
   HTTP failures and applies retries: only requests that never reached the engine, or a 503, are
   retried for non-idempotent calls.
+- **Crash reports:** an sd-server started from the Engines screen explains its failures. When a
+  job on it fails, or a request finds it down, the adapter asks the engine service for a report
+  on its process (`engines/diagnostics.py`): how it exited, the model files it ran (flagging any
+  from a repo its family doesn't usually take that slot from), the error and warning lines of
+  its log, its last lines without progress bars, and hints for failures we know (a tensor shape
+  mismatch, running out of memory, an unreadable file). An engine that has exited makes the
+  error `engine_crashed` (502), which says why: "sdcpp crashed (exit code 3, aborted) while it
+  made the image: GGML_ASSERT(ggml_can_mul_mat(a, b)) failed", not "unreachable". The report
+  rides in the error's `engine_report` extra, and the image tools hand it to the chat model
+  with a note to explain the cause and suggest a fix. Linked instances get only the code and
+  detail: the log and file paths stay on this machine.
 
 ### Cancellation
 

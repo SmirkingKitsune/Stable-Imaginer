@@ -62,6 +62,12 @@ async def _say(
     return cid, parse_sse(resp.text)
 
 
+async def _use(client: httpx.AsyncClient, agent: dict[str, Any]) -> None:
+    """Point its engine at the agent without launching it."""
+    resp = await client.post(f"/v1/agents/{agent['id']}/use", json={"start": False})
+    assert resp.status_code == 200, resp.text
+
+
 async def _turn_over(client: httpx.AsyncClient, cid: str) -> None:
     deadline = time.monotonic() + 15
     while True:
@@ -250,11 +256,18 @@ async def test_a_launched_engine_runs_its_agents_model(
         engine = (await client.get("/v1/engines/llama")).json()
         assert engine["agent"] == first["id"]
 
-        resp = await client.post(
-            "/v1/agents", json={"path": str(gemma), "engine": "llama", "name": "Gemma"}
-        )
+        # An agent must see images: a model with no vision projector beside it is refused.
+        body = {"path": str(gemma), "engine": "llama", "name": "Gemma"}
+        refused = await client.post("/v1/agents", json=body)
+        assert refused.status_code == 422 and "vision projector" in refused.json()["detail"]
+        projector = gemma.parent / "mmproj-gemma-3-12b-it-F16.gguf"
+        projector.write_bytes(gguf(900, 4))
+        resp = await client.post("/v1/agents", json=body)
         assert resp.status_code == 201, resp.text
         second = resp.json()
+        # The one beside it is taken.
+        assert next(f for f in second["files"] if f["key"] == "mmproj")["path"] == str(projector)
+        assert second["ready"] and second["vision"]
         assert second["use"]["runs_it"] is False
         assert second["use"]["runs_other"] == "Qwen3-VL-8B-Instruct"
 
@@ -277,3 +290,108 @@ async def test_a_launched_engine_runs_its_agents_model(
         assert (await client.delete(f"/v1/agents/{first['id']}")).status_code == 204
         names = [a["name"] for a in (await client.get("/v1/agents")).json()["items"]]
         assert names == ["Gemma"]
+
+
+async def test_branching_where_the_engine_runs_another_agent_names_that_agent(
+    make_settings: SettingsFactory, fake_llama: FakeLlama, tmp_path: Path
+) -> None:
+    """An edit & branch in an older conversation, after its engine was switched to another
+    agent, is refused for that reason, not as a turn already running there: the web UI only
+    says "a turn is running" for a 409 that names one (turn_id)."""
+    models = tmp_path / "models"
+    files = {}
+    for name, seed in (("Qwen3-VL-8B-Instruct-Q4_K_M", 1), ("gemma-3-12b-it-Q5_K_M", 3)):
+        (models / name).mkdir(parents=True)
+        files[name] = models / name / f"{name}.gguf"
+        files[name].write_bytes(gguf(4000, seed))
+        (models / name / f"mmproj-{name}-F16.gguf").write_bytes(gguf(900, seed + 1))
+    qwen, gemma = files.values()
+    launch = LlamaCppLaunch(model=qwen, mmproj=qwen.parent / f"mmproj-{qwen.stem}-F16.gguf")
+    settings = make_settings(
+        backends={"llama": llama_config(fake_llama.url, launch=launch)},
+        routing=RoutingConfig(chat="llama"),
+    )
+    async for client in _client_for(settings):
+        first = await _only_agent(client)
+        body = {"path": str(gemma), "engine": "llama", "name": "Gemma"}
+        second = (await client.post("/v1/agents", json=body)).json()
+        await _use(client, second)
+
+        # A conversation with Gemma, and one edit of its first message.
+        cid, _ = await _say(client, "a lighthouse", agent=second["id"])
+        url = f"/v1/conversations/{cid}/messages"
+        (asked,) = [m for m in (await client.get(url)).json()["items"] if m["role"] == "user"]
+        await _say(client, "a lighthouse at dusk", cid=cid, edit_of=asked["id"])
+
+        # The engine moves on to the other agent: a second edit there is refused, by name.
+        await _use(client, first)
+        refused = await client.post(url, json={"content": "a lighthouse", "edit_of": asked["id"]})
+        assert refused.status_code == 409, refused.text
+        problem = refused.json()
+        assert "turn_id" not in problem
+        assert (problem["agent_id"], problem["engine"]) == (second["id"], "llama")
+        assert problem["use"] == f"/v1/agents/{second['id']}/use"
+        assert problem["detail"] == (
+            f"llama runs {first['name']}: switch it to Gemma first (Use on llama)"
+        )
+
+        # Switched back, the same edit makes a third version of the message.
+        await _use(client, second)
+        await _say(client, "a lighthouse in fog", cid=cid, edit_of=asked["id"])
+        everything = (await client.get(url, params={"all_branches": True})).json()["items"]
+        versions = [m["content_text"] for m in everything if m["parent_id"] is None]
+        assert versions == ["a lighthouse", "a lighthouse at dusk", "a lighthouse in fog"]
+
+
+async def test_detect_checks_a_model_here_before_it_becomes_an_agent(
+    chat: httpx.AsyncClient, tmp_path: Path
+) -> None:
+    folder = tmp_path / "models" / "acme" / "Look-4B-GGUF"
+    folder.mkdir(parents=True)
+    model = folder / "Look-4B-Q4_K_M.gguf"
+    model.write_bytes(gguf(4000, 1))
+
+    # No projector beside it: it can't see images, so it can't be an agent.
+    blind = (await chat.post("/v1/agents/detect", json={"path": str(model)})).json()
+    assert blind["kind"] == "path" and blind["name"] == "Look-4B"
+    assert blind["fit"]["vision"] is False and not blind["fit"]["allowed"]
+    assert "vision projector" in blind["fit"]["problems"][0]
+    assert blind["owner"] == "acme"  # its Hub uploader, by the folder it is in
+
+    projector = folder / "mmproj-Look-4B-F16.gguf"
+    projector.write_bytes(gguf(900, 2))
+    seeing = (await chat.post("/v1/agents/detect", json={"path": str(model)})).json()
+    assert seeing["fit"]["allowed"] and seeing["fit"]["vision"]
+    assert [p["id"] for p in seeing["projectors"]] == [str(projector)]
+
+    # Dropping the projector finds the model beside it.
+    dropped = (await chat.post("/v1/agents/detect", json={"path": str(projector)})).json()
+    assert dropped["fit"]["allowed"] and [m["id"] for m in dropped["models"]] == [str(model)]
+    assert dropped["fit"]["notes"]
+    # ...but an agent is made of the model, with the projector as its mmproj.
+    refused = await chat.post("/v1/agents", json={"path": str(projector)})
+    assert refused.status_code == 422 and "vision projector" in refused.json()["detail"]
+
+    nowhere = {"path": str(folder / "nope.gguf")}
+    missing = (await chat.post("/v1/agents/detect", json=nowhere)).json()
+    assert not missing["fit"]["allowed"] and "no file" in missing["fit"]["problems"][0]
+
+    made = await chat.post("/v1/agents", json={"path": str(model)})
+    assert made.status_code == 201, made.text
+    assert next(f for f in made.json()["files"] if f["key"] == "mmproj")["path"] == str(projector)
+
+    # A dropped file is found by its name and size where agents' models are kept.
+    other = folder / "Look-4B-Q8_0.gguf"
+    other.write_bytes(gguf(6000, 3))
+    located = await chat.post(
+        "/v1/agents/locate", json={"name": other.name, "size_bytes": other.stat().st_size}
+    )
+    assert located.json()["paths"] == [str(other)]
+
+
+async def test_detect_what_an_engine_started_elsewhere_runs(chat: httpx.AsyncClient) -> None:
+    found = (await chat.post("/v1/agents/detect", json={"engine": "llama"})).json()
+    assert found["kind"] == "engine" and found["name"] == "Qwen3VL-8B-Instruct"
+    assert found["fit"]["allowed"] and found["fit"]["vision"] is True
+    bad = await chat.post("/v1/agents/detect", json={"engine": "nope"})
+    assert bad.status_code == 422

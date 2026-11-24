@@ -16,15 +16,15 @@ import asyncio
 import base64
 import binascii
 import json
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from datetime import datetime
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 from pydantic import ValidationError
 
 from imaginer.domain import models as dto
-from imaginer.domain.errors import EngineUnavailableError, ImaginerError, InvalidRequestError
+from imaginer.domain.errors import ImaginerError, InvalidRequestError
 from imaginer.links.state import Link
 from imaginer.orchestration.event_bus import TurnManager
 from imaginer.services.conversations import ConversationService, encode_cursor
@@ -36,12 +36,14 @@ LOCAL = "local"
 REMOTE_TIMEOUT_S = 3.0
 RECHECK_AFTER_S = 5.0  # how often listings ask an unreachable link again (in the background)
 
-Position = tuple[str, str] | None  # (updated_at ISO, id); None: the source is exhausted
+# Where a source's listing goes on from: the gallery keeps (updated_at ISO, id) of the last
+# conversation taken, the artifact library (id,). None: the source is exhausted.
+Position = tuple[str, ...] | None
 
 
 @dataclass(frozen=True)
-class SourcePage:
-    items: list[dto.GalleryItem]  # newest first, all after the source's position
+class SourcePage[T]:
+    items: list[T]  # newest first, all after the source's position
     has_more: bool
 
 
@@ -55,19 +57,38 @@ def decode(cursor: str) -> dict[str, Position]:
         raw = json.loads(base64.urlsafe_b64decode(cursor + "=" * (-len(cursor) % 4)))
         if not isinstance(raw, dict):
             raise ValueError("not an object")
-        return {str(k): (str(v[0]), str(v[1])) if v is not None else None for k, v in raw.items()}
+        positions: dict[str, Position] = {}
+        for k, v in raw.items():
+            if v is not None and (not isinstance(v, list) or not v):
+                raise ValueError("not a position")
+            positions[str(k)] = tuple(str(part) for part in v) if v is not None else None
+        return positions
     except (binascii.Error, ValueError, TypeError, IndexError, KeyError) as exc:
         raise InvalidRequestError("invalid cursor") from exc
 
 
-def merge(
-    pages: Mapping[str, SourcePage], positions: Mapping[str, Position], limit: int
-) -> tuple[list[dto.GalleryItem], dict[str, Position]]:
+def _by_activity(item: Any) -> Any:
+    return (item.updated_at, item.id)
+
+
+def _activity_position(item: Any) -> tuple[str, ...]:
+    return (item.updated_at.isoformat(), item.id)
+
+
+def merge[T](
+    pages: Mapping[str, SourcePage[T]],
+    positions: Mapping[str, Position],
+    limit: int,
+    *,
+    sort_key: Callable[[T], Any] = _by_activity,
+    position: Callable[[T], tuple[str, ...]] = _activity_position,
+) -> tuple[list[T], dict[str, Position]]:
     """The newest ``limit`` items across the pages, and every source's position after them.
+    By default items are gallery conversations, ordered by their latest activity.
 
     A source is exhausted once it has no more pages and all its items were taken."""
     pool = [(item, source) for source, page in pages.items() for item in page.items]
-    pool.sort(key=lambda pair: (pair[0].updated_at, pair[0].id), reverse=True)
+    pool.sort(key=lambda pair: sort_key(pair[0]), reverse=True)
     chosen = pool[:limit]
     after = dict(positions)
     for source, page in pages.items():
@@ -75,8 +96,19 @@ def merge(
         if not page.has_more and len(taken) == len(page.items):
             after[source] = None
         elif taken:
-            after[source] = (taken[-1].updated_at.isoformat(), taken[-1].id)
+            after[source] = position(taken[-1])
     return [item for item, _ in chosen], after
+
+
+def source_failed(source: dto.GallerySource, error: BaseException) -> dto.GallerySource:
+    """A source as listed once asking it failed: unreachable when it didn't answer."""
+    reachable = isinstance(error, ImaginerError) and not error.code.startswith("engine")
+    return source.model_copy(
+        update={
+            "status": "error" if reachable else "unreachable",
+            "detail": error.detail if isinstance(error, ImaginerError) else str(error),
+        }
+    )
 
 
 def _source_cursor(position: Position) -> str | None:
@@ -122,18 +154,12 @@ class Gallery:
             ),
             return_exceptions=True,
         )
-        pages: dict[str, SourcePage] = {}
+        pages: dict[str, SourcePage[dto.GalleryItem]] = {}
         for source, result in zip(wanted, fetched, strict=True):
             if isinstance(result, SourcePage):
                 pages[source] = result
                 continue
-            reachable = isinstance(result, ImaginerError) and not result.code.startswith("engine")
-            sources[source] = sources[source].model_copy(
-                update={
-                    "status": "error" if reachable else "unreachable",
-                    "detail": result.detail if isinstance(result, ImaginerError) else str(result),
-                }
-            )
+            sources[source] = source_failed(sources[source], result)
             positions[source] = None  # skip it for the rest of this listing
         items, after = merge(pages, positions, limit)
         done = all(after.get(s, "start") is None for s in sources)
@@ -143,7 +169,9 @@ class Gallery:
             sources=list(sources.values()),
         )
 
-    async def _local(self, limit: int, position: Position, include_archived: bool) -> SourcePage:
+    async def _local(
+        self, limit: int, position: Position, include_archived: bool
+    ) -> SourcePage[dto.GalleryItem]:
         page = await self._conversations.list(
             limit=limit, cursor=_source_cursor(position), include_archived=include_archived
         )
@@ -157,28 +185,20 @@ class Gallery:
 
     async def _remote(
         self, link: Link, limit: int, position: Position, include_archived: bool
-    ) -> SourcePage:
-        if link.status in ("unauthorized", "incompatible"):
-            raise InvalidRequestError(link.detail or f"{link.peer_name} is {link.status}")
-        if link.status == "unreachable":
-            self._links.recheck(link, RECHECK_AFTER_S)
-            raise EngineUnavailableError(link.detail or f"{link.peer_name} is unreachable")
+    ) -> SourcePage[dto.GalleryItem]:
         params: dict[str, str | int] = {"limit": limit, "include_archived": include_archived}
         cursor = _source_cursor(position)
         if cursor is not None:
             params["cursor"] = cursor
-        try:
-            response = await link.transport.request(
-                "GET",
-                "/v1/conversations",
-                params=params,
-                timeout_s=REMOTE_TIMEOUT_S,
-                attempts=1,
-                accept_status=frozenset({403}),
-            )
-        except ImaginerError:
-            self._links.recheck(link, 0)  # so the next listings know without waiting
-            raise
+        response = await self._links.ask(
+            link,
+            "GET",
+            "/v1/conversations",
+            params=params,
+            timeout_s=REMOTE_TIMEOUT_S,
+            accept_status=frozenset({403}),
+            recheck_after_s=RECHECK_AFTER_S,
+        )
         if response.status_code == 403:
             raise InvalidRequestError(f"{link.peer_name} doesn't share its conversations")
         try:

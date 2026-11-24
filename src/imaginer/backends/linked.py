@@ -37,6 +37,7 @@ from imaginer.domain import models as dto
 from imaginer.domain.enums import BackendKind, BackendStatus, Capability
 from imaginer.domain.errors import (
     CapabilityUnavailableError,
+    EngineCrashedError,
     EngineError,
     EngineInterruptedError,
     EngineTimeoutError,
@@ -53,6 +54,7 @@ _ERRORS: dict[str, type[ImaginerError]] = {
     EngineUnavailableError.code: EngineUnavailableError,
     EngineTimeoutError.code: EngineTimeoutError,
     EngineInterruptedError.code: EngineInterruptedError,
+    EngineCrashedError.code: EngineCrashedError,
     CapabilityUnavailableError.code: CapabilityUnavailableError,
     InvalidRequestError.code: InvalidRequestError,
 }

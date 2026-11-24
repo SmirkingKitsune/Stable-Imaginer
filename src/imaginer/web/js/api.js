@@ -194,6 +194,9 @@ export const api = {
   // --- Hugging Face Hub ---
   hub: () => getJson('v1/hub'),
   updateHub: (patch) => sendJson('PATCH', 'v1/hub', patch),
+  /** Checked with the Hub, then saved where `hf auth login` keeps it. Never read back. */
+  setHubToken: (token) => sendJson('PUT', 'v1/hub/token', { token }),
+  clearHubToken: () => sendJson('DELETE', 'v1/hub/token'),
   /** {q, format, sort, limit, base_model, relation} */
   hubSearch: (params) => getJson(`v1/hub/search?${new URLSearchParams(params)}`),
   /** A repo's layout, matched to engine's model settings. ref: anything a person pastes. */
@@ -210,6 +213,10 @@ export const api = {
   agents: () => getJson('v1/agents'),
   agent: (id) => getJson(`v1/agents/${id}`),
   createAgent: (body) => sendJson('POST', 'v1/agents', body),
+  /** Whether a model can be an agent ({path, mmproj, chat_template} | {ref} | {engine}). */
+  detectAgent: (body) => sendJson('POST', 'v1/agents/detect', body),
+  /** Where a GGUF dropped in the browser is on this machine ({name, size_bytes}). */
+  locateAgentModel: (body) => sendJson('POST', 'v1/agents/locate', body),
   updateAgent: (id, patch) => sendJson('PATCH', `v1/agents/${id}`, patch),
   deleteAgent: (id) => sendJson('DELETE', `v1/agents/${id}`),
   useAgent: (id, body = {}) => sendJson('POST', `v1/agents/${id}/use`, body),
@@ -249,6 +256,27 @@ export const api = {
   /** {artifact_id} or {hub: true} */
   setLoraCover: (id, body) => sendJson('PUT', `v1/loras/${id}/cover`, body),
   clearLoraCover: (id) => sendJson('DELETE', `v1/loras/${id}/cover`),
+
+  // --- the artifact library (every image, here and on linked instances) ---
+  /** {cursor, limit, kind: image|mask|all, source: [..], q, pinned, origin} */
+  library({ cursor = null, limit = 60, kind = 'image', source = [], q = '', pinned = false, origin = null } = {}) {
+    const p = new URLSearchParams({ limit, kind });
+    if (cursor) p.set('cursor', cursor);
+    for (const s of source) p.append('source', s);
+    if (q) p.set('q', q);
+    if (pinned) p.set('pinned', 'true');
+    if (origin) p.set('origin', origin);
+    return getJson(`v1/artifact-library?${p}`);
+  },
+  /** {ref, name, notes, tags}: keeps a copy of the image, so it outlives its conversation. */
+  pinImage: (body) => sendJson('POST', 'v1/artifact-library/pins', body),
+  updatePin: (id, patch) => sendJson('PATCH', `v1/artifact-library/pins/${id}`, patch),
+  unpin: (id) => sendJson('DELETE', `v1/artifact-library/pins/${id}`),
+  /** Copy a library image (ref) into a conversation, here or on a linked instance; the
+   * artifact it became there. */
+  importImage: (conversationId, ref, linkId = null) => sendJson('POST', 'v1/artifact-library/import', {
+    conversation_id: conversationId, link_id: linkId, ref,
+  }),
 
   // --- linked instances ---
   links: () => getJson('v1/links'),
@@ -341,11 +369,27 @@ export function setImageUrl(img, url) {
   pending.then((u) => { img.src = u; }, () => {});
 }
 
+/** Where a library item's bytes are: on this server, or through a linked instance's proxy. */
+export const libraryUrl = (item) => `${item.origin.base_path ?? ''}${item.content_url}`;
+
+/** A library image: its bytes may be on a linked instance, or only in its pin. */
+export const setLibraryImage = (img, item) => setImageUrl(img, libraryUrl(item));
+
 export async function download(artifact) {
-  const resp = await request('GET', contentOf(artifact));
-  const href = URL.createObjectURL(await resp.blob());
   const ext = artifact.mime.split('/').pop().replace('jpeg', 'jpg');
-  const a = Object.assign(document.createElement('a'), { href, download: `${artifact.label}.${ext}` });
+  await saveFrom(contentOf(artifact), `${artifact.label}.${ext}`);
+}
+
+export async function downloadLibraryItem(item) {
+  const ext = item.mime.split('/').pop().replace('jpeg', 'jpg');
+  const stem = item.pin?.name || item.original_filename?.replace(/\.[^.]*$/, '') || item.label || 'image';
+  await saveFrom(rel(libraryUrl(item)), `${stem.replace(/[\\/:*?"<>|]+/g, '-')}.${ext}`);
+}
+
+async function saveFrom(path, name) {
+  const resp = await request('GET', path);
+  const href = URL.createObjectURL(await resp.blob());
+  const a = Object.assign(document.createElement('a'), { href, download: name });
   document.body.append(a);
   a.click();
   a.remove();

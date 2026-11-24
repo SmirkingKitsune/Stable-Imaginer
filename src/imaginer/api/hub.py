@@ -26,14 +26,28 @@ _STREAM_DOC: dict[int | str, dict[str, Any]] = {
 
 @router.get("")
 async def hub_status(container: ContainerDep) -> dto.HubStatus:
-    """The endpoint, whether a Hub token is set (never the token), and where models go."""
-    return container.hub.status()
+    """The endpoint, whether a Hub token is set (never the token) and whose it is, and
+    where models go."""
+    return await container.hub.status()
 
 
 @router.patch("")
 async def update_hub(body: dto.HubSettingsUpdate, container: ContainerDep) -> dto.HubStatus:
     """Change where downloads go. Saved to ``config/<profile>.local.yaml``."""
     return await container.hub.update(body)
+
+
+@router.put("/token")
+async def set_token(body: dto.HubTokenUpdate, container: ContainerDep) -> dto.HubStatus:
+    """Check a Hub token with the Hub, then save it where ``hf auth login`` does, so the
+    ``hf`` CLI and Diffusers use it too. 409 when ``$HF_TOKEN`` (which wins) is set."""
+    return await container.hub.set_token(body)
+
+
+@router.delete("/token")
+async def clear_token(container: ContainerDep) -> dto.HubStatus:
+    """Remove the saved Hub token, as ``hf auth logout`` does."""
+    return await container.hub.clear_token()
 
 
 @router.get("/search")
@@ -50,11 +64,23 @@ async def search(
     ),
     sort: Literal["downloads", "trending", "likes", "updated"] = "downloads",
     limit: int = Query(default=30, ge=1, le=100),
+    vision: bool = Query(
+        default=False,
+        description="Only GGUF repos with a vision projector (what an agent needs), each "
+        "saying whether its chat template takes tools; those that do come first.",
+    ),
 ) -> list[dto.HubRepoSummary]:
     """Model repos on the Hub. ``base_model`` with ``relation=quantized`` lists a model's
     GGUF and other quantized versions."""
     return await container.hub.search(
-        q, fmt=format, base_model=base_model, relation=relation, task=task, sort=sort, limit=limit
+        q,
+        fmt=format,
+        base_model=base_model,
+        relation=relation,
+        task=task,
+        sort=sort,
+        limit=limit,
+        vision=vision,
     )
 
 

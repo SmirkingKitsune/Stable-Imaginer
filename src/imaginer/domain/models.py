@@ -3,7 +3,7 @@
 from datetime import datetime
 from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, computed_field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, SecretStr, computed_field, model_validator
 
 from imaginer.domain.enums import (
     ArtifactKind,
@@ -414,7 +414,24 @@ class BackendEditInfo(BaseModel):
     card_name: str | None = None
     capabilities: list[Capability] = Field(default_factory=list)
     max_ref_images: int | None = Field(
-        default=None, description="Input images an edit takes at most (a mask counts as one)."
+        default=None,
+        description=(
+            "Input images an edit takes at most (a mask counts as one), on whichever card "
+            "runs it: more than the edit card takes run on refs_card."
+        ),
+    )
+    refs_card: str | None = Field(
+        default=None,
+        description=(
+            "The card an edit with more input images than the edit card takes runs instead, "
+            "when the engine's model card takes them (FLUX.1 Kontext takes one, "
+            "Qwen-Image-2.1 up to ten)."
+        ),
+    )
+    refs_card_name: str | None = None
+    card_max_ref_images: int | None = Field(
+        default=None,
+        description="Input images the edit card itself takes at most, when refs_card is set.",
     )
     mask: bool = Field(default=True, description="Whether an edit can take a mask.")
     mask_card: str | None = Field(
@@ -532,6 +549,8 @@ class EngineRuntime(BaseModel):
     version: str | None = None
     method: str | None = None
     accelerator: str | None = None
+    # What the install asked for, when a fallback installed something else (cpu for cuda).
+    requested_accelerator: str | None = None
     executable: str | None = None
     installed_at: str | None = None
     directory: str
@@ -682,6 +701,20 @@ class HubStatus(BaseModel):
     endpoint: str
     token: bool = Field(description="Whether a Hub token is set. The token itself never is.")
     token_source: str | None = Field(default=None, description="'$HF_TOKEN' or 'hf auth login'.")
+    token_valid: bool | None = Field(
+        default=None,
+        description="False when the Hub rejected the token; null when it couldn't be checked.",
+    )
+    account: str | None = Field(
+        default=None, description="The Hub account the token belongs to, when the Hub says."
+    )
+    token_file: str = Field(
+        description="Where a token set here is saved: the file `hf auth login` writes."
+    )
+    token_editable: bool = Field(
+        description="False when the token comes from an environment variable, which wins "
+        "over the file."
+    )
     models_dir: str = Field(description="Where downloads go.")
     hf_cache: str | None = Field(
         default=None, description="The Hugging Face cache searched for copies, if any."
@@ -694,6 +727,11 @@ class HubSettingsUpdate(_Input):
     )
 
 
+class HubTokenUpdate(_Input):
+    # Checked by the service, not by constraints here: a validation error echoes its input.
+    token: SecretStr = Field(description="A Hub access token. A read token is enough.")
+
+
 class HubRepoSummary(BaseModel):
     id: str
     url: str
@@ -704,6 +742,13 @@ class HubRepoSummary(BaseModel):
     gated: bool = False
     updated_at: str | None = None
     formats: list[Literal["gguf", "diffusers", "safetensors"]] = Field(default_factory=list)
+    # A search for vision models (``vision=true``) says what an agent needs of each:
+    vision: bool | None = Field(default=None, description="It has a vision projector (mmproj).")
+    tools: bool | None = Field(
+        default=None, description="Its GGUF's chat template takes tools; null: no template."
+    )
+    params: str | None = Field(default=None, description="Its parameter count, e.g. '8.2B'.")
+    architecture: str | None = Field(default=None, description="Its GGUF architecture.")
 
 
 class HubLocal(BaseModel):
@@ -1024,7 +1069,9 @@ class GallerySource(BaseModel):
     id: str = Field(description="'local', or a link id.")
     name: str
     local: bool
-    status: Literal["ok", "unreachable", "error"]
+    status: Literal["ok", "unreachable", "error", "unsupported"] = Field(
+        description="unsupported: it runs an Imaginer too old to list this (its images)."
+    )
     detail: str | None = None
 
 
@@ -1650,6 +1697,11 @@ class AgentItem(BaseModel):
     default: bool = Field(default=False, description="New prompts go to it.")
     working: bool = Field(default=False, description="Answering, or painting a portrait, now.")
     portrait: AgentPortrait
+    template_tools: bool | None = Field(
+        default=None,
+        description="Its chat template (its own, or the file that replaces it) takes tools; "
+        "null: it can't be read.",
+    )
     viewer: AgentViewer = "reasoning"
     pinned: bool = False
     tags: list[str] = Field(default_factory=list)
@@ -1695,14 +1747,78 @@ class AgentLibraryView(BaseModel):
 
 class AgentCreate(_Input):
     """A new agent: from a GGUF on this machine (path), from a Hub reference (ref: its model
-    and vision projector are downloaded into it next), or for whatever an engine runs."""
+    and vision projector are downloaded into it next), or for whatever an engine runs.
+
+    Its model must see images: a path needs a vision projector (mmproj, else the one beside
+    it), a repo must have one, and an engine started elsewhere must not report a model
+    without vision."""
 
     name: str | None = Field(default=None, max_length=120)
     engine: str | None = Field(default=None, max_length=64)
     path: str | None = Field(default=None, max_length=1024)
     mmproj: str | None = Field(default=None, max_length=1024)
+    chat_template: str | None = Field(
+        default=None, max_length=1024, description="A Jinja file for --chat-template-file."
+    )
     ref: str | None = Field(default=None, max_length=1024)
     system_prompt: str | None = Field(default=None, max_length=20_000)
+
+
+class AgentDetect(_Input):
+    """A model to check before an agent is made of it: a GGUF here (path, with the projector
+    and chat template file picked so far), a Hub reference, or whatever an engine started
+    elsewhere runs (engine alone)."""
+
+    path: str | None = Field(default=None, max_length=1024)
+    mmproj: str | None = Field(default=None, max_length=1024)
+    chat_template: str | None = Field(default=None, max_length=1024)
+    ref: str | None = Field(default=None, max_length=1024)
+    engine: str | None = Field(default=None, max_length=64)
+
+
+class AgentFit(BaseModel):
+    """What an agent needs of its model: it must see images; it should call tools."""
+
+    vision: bool | None = Field(
+        description="It has a vision projector (or its engine reports vision); null: its "
+        "engine can't say now."
+    )
+    tools: bool | None = Field(
+        description="Its chat template takes tools; null: there is none to read (llama-server "
+        "says once it runs)."
+    )
+    architecture: str | None = None
+    params: str | None = Field(default=None, description="e.g. '8.2B'.")
+    context_length: int | None = None
+    allowed: bool = Field(description="It can be an agent: nothing in problems.")
+    problems: list[str] = Field(default_factory=list, description="Why it can't be one.")
+    notes: list[str] = Field(default_factory=list)
+
+
+class AgentFileOption(BaseModel):
+    """A model or vision projector to pick: a file here, or a file in the repo."""
+
+    id: str = Field(description="Its path here, or its path in the repo (a variant id).")
+    name: str
+    quant: str | None = None
+    size_bytes: int | None = None
+    local: str | None = Field(default=None, description="A copy already on this machine.")
+    shards: int = 1
+
+
+class AgentDetected(BaseModel):
+    kind: Literal["path", "ref", "engine"]
+    name: str = Field(description="A name for the agent.")
+    repo: str | None = None
+    sha: str | None = None
+    owner: str | None = Field(default=None, description="Whose Hub avatar becomes its portrait.")
+    models: list[AgentFileOption] = Field(
+        default_factory=list, description="Its model files, the one to suggest first."
+    )
+    projectors: list[AgentFileOption] = Field(
+        default_factory=list, description="Its vision projectors, the one to suggest first."
+    )
+    fit: AgentFit
 
 
 class AgentUpdate(_Input):
@@ -1747,3 +1863,119 @@ class AgentPortraitSet(_Input):
 class AgentPainted(BaseModel):
     agent: AgentDetail
     conversation_id: str = Field(description="Where it is painting; the image stays there.")
+
+
+# --- the artifact library (docs/artifact-library.md) ----------------------------------------
+
+LibraryKind = Literal["image", "mask", "all"]
+
+
+class LibraryRef(BaseModel):
+    """One image of the library: a conversation's artifact, or a pin (a kept copy), on this
+    instance ('local') or on a linked one (its link id). Extra fields are ignored: a newer
+    instance may send more."""
+
+    origin: str = Field(default="local", max_length=64, description="'local', or a link id.")
+    artifact_id: str | None = Field(default=None, max_length=36)
+    pin_id: str | None = Field(default=None, max_length=36)
+
+    @model_validator(mode="after")
+    def _one_id(self) -> "LibraryRef":
+        if (self.artifact_id is None) == (self.pin_id is None):
+            raise ValueError("give either artifact_id or pin_id")
+        return self
+
+
+class LibraryGeneration(BaseModel):
+    """How a generated or edited image was made (its generation job)."""
+
+    job_id: str | None = None
+    task: str | None = None
+    backend: str | None = None
+    model: str | None = None
+    model_card: str | None = None
+    seed: int | None = None
+    alpha: bool | None = None
+    resolved: dict[str, Any] | None = Field(
+        default=None,
+        description="The settings the engine ran: width, height, steps, cfg, sampler, "
+        "negative_prompt, loras...",
+    )
+
+
+class LibraryPinInfo(BaseModel):
+    id: str
+    name: str | None = None
+    notes: str | None = None
+    tags: list[str] = Field(default_factory=list)
+    pinned_at: datetime
+    source_instance_id: str
+    source_instance_name: str | None = None
+    source_link_id: str | None = Field(
+        default=None, description="The link to the instance it came from, while there is one."
+    )
+    source_conversation_id: str | None = Field(
+        default=None, description="The conversation it was taken from (on that instance)."
+    )
+
+
+class ArtifactLibraryItem(BaseModel):
+    """One image in the library. Copies of the same bytes are listed once."""
+
+    id: str = Field(description="Its place: the original artifact's id (time-ordered).")
+    ref: LibraryRef = Field(description="Send this back to pin or import it.")
+    live: bool = Field(description="False: its conversation is gone and only its pin keeps it.")
+    kind: ArtifactKind
+    source: ArtifactSource
+    mime: str
+    sha256: str
+    size_bytes: int
+    width: int | None = None
+    height: int | None = None
+    has_alpha: bool | None = None
+    created_at: datetime
+    content_url: str = Field(description="Relative to origin.base_path.")
+    label: str | None = None
+    conversation_id: str | None = None
+    conversation_title: str | None = None
+    prompt: str | None = None
+    original_filename: str | None = None
+    generation: LibraryGeneration | None = None
+    copies: int = Field(default=1, description="Artifacts with these bytes on its instance.")
+    pin: LibraryPinInfo | None = Field(default=None, description="This instance's pin of it.")
+    origin: Origin
+
+
+class ArtifactLibraryPage(BaseModel):
+    items: list[ArtifactLibraryItem]
+    next_cursor: str | None = None
+    sources: list[GallerySource]
+
+
+class ArtifactPinCreate(_Input):
+    """Keep an image: its bytes are copied into the library, so it outlives its conversation."""
+
+    ref: LibraryRef
+    name: str | None = Field(default=None, max_length=200)
+    notes: str | None = Field(default=None, max_length=4000)
+    tags: list[str] | None = Field(default=None, max_length=24)
+
+
+class ArtifactPinUpdate(_Input):
+    """Only fields present are changed."""
+
+    name: str | None = Field(default=None, max_length=200)
+    notes: str | None = Field(default=None, max_length=4000)
+    tags: list[str] | None = Field(default=None, max_length=24)
+
+
+class ArtifactImport(_Input):
+    """Copy a library image into a conversation, as a new artifact with its own label."""
+
+    conversation_id: str = Field(max_length=36)
+    link_id: str | None = Field(
+        default=None,
+        max_length=64,
+        description="The linked instance the conversation lives on; null: this instance.",
+    )
+    ref: LibraryRef

@@ -1,7 +1,7 @@
 // Pieces every screen shares: the brand, the engine status line, dialogs and menus.
 
 import { append, corners, h, icon, clear } from './dom.js';
-import { backendWork, connection, defaultBackend, offline, on, reconnectNow } from './store.js';
+import { agentById, backendWork, connection, defaultBackend, offline, on, reconnectNow } from './store.js';
 
 export const brand = () => h('a.brand', { href: '#/' }, h('span.brand-mark'), 'Stable-Imaginer');
 
@@ -241,8 +241,9 @@ export function dialog({ title, body, input = null, confirm = 'OK', danger = fal
 // --- menus (design 7a: roving focus) -----------------------------------------------
 
 /**
- * A small menu anchored under a button: items = [{label, icon, onclick, danger, checked}].
- * An item with `checked` (true or false) is a radio item, e.g. the branch shown.
+ * A small menu anchored under a button: items = [{label, icon, onclick, danger, checked, hint}].
+ * An item with `checked` (true or false) is a radio item, e.g. the branch shown; `hint` is a
+ * muted second line. It opens above the button when there is no room below (the prompt bar).
  * Arrow keys move with wrap-around, Home/End jump, a letter jumps to the next match,
  * Tab closes it and moves on; focus returns to the anchor.
  */
@@ -271,7 +272,9 @@ export function menu(anchor, items) {
     'aria-checked': item.checked == null ? null : String(!!item.checked),
     class: [item.danger && 'danger', item.checked && 'checked'].filter(Boolean).join(' '),
     onclick: () => { close(); item.onclick(); },
-  }, item.icon && icon(item.icon, 15), h('span.menu-label', item.label), item.checked && [h('span.spacer'), icon('check', 14)]));
+  }, item.icon && icon(item.icon, 15),
+  item.hint ? h('span.menu-text', h('span.menu-label', item.label), h('span.menu-hint', item.hint)) : h('span.menu-label', item.label),
+  item.checked && [h('span.spacer'), icon('check', 14)]));
   const focusAt = (i) => {
     const n = buttons.length;
     if (!n) return;
@@ -308,6 +311,13 @@ export function menu(anchor, items) {
   buttons,
   h('div.menu-keys', { 'aria-hidden': 'true' }, kbd('↑↓', 'move'), kbd('↵', 'select'), kbd('esc', 'close')));
   document.body.append(sheet);
+  // Squeezed against the left edge it wraps and grows taller, so it is measured again once moved.
+  let box = sheet.getBoundingClientRect();
+  if (box.left < 8) {
+    Object.assign(sheet.style, { right: 'auto', left: `${Math.max(8, rect.left)}px` });
+    box = sheet.getBoundingClientRect();
+  }
+  if (box.bottom > window.innerHeight - 8 && rect.top - box.height - 6 >= 8) sheet.style.top = `${rect.top - box.height - 6}px`;
   setTimeout(() => document.addEventListener('pointerdown', outside, true));
   document.addEventListener('keydown', onKey, true);
   window.addEventListener('hashchange', onRoute);
@@ -367,4 +377,24 @@ export function toast(text, { error = false, action = null } = {}) {
   el.addEventListener('focusout', (e) => { if (!el.contains(e.relatedTarget)) arm(); });
   arm();
   return { dismiss };
+}
+
+/**
+ * Why the server wouldn't start a turn (a send, an edit & branch, a retry) as {text, action}.
+ * Only a 409 that names the running turn (turn_id) means one is running here. Any other
+ * refusal is said the way the server put it, such as the conversation's agent not being the
+ * one its engine is set to run, which offers that agent's card (its Use on switches the engine).
+ */
+export function turnRefusal(err, { running = 'A turn is already running here.' } = {}) {
+  const problem = err.problem ?? {};
+  if (err.status === 409 && problem.turn_id) return { text: running, action: null, running: true };
+  const agent = agentById(problem.agent_id); // a linked instance's agents aren't known here
+  const action = agent && { label: 'Open agent', onclick: () => { location.hash = `#/agents/${agent.id}`; } };
+  return { text: err.message || 'Something went wrong.', action, running: false };
+}
+
+/** turnRefusal as an error toast. onRunning: where "Show" goes when a turn is running. */
+export function toastRefusal(err, { onRunning = null } = {}) {
+  const { text, action, running } = turnRefusal(err);
+  toast(text, { error: true, action: action ?? (running && onRunning ? { label: 'Show', onclick: onRunning } : null) });
 }

@@ -38,7 +38,7 @@ import sqlalchemy as sa
 from PIL import UnidentifiedImageError
 from sqlalchemy.orm import aliased
 
-from imaginer.agents import portraits
+from imaginer.agents import fit, portraits
 from imaginer.backends.common import expand_path
 from imaginer.core.clock import utcnow
 from imaginer.core.config import (
@@ -68,6 +68,7 @@ from imaginer.domain.errors import (
 )
 from imaginer.engines import launch
 from imaginer.hub.refs import RefError, parse_ref
+from imaginer.image_models.library import find_named
 from imaginer.loras import files as names
 from imaginer.services import covers
 
@@ -352,7 +353,8 @@ class AgentLibrary:
 
     def check_runs(self, agent: Agent) -> str:
         """Its engine, ready to take a turn as this agent: refused when that engine was
-        launched here and is set to run another agent's model."""
+        launched here and is set to run another agent's model. The refusal names the agent
+        and its engine, and ``use``, the call that switches the engine to it."""
         engine = self.engine_of(agent)
         if engine is None:
             raise InvalidRequestError(f"{agent.name} has no chat engine to run on")
@@ -363,8 +365,10 @@ class AgentLibrary:
             other = self.agent(getattr(config, "agent", None))
             runs = other.name if other is not None else "its own model"
             raise ConflictError(
-                f"{engine} runs {runs}: switch it to {agent.name} first "
-                f"(Use on {engine}, POST /v1/agents/{agent.id}/use)"
+                f"{engine} runs {runs}: switch it to {agent.name} first (Use on {engine})",
+                agent_id=agent.id,
+                engine=engine,
+                use=f"/v1/agents/{agent.id}/use",
             )
         return engine
 
@@ -683,10 +687,13 @@ class AgentLibrary:
         model_path = agent.files.get("model")
         model = model_path or (info.model if info is not None and runs else None)
         vision = bool(agent.files.get("mmproj")) or Capability.VISION_IN in caps
+        template_tools = _template_tools(agent)
+        # Running, it says; else its chat template does.
+        can_call = Capability.TOOLS in caps if caps else template_tools is not False
         has_tools = bool(
             self._tools is not None
             and any(t.name not in agent.tools_off for t in self._tools.all())
-            and (not caps or Capability.TOOLS in caps)
+            and can_call
         )
         use_stats = usage.get(agent.id, _Use())
         return dto.AgentItem(
@@ -700,6 +707,7 @@ class AgentLibrary:
             family=_family(agent, model),
             vision=vision,
             tools=has_tools,
+            template_tools=template_tools,
             own_files=agent.own_files,
             ready=not missing and not problems,
             missing=missing,
@@ -826,6 +834,186 @@ class AgentLibrary:
                 out.setdefault(str(aid), _Use()).images = int(count)
         return out
 
+    # --- checking a model -----------------------------------------------------------------
+
+    async def detect(self, body: dto.AgentDetect) -> dto.AgentDetected:
+        """Whether a model can be an agent (it must see images; it should call tools), with
+        the model files and vision projectors to pick from: a GGUF here, a Hub repo, or what
+        an engine started elsewhere runs."""
+        if body.path and body.path.strip():
+            return await asyncio.to_thread(self._detect_path, body)
+        if body.ref and body.ref.strip():
+            return await self._detect_ref(body)
+        return await self._detect_engine((body.engine or "").strip() or None)
+
+    def _detect_path(self, body: dto.AgentDetect) -> dto.AgentDetected:
+        """Blocking."""
+        assert body.path is not None
+        path = expand_path(body.path.strip())
+        mmproj = expand_path(body.mmproj.strip()) if body.mmproj and body.mmproj.strip() else None
+        template = (
+            expand_path(body.chat_template.strip())
+            if body.chat_template and body.chat_template.strip()
+            else None
+        )
+        found = fit.describe(path, mmproj=mmproj, chat_template=template)
+        problems: list[str] = []
+        notes: list[str] = []
+        if not found.exists:
+            problems.append(f"There is no file at {path}.")
+        elif path.is_dir():
+            problems.append(f"{path} is a folder: pick the .gguf in it.")
+        elif found.was_projector and found.model is None:
+            problems.append(
+                f"{path.name} is a vision projector, and there is no model beside it to go with it."
+            )
+        elif not found.gguf:
+            problems.append(f"{path.name} isn't a GGUF file: llama-server loads .gguf models.")
+        if found.was_projector and found.model is not None:
+            notes.append(f"{path.name} is its vision projector; the model beside it is picked.")
+        if mmproj is not None and not mmproj.is_file():
+            problems.append(f"There is no vision projector at {mmproj}.")
+        if template is not None and fit.read_template(template) is None:
+            problems.append(f"The chat template {template} can't be read.")
+        if not problems and found.projector is None:
+            problems.append(_NO_PROJECTOR_HERE)
+        model = found.model
+        source = _source_of(str(model)) if model is not None else None
+        return dto.AgentDetected(
+            kind="path",
+            name=_name_for(source, str(model) if model else None, "Agent"),
+            repo=(source or {}).get("repo"),
+            owner=_owner_of(source),
+            models=[_option_here(p) for p in found.models],
+            projectors=[_option_here(p) for p in found.projectors],
+            fit=_fit(
+                vision=found.projector is not None,
+                tools=found.tools,
+                architecture=found.architecture,
+                params=found.params,
+                problems=problems,
+                notes=notes,
+            ),
+        )
+
+    async def _detect_ref(self, body: dto.AgentDetect) -> dto.AgentDetected:
+        if self._hub is None or not self._settings.hub.enabled:
+            raise InvalidRequestError("Hugging Face isn't available here")
+        assert body.ref is not None
+        found = await self._hub.agent_files(body.ref.strip())
+        repo = found.ref.repo_id
+        tools = fit.takes_tools(found.gguf.chat_template) if found.gguf is not None else None
+        problems = []
+        if body.chat_template and body.chat_template.strip():
+            template = expand_path(body.chat_template.strip())
+            text = await asyncio.to_thread(fit.read_template, template)
+            if text is None:
+                problems.append(f"The chat template {template} can't be read.")
+            else:
+                tools = fit.takes_tools(text)
+        if not found.models:
+            problems.append(
+                f"{repo} has no GGUF model: llama-server loads .gguf files. Look for a -GGUF "
+                "repo of it."
+            )
+        if not found.projectors:
+            problems.append(
+                f"{repo} has no vision projector (mmproj), so its model can't see images, and "
+                "an agent must. Look for a vision (VL) model."
+            )
+        gguf = found.gguf
+        source = {"repo": repo}
+        return dto.AgentDetected(
+            kind="ref",
+            name=_name_for(source, None, repo),
+            repo=repo,
+            sha=found.info.sha,
+            owner=_owner_of(source),
+            models=[_option_hub(v) for v in found.models],
+            projectors=[_option_hub(v) for v in found.projectors],
+            fit=_fit(
+                vision=bool(found.projectors),
+                tools=tools,
+                architecture=gguf.architecture if gguf is not None else None,
+                params=fit.params_label(gguf.params) if gguf is not None else None,
+                context_length=gguf.context_length if gguf is not None else None,
+                problems=problems,
+            ),
+        )
+
+    async def _detect_engine(self, engine: str | None) -> dto.AgentDetected:
+        """What an engine started elsewhere runs, as it last said: whether it sees images
+        and takes tools comes from what it reports."""
+        engine = engine or self._settings.default_backend("chat")
+        config = self._engine_config(engine)
+        if engine is None or config is None or backend_kind(config) is not BackendKind.LLM:
+            raise InvalidRequestError(f"{engine or 'it'} is not a chat engine")
+        problems: list[str] = []
+        notes: list[str] = []
+        if self._launchable(config):
+            problems.append(f"{engine} is launched here: pick the model it should load.")
+        info = None
+        if self._registry is not None:
+            with contextlib.suppress(Exception):
+                info = await self._registry.describe_one(engine)
+        up = info is not None and info.status.value == "ok"
+        caps = set(info.capabilities) if info is not None else set()
+        vision = (Capability.VISION_IN in caps) if up else None
+        tools = (Capability.TOOLS in caps) if up else None
+        if vision is False:
+            problems.append(
+                f"{engine} runs a model that doesn't see images (it was started without "
+                "--mmproj), and an agent must."
+            )
+        elif vision is None and not problems:
+            notes.append(f"{engine} isn't answering now, so whether it sees images is unknown.")
+        model = info.model if info is not None else getattr(config, "model", None)
+        name = names.model_name(model) if model else engine
+        if isinstance(config, LinkedBackendConfig):
+            name = f"{name} on {config.link}"
+        return dto.AgentDetected(
+            kind="engine",
+            name=name,
+            models=[dto.AgentFileOption(id=model, name=model)] if model else [],
+            fit=_fit(vision=vision, tools=tools, problems=problems, notes=notes),
+        )
+
+    async def locate(self, body: dto.ModelLocate) -> dto.ModelLocated:
+        """A GGUF dropped in the browser (its name and size, not its folder), looked for
+        where chat models are kept here."""
+        roots = self._search_roots()
+        found = await asyncio.to_thread(find_named, roots, body.name.strip(), body.size_bytes)
+        return dto.ModelLocated(paths=[str(p) for p in found], searched=[str(r) for r in roots])
+
+    def _search_roots(self) -> list[Path]:
+        """The download folder and Hugging Face cache, every agent's and llama-server's
+        model folder (and the folder above), and Downloads."""
+        out: list[Path] = []
+        if self._hub is not None:
+            out.append(self._hub.models_dir)
+            if self._hub.cache_dir is not None:
+                out.append(self._hub.cache_dir)
+        models = [a.files["model"] for a in self._agents.values() if a.own_files]
+        if self._engines is not None:
+            for _, config in self._chat_engines():
+                launched = config.launch if isinstance(config, LlamaCppBackendConfig) else None
+                if launched is not None and launched.model is not None:
+                    models.append(str(launched.model))
+        for value in models:
+            parent = expand_path(value).parent
+            out += [parent, parent.parent]
+        out.append(Path.home() / "Downloads")
+        home = Path.home()
+        roots: list[Path] = []
+        for path in out:
+            # A drive or the home folder itself is too wide to walk.
+            if path == home or path.parent == path or path in roots:
+                continue
+            if any(path.is_relative_to(r) for r in roots):
+                continue
+            roots = [r for r in roots if not r.is_relative_to(path)] + [path]
+        return roots
+
     # --- changing agents ------------------------------------------------------------------
 
     async def create(self, body: dto.AgentCreate) -> dto.AgentDetail:
@@ -836,19 +1024,47 @@ class AgentLibrary:
                 raise InvalidRequestError(f"{engine} is not a chat engine")
         files: dict[str, str] = {}
         source: dict[str, Any] | None = None
-        if body.path:
-            files["model"] = str(expand_path(body.path.strip()))
-            if body.mmproj:
-                files["mmproj"] = str(expand_path(body.mmproj.strip()))
+        template = (body.chat_template or "").strip()
+        if template:
+            files["chat_template"] = str(expand_path(template))
+        if body.path and body.path.strip():
+            model = expand_path(body.path.strip())
+            if await asyncio.to_thread(_projector_file, model):
+                raise InvalidRequestError(
+                    f"{model.name} is a vision projector: give it as mmproj, with its model as path"
+                )
+            checked = await asyncio.to_thread(
+                self._detect_path,
+                dto.AgentDetect(path=body.path, mmproj=body.mmproj, chat_template=template),
+            )
+            if checked.fit.problems:
+                raise InvalidRequestError(checked.fit.problems[0])
+            files["model"] = str(model)
+            files["mmproj"] = checked.projectors[0].id
             source = await asyncio.to_thread(_described, files["model"], files)
-        elif body.ref:
+            source = {**(source or {}), "vision": True}
+        elif body.ref and body.ref.strip():
             try:
                 ref = parse_ref(body.ref)
             except RefError as exc:
                 raise InvalidRequestError(str(exc)) from exc
+            checked = await self._detect_ref(
+                dto.AgentDetect(ref=body.ref, chat_template=template or None)
+            )
+            if checked.fit.problems:
+                raise InvalidRequestError(" ".join(checked.fit.problems))
             source = {"repo": ref.repo_id, "revision": ref.revision, "path": ref.path}
             if ref.quant:
                 source["quant"] = ref.quant
+            # It needs its projector before it's ready; the Hub's word on tools until its
+            # model is here to read.
+            source["vision"] = True
+            if checked.fit.tools is not None:
+                source["tools"] = checked.fit.tools
+        else:
+            checked = await self._detect_engine(engine)
+            if checked.fit.vision is False:
+                raise InvalidRequestError(checked.fit.problems[0])
         name = " ".join((body.name or "").split()) or _name_for(
             source, files.get("model"), engine or "Agent"
         )
@@ -885,9 +1101,15 @@ class AgentLibrary:
                     else:
                         merged.pop(key, None)
                 if merged.get("model") != (row.files or {}).get("model"):
+                    vision = bool((row.source or {}).get("vision"))
                     row.source = _source_of(merged.get("model")) or (
                         row.source if merged.get("model") else None
                     )
+                    if vision and merged.get("model"):
+                        # Made to see images: a new model needs its projector too. Whether
+                        # it takes tools is read from the new file.
+                        kept = {k: v for k, v in (row.source or {}).items() if k != "tools"}
+                        row.source = {**kept, "vision": True}
                 row.files = merged or None
             if "system_prompt" in fields:
                 row.system_prompt = (body.system_prompt or "").strip() or None
@@ -1279,8 +1501,80 @@ def _family(agent: Agent, model: str | None) -> str | None:
 
 
 def _wants_mmproj(agent: Agent) -> bool:
-    """Whether its model is known to need a vision projector: its repo offers one."""
+    """Whether its model needs a vision projector: an agent made here (which must see
+    images), or one whose model's folder has one."""
     return bool((agent.source or {}).get("vision"))
+
+
+def _projector_file(path: Path) -> bool:
+    """Blocking."""
+    return path.is_file() and fit.is_projector(path, names.gguf_metadata(path))
+
+
+def _template_tools(agent: Agent) -> bool | None:
+    """Whether its chat template takes tools: the file that replaces the model's own, else
+    its model's, else what the Hub said before the model was here. Blocking (cached)."""
+    template = agent.files.get("chat_template")
+    model = agent.files.get("model")
+    if model or template:
+        found = fit.model_takes_tools(
+            expand_path(model) if model else Path(),
+            expand_path(template) if template else None,
+        )
+        if found is not None:
+            return found
+    told = (agent.source or {}).get("tools")
+    return told if isinstance(told, bool) else None
+
+
+_NO_PROJECTOR_HERE = (
+    "No vision projector (mmproj) beside it: its model can't see images, and an agent must. "
+    "Pick its projector, or get the model from Hugging Face, where vision models come with one."
+)
+
+
+def _fit(
+    *,
+    vision: bool | None,
+    tools: bool | None,
+    architecture: str | None = None,
+    params: str | None = None,
+    context_length: int | None = None,
+    problems: list[str],
+    notes: list[str] | None = None,
+) -> dto.AgentFit:
+    return dto.AgentFit(
+        vision=vision,
+        tools=tools,
+        architecture=architecture,
+        params=params,
+        context_length=context_length,
+        allowed=not problems,
+        problems=problems,
+        notes=notes or [],
+    )
+
+
+def _option_here(path: Path) -> dto.AgentFileOption:
+    try:
+        size = path.stat().st_size
+    except OSError:
+        size = None
+    return dto.AgentFileOption(
+        id=str(path), name=path.name, quant=names.model_quant(path.name), size_bytes=size,
+        local=str(path),
+    )  # fmt: skip
+
+
+def _option_hub(v: dto.HubVariant) -> dto.AgentFileOption:
+    return dto.AgentFileOption(
+        id=v.id,
+        name=v.name,
+        quant=v.quant,
+        size_bytes=v.size_bytes,
+        local=v.local.path if v.local is not None else None,
+        shards=max(1, v.shards),
+    )
 
 
 def _merged_sampling(current: dict[str, Any], given: Mapping[str, Any]) -> dict[str, Any]:

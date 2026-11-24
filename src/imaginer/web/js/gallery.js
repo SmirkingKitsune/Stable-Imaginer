@@ -83,6 +83,7 @@ export function galleryScreen({ archived = false, navigate }) {
     h('div.only-wide', status.el),
     h('div.only-narrow', statusShort.el),
     searchToggle,
+    h('a.icon-btn', { href: '#/artifacts', title: 'Artifact library', 'aria-label': 'Artifact library' }, icon('image')),
     h('a.icon-btn', {
       href: archived ? '#/' : '#/archived', title: archived ? 'Back to gallery' : 'Archived',
       'aria-label': archived ? 'Back to gallery' : 'Archived',

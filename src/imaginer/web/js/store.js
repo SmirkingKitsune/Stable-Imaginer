@@ -12,8 +12,8 @@
 import { api, readEvents } from './api.js';
 import { announce } from './chrome.js';
 import { titleFrom } from './format.js';
-import { loraNamesIn, renameMentions } from './mentions.js';
-import { baseOf, place } from './origin.js';
+import { loraNamesIn, renameMentions, uploadRef } from './mentions.js';
+import { baseOf, linkOf, place } from './origin.js';
 
 // --- topics ---------------------------------------------------------------------
 
@@ -169,8 +169,43 @@ export function agentOfMessage(c, m) {
 // screen: those screens' Back goes there, and so does "Use in next prompt" in the library,
 // however many cards were opened in between.
 let workPlace = '#/';
-export function notePlace(hash) { workPlace = hash || '#/'; }
+let workDraft = 'new';
+export function notePlace(hash, draftKey = 'new') {
+  workPlace = hash || '#/';
+  workDraft = draftKey || 'new';
+}
 export const lastPlace = () => workPlace;
+/** The draft the place the user was working in writes: a conversation's id, or 'new'. */
+export const placeDraft = () => workDraft;
+
+/**
+ * Put artifact library images into a draft ("Use in next prompt", the bar's library
+ * picker). One the conversation already has goes in as that artifact; any other is copied
+ * into the conversation when the message is sent (store.send), and named "@lib-…" in the
+ * text until then. Returns how many were added (an image already there is skipped).
+ */
+export function addLibraryToDraft(key, items, { max = Infinity } = {}) {
+  const d = draft(key);
+  const here = key === 'new' ? null : state.convs.get(key);
+  const taken = new Set(d.attachments.map((a) => a.artifact?.label ?? a.ref));
+  const sha = (a) => a.artifact?.sha256 ?? a.library?.sha256;
+  let added = 0;
+  for (const item of items) {
+    if (d.attachments.length >= max) break;
+    if (d.attachments.some((a) => sha(a) === item.sha256)) continue;
+    const own = here && item.live && item.conversation_id === key ? here.artifacts.get(item.id) : null;
+    if (own) {
+      d.attachments.push({ artifact: own });
+    } else {
+      const ref = uploadRef(`lib-${item.label ?? 'image'}`, taken);
+      taken.add(ref);
+      d.attachments.push({ library: item, ref });
+    }
+    added += 1;
+  }
+  if (added) emit(`draft:${key}`);
+  return added;
+}
 
 // LoRAs to put in the next prompt bar that opens ("Use in next prompt" in the library).
 let queued = [];
@@ -581,14 +616,18 @@ export async function send(cid, { text, attachments, options, mode = null, qa = 
   const c = fresh ? adopt(await api.createConversation(titleFrom(loraNamesIn(text)))) : await ensureLoaded(cid);
   try {
     const ids = [];
-    const labelled = new Map(); // an upload's "@name" in the text -> the label it got
+    const labelled = new Map(); // an upload's (or library image's) "@name" -> the label it got
     for (const att of attachments) {
-      const artifact = att.artifact ?? (await api.upload(c.id, att.file));
+      const artifact = att.artifact
+        ?? (att.library
+          ? await api.importImage(c.id, att.library.ref, linkOf(c.id))
+          : await api.upload(c.id, att.file));
       c.artifacts.set(artifact.id, artifact);
-      ids.push(artifact.id);
+      if (!ids.includes(artifact.id)) ids.push(artifact.id); // an import can be one it has
       if (att.ref && att.ref !== artifact.label) labelled.set(att.ref, artifact.label);
     }
     const body = { content: renameMentions(text, labelled), attachments: ids };
+    if (options?.mask && labelled.has(options.mask)) options = { ...options, mask: labelled.get(options.mask) };
     if (options && Object.keys(options).length) body.image_options = options;
     if (mode && mode !== 'chat') body.mode = mode;
     if (qa != null) body.qa = qa;
@@ -880,6 +919,21 @@ export const editInfo = () => editEngine()?.edit ?? null;
  * (FLUX.1 Kontext) and the engine's model card does (Qwen-Image-2.1). */
 export const maskHint = (edit, text) =>
   edit?.mask_card_name ? `${text} (masked edits run ${edit.mask_card_name})` : text;
+
+/** "one image", "3 images". */
+const imagesWord = (n) => (n === 1 ? 'one image' : `${n} images`);
+
+/** A reference button's tooltip: which card an edit with more images than the edit card
+ * takes runs (FLUX.1 Kontext takes one; Qwen-Image-2.1 on the model card up to ten). */
+export const refsHint = (edit, text) =>
+  edit?.refs_card_name
+    ? `${text} (edits of more than ${imagesWord(edit.card_max_ref_images)} run ${edit.refs_card_name})`
+    : text;
+
+/** Whether an edit of ``inputs`` images (a mask counts as one) runs the engine's model card
+ * rather than its edit card, which takes fewer. */
+export const runsRefsCard = (edit, inputs) =>
+  Boolean(edit?.refs_card_name) && inputs > (edit.card_max_ref_images ?? Infinity);
 
 /** The picked preset, if the image backend the next message will use has it, for making
  * images or (an edit card's) for edits. */

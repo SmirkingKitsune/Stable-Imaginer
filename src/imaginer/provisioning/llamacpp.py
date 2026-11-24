@@ -480,8 +480,25 @@ def release_asset_patterns(cfg: ProvisionConfig) -> list[str]:
     return []
 
 
-def choose_cuda_release(names: Sequence[str], driver_version: tuple[int, ...] | None) -> str | None:
-    """Highest CUDA release asset the installed driver can load."""
+# Architectures llama.cpp's CUDA releases carry compiled code (SASS) for, from the default
+# CMAKE_CUDA_ARCHITECTURES in ggml/src/ggml-cuda/CMakeLists.txt (86-real, 89-real, 120a-real,
+# 121a-real). Every other architecture runs the release's PTX through the driver's JIT.
+RELEASE_SASS_TARGETS = frozenset({"86", "89", "120", "121"})
+
+
+def choose_cuda_release(
+    names: Sequence[str],
+    driver_version: tuple[int, ...] | None,
+    *,
+    minor_compatible: bool = False,
+) -> str | None:
+    """Highest CUDA release asset the installed driver can load.
+
+    A build no newer than the driver is preferred. With ``minor_compatible`` a newer build of
+    the driver's own CUDA major is the fallback: CUDA's minor version compatibility runs a 13.5
+    runtime on a 13.4 driver, so long as nothing needs the driver to JIT the newer PTX, which
+    holds for a GPU the release has compiled code for. A newer major never loads.
+    """
     versioned: list[tuple[tuple[int, ...], str]] = []
     for name in names:
         match = re.search(r"-cuda-([0-9.]+)-", name)
@@ -497,9 +514,12 @@ def choose_cuda_release(names: Sequence[str], driver_version: tuple[int, ...] | 
         # Unknown driver: the lowest CUDA build is the safest bet.
         return min(versioned, key=lambda item: item[0])[1]
     eligible = [item for item in versioned if item[0] <= driver_version]
-    if not eligible:
-        return None
-    return max(eligible, key=lambda item: item[0])[1]
+    if eligible:
+        return max(eligible, key=lambda item: item[0])[1]
+    same_major = [item for item in versioned if item[0][:1] == driver_version[:1]]
+    if minor_compatible and same_major:
+        return min(same_major, key=lambda item: item[0])[1]  # the closest to the driver
+    return None
 
 
 def select_release_assets(
@@ -530,7 +550,8 @@ def select_release_assets(
             if cfg.release_variant in ("cuda-12", "cuda-13"):
                 major = cfg.release_variant.split("-")[1]
                 matches = [n for n in matches if re.search(rf"-cuda-{major}\.", n)]
-            choice = choose_cuda_release(matches, driver_version)
+            native = bool(targets) and all(str(t) in RELEASE_SASS_TARGETS for t in targets)
+            choice = choose_cuda_release(matches, driver_version, minor_compatible=native)
             matches = [choice] if choice else []
         if not matches:
             raise ProvisionError(
@@ -723,6 +744,9 @@ class UpdateStatus:
     warning: str = ""
     release_alternatives: list[str] = field(default_factory=list)
     error: str = ""
+    # The accelerator installed in place of the one asked for (a CPU fallback for a CUDA
+    # request, say), or "". A fallback is worth replacing however new it is.
+    fallback: str = ""
 
     @property
     def ok(self) -> bool:
@@ -731,7 +755,7 @@ class UpdateStatus:
     @property
     def is_current(self) -> bool:
         """Level with upstream, or ahead of it."""
-        return self.behind == 0
+        return self.behind == 0 and not self.fallback
 
     @property
     def below_threshold(self) -> bool:
@@ -744,6 +768,7 @@ def check_for_update(
     installed_version: str,
     timeout: float = 30.0,
     threshold: int = UPDATE_BUILD_THRESHOLD,
+    installed_accelerator: str = "",
 ) -> UpdateStatus:
     """Ask upstream whether a newer llama.cpp runtime exists for this host.
 
@@ -752,10 +777,14 @@ def check_for_update(
     distinguishing before the user commits to one.
 
     `threshold` suppresses the report until the runtime is meaningfully behind;
-    pass 0 to report any difference at all.
+    pass 0 to report any difference at all. `cfg` describes the runtime that was
+    asked for; an `installed_accelerator` other than its own marks the installed
+    one as a fallback, which is reported whatever its version.
     """
     cfg = cfg.normalized()
     status = UpdateStatus(current_version=installed_version, threshold=threshold)
+    if installed_accelerator and installed_accelerator != cfg.accelerator:
+        status.fallback = installed_accelerator
 
     try:
         releases = fetch_releases("latest", timeout)
@@ -784,12 +813,13 @@ def check_for_update(
     status.latest_version = str(newest.get("tag_name", "")).strip()
 
     status.behind = builds_behind(installed_version, status.latest_version)
-    if status.behind == 0:
-        return status
-    # An uncomparable version (None) is reported rather than hidden: failing to
-    # parse a custom build string is not evidence that it is current.
-    if status.behind is not None and status.behind < threshold:
-        return status
+    if not status.fallback:
+        if status.behind == 0:
+            return status
+        # An uncomparable version (None) is reported rather than hidden: failing to
+        # parse a custom build string is not evidence that it is current.
+        if status.behind is not None and status.behind < threshold:
+            return status
 
     status.update_available = True
     asset_names = [str(asset.get("name", "")) for asset in newest.get("assets") or []]
@@ -842,6 +872,22 @@ def check_for_update(
         status.warning += (
             f" Official releases do exist for: {', '.join(status.release_alternatives)}."
         )
+    if status.fallback:
+        found = {
+            "release": f"{status.latest_version} has a {cfg.accelerator} release for this system.",
+            "compile": "",
+            "unavailable": "",
+        }[status.action]
+        status.warning = " ".join(
+            part
+            for part in (
+                f"The installed runtime is the {status.fallback} fallback: "
+                f"{cfg.accelerator} was asked for.",
+                found,
+                status.warning,
+            )
+            if part
+        )
     return status
 
 
@@ -867,6 +913,25 @@ class InstallStep:
     action: Callable[[Emit], None] | None = None
     cwd: Path | None = None
     allow_failure: bool = False
+    # The environment a command runs in, when the plan settles one (MSVC's, for CUDA on
+    # Windows). None, or a BuildEnvironment left unset, runs it in this process's own.
+    env: BuildEnvironment | None = None
+
+
+@dataclass
+class BuildEnvironment:
+    """Environment variables for a source build's commands, settled by one of its steps.
+
+    Plan builders spawn nothing, so the plan carries this holder and the step that
+    finds the toolchain fills it in when it runs.
+    """
+
+    variables: dict[str, str] | None = None
+
+
+def env_path(variables: dict[str, str]) -> str | None:
+    """PATH, however this environment spells it (Windows' own `set` says Path)."""
+    return next((value for name, value in variables.items() if name.upper() == "PATH"), None)
 
 
 def build_release_plan(cfg: ProvisionConfig) -> list[InstallStep]:
@@ -921,6 +986,8 @@ def build_release_plan(cfg: ProvisionConfig) -> list[InstallStep]:
             shutil.copy2(server, target)
         target.chmod(target.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
         emit(validate_server(target), False)
+        if device := validate_devices(target, cfg.accelerator):
+            emit(f"Sees {device}", False)
 
         _swap_staged_bin(bin_dir, next_bin)
         shutil.rmtree(staging, ignore_errors=True)
@@ -939,13 +1006,14 @@ def build_source_plan(cfg: ProvisionConfig) -> list[InstallStep]:
     src = cfg.source_dir
     build = cfg.build_dir
     ref = "master" if cfg.version == "latest" else cfg.version
-    plan: list[InstallStep] = []
+    env = BuildEnvironment()
+    plan: list[InstallStep] = toolchain_steps(cfg, env)
 
     if not cfg.bypass_environment_checks:
         plan.append(
             InstallStep(
                 "Checking source-build prerequisites",
-                action=lambda emit: preflight(cfg, emit),
+                action=lambda emit: preflight(cfg, emit, env),
                 cwd=cfg.provision_dir,
             )
         )
@@ -1035,6 +1103,8 @@ def build_source_plan(cfg: ProvisionConfig) -> list[InstallStep]:
             cwd=src,
         )
     )
+    for step in plan:
+        step.env = env
     return plan
 
 
@@ -1044,6 +1114,209 @@ def build_install_plan(cfg: ProvisionConfig) -> list[InstallStep]:
     if cfg.install_method == "source":
         return build_source_plan(cfg)
     return build_release_plan(cfg)
+
+
+# ---------------------------------------------------------------------------
+# Windows toolchain
+# ---------------------------------------------------------------------------
+#
+# nvcc compiles host code with MSVC's cl.exe, which is on PATH only inside a
+# Visual Studio developer environment, and each CUDA Toolkit accepts only the
+# MSVC versions it knows (CUDA 13.1 stops before MSVC 14.50, Visual Studio
+# 2026's). So a Windows CUDA build loads the environment of an installed MSVC
+# toolset this nvcc accepts, and builds with Ninja: the Visual Studio generator
+# would need CUDA's Visual Studio integration as well.
+
+VSWHERE = (
+    Path(os.environ.get("ProgramFiles(x86)") or r"C:\Program Files (x86)")  # noqa: SIM112
+    / "Microsoft Visual Studio"
+    / "Installer"
+    / "vswhere.exe"
+)
+
+VS2022_TOOLSET = "MSVC v143 - VS 2022 C++ x64/x86 build tools"
+
+
+@dataclass(frozen=True)
+class MsvcToolset:
+    """One installed MSVC toolset and the script that loads its environment."""
+
+    version: str  # e.g. 14.44.35207
+    vcvarsall: Path
+    product: str  # e.g. Visual Studio Community 2026
+
+    @property
+    def msc_ver(self) -> int:
+        """The compiler's _MSC_VER: MSVC 14.44 is 1944, 14.51 is 1951."""
+        parts = self.version.split(".")
+        try:
+            return 1900 + int(parts[1]) if parts[0] == "14" and len(parts) > 1 else 0
+        except ValueError:
+            return 0
+
+    @property
+    def key(self) -> tuple[int, ...]:
+        return tuple(int(p) if p.isdigit() else 0 for p in self.version.split("."))
+
+
+def msvc_toolsets(arch: str) -> list[MsvcToolset]:
+    """Every MSVC toolset with a compiler for `arch`, from each Visual Studio vswhere knows."""
+    if not VSWHERE.is_file():
+        return []
+    try:
+        completed = subprocess.run(
+            [str(VSWHERE), "-all", "-prerelease", "-products", "*", "-format", "json", "-utf8"],
+            capture_output=True,
+            timeout=30,
+            check=False,
+        )
+        installs = json.loads(completed.stdout.decode("utf-8", errors="replace") or "[]")
+    except (OSError, subprocess.TimeoutExpired, json.JSONDecodeError):
+        return []
+    host = "arm64" if current_arch() == "arm64" else "x64"
+    toolsets: list[MsvcToolset] = []
+    for install in installs if isinstance(installs, list) else []:
+        root = Path(str(install.get("installationPath") or ""))
+        vcvarsall = root / "VC" / "Auxiliary" / "Build" / "vcvarsall.bat"
+        tools = root / "VC" / "Tools" / "MSVC"
+        if not vcvarsall.is_file() or not tools.is_dir():
+            continue
+        product = str(install.get("displayName") or root.name)
+        for folder in sorted(tools.iterdir()):
+            if (folder / "bin" / f"Host{host}" / arch / "cl.exe").is_file():
+                toolsets.append(MsvcToolset(folder.name, vcvarsall, product))
+    return toolsets
+
+
+def msvc_limit_from_header(text: str) -> int | None:
+    """The first _MSC_VER nvcc refuses, from the version check in its crt/host_config.h:
+    ``#if _MSC_VER < 1920 || _MSC_VER >= 1950``."""
+    match = re.search(r"#if\s+_MSC_VER\s*<\s*\d+\s*\|\|\s*_MSC_VER\s*>=\s*(\d+)", text)
+    return int(match.group(1)) if match else None
+
+
+def nvcc_msvc_limit(nvcc: str) -> int | None:
+    found = shutil.which(nvcc) or nvcc
+    header = Path(found).resolve().parent.parent / "include" / "crt" / "host_config.h"
+    try:
+        return msvc_limit_from_header(header.read_text(encoding="utf-8", errors="replace"))
+    except OSError:
+        return None
+
+
+def choose_msvc_toolset(toolsets: Sequence[MsvcToolset], limit: int | None) -> MsvcToolset | None:
+    """The newest toolset below nvcc's limit (the newest of all when the limit is unknown)."""
+    usable = [t for t in toolsets if limit is None or 0 < t.msc_ver < limit]
+    return max(usable, key=lambda t: t.key) if usable else None
+
+
+def parse_environment(text: str) -> dict[str, str]:
+    """`set`'s NAME=value lines; cmd's hidden per-drive entries (=C:=C:\\) are skipped."""
+    variables: dict[str, str] = {}
+    for line in text.splitlines():
+        name, sep, value = line.partition("=")
+        if sep and name and not name.startswith("="):
+            variables[name] = value
+    return variables
+
+
+def msvc_environment(toolset: MsvcToolset, arch: str) -> dict[str, str]:
+    """The environment vcvarsall.bat sets up for `toolset`."""
+    host = "arm64" if current_arch() == "arm64" else "x64"
+    target = arch if arch == host else f"{host}_{arch}"
+    # A string, not a list: cmd /s strips the outer quotes and keeps the inner ones,
+    # which list quoting would escape. /u makes `set` write UTF-16, whatever the code page.
+    command = (
+        f'cmd /d /u /s /c ""{toolset.vcvarsall}" {target} '
+        f'-vcvars_ver={toolset.version} >nul && set"'
+    )
+    try:
+        completed = subprocess.run(command, capture_output=True, timeout=120, check=False)
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise ProvisionError(f"Could not load MSVC {toolset.version}'s environment: {exc}") from exc
+    variables = parse_environment(completed.stdout.decode("utf-16-le", errors="replace"))
+    if not shutil.which("cl", path=env_path(variables)):
+        detail = completed.stderr.decode(errors="replace").strip()
+        raise ProvisionError(
+            f"Loading MSVC {toolset.version} with {toolset.vcvarsall} put no cl.exe on PATH."
+            + (f"\n{detail}" if detail else "")
+        )
+    return variables
+
+
+def probe_failure_hint(output: str) -> str:
+    """What a failed nvcc probe compile most likely means, from its output."""
+    if "Cannot find compiler 'cl.exe'" in output:
+        return (
+            "nvcc found no MSVC C++ compiler (cl.exe) on PATH: install Visual Studio or its "
+            "Build Tools with the 'Desktop development with C++' workload."
+        )
+    if "unsupported Microsoft Visual Studio version" in output:
+        return (
+            "This nvcc does not accept the MSVC compiler on PATH: add the "
+            f"'{VS2022_TOOLSET}' component in the Visual Studio Installer, or install a CUDA "
+            "Toolkit that supports this Visual Studio."
+        )
+    return "Ensure nvcc and ptxas come from the same CUDA Toolkit installation."
+
+
+def toolchain_steps(cfg: ProvisionConfig, env: BuildEnvironment) -> list[InstallStep]:
+    """Steps that settle the build environment before anything compiles."""
+    if cfg.platform != "windows" or cfg.accelerator != "cuda":
+        return []
+    return [
+        InstallStep(
+            "Finding an MSVC compiler nvcc accepts",
+            action=lambda emit: load_msvc(cfg, env, emit),
+            cwd=cfg.provision_dir,
+        )
+    ]
+
+
+def load_msvc(cfg: ProvisionConfig, env: BuildEnvironment, emit: Emit) -> None:
+    """Fill `env` with the developer environment of an MSVC toolset nvcc accepts."""
+    nvcc = os.environ.get("CUDACXX", "nvcc")
+    if shutil.which("cl"):
+        # Started from a developer prompt: keep the compiler that was chosen there.
+        emit("Using the MSVC compiler already on PATH", False)
+        variables = dict(os.environ)
+    else:
+        toolsets = msvc_toolsets(cfg.arch)
+        if not toolsets:
+            raise ProvisionError(
+                "nvcc needs Microsoft's C++ compiler (cl.exe), and no Visual Studio with C++ "
+                "tools was found. Install Visual Studio or its Build Tools with the "
+                "'Desktop development with C++' workload."
+            )
+        limit = nvcc_msvc_limit(nvcc)
+        toolset = choose_msvc_toolset(toolsets, limit)
+        if toolset is None:
+            assert limit is not None  # without a limit every toolset is usable
+            release = re.search(r"release (\d+\.\d+)", _run_text((nvcc, "--version")))
+            who = f"CUDA {release.group(1)}'s nvcc" if release else "This nvcc"
+            installed = ", ".join(f"{t.version} ({t.product})" for t in toolsets)
+            raise ProvisionError(
+                f"{who} accepts MSVC older than 14.{limit - 1900}, and this machine has only "
+                f"MSVC {installed}. Add the '{VS2022_TOOLSET}' component in the Visual Studio "
+                "Installer (Individual components), or install a CUDA Toolkit that supports "
+                "this Visual Studio."
+            )
+        emit(f"Using MSVC {toolset.version} from {toolset.product}", False)
+        variables = msvc_environment(toolset, cfg.arch)
+
+    path = env_path(variables)
+    chose_generator = any(arg.startswith("-G") for arg in cfg.cmake_args)
+    if not chose_generator and "CMAKE_GENERATOR" not in variables:
+        if shutil.which("ninja", path=path):
+            variables["CMAKE_GENERATOR"] = "Ninja"
+            emit("Building with Ninja", False)
+        else:
+            emit(
+                "Warning: Ninja is not on PATH, so CMake uses the Visual Studio generator, "
+                "which needs CUDA's Visual Studio integration for this Visual Studio.",
+                True,
+            )
+    env.variables = variables
 
 
 # ---------------------------------------------------------------------------
@@ -1077,11 +1350,12 @@ def missing_prerequisites(cfg: ProvisionConfig) -> list[str]:
     return missing
 
 
-def preflight(cfg: ProvisionConfig, emit: Emit) -> None:
+def preflight(cfg: ProvisionConfig, emit: Emit, env: BuildEnvironment | None = None) -> None:
     """Fail fast on a toolchain that cannot produce the requested build.
 
     Everything here is cheap. Discovering a missing nvcc twenty minutes into a
-    compile is the failure mode this exists to prevent.
+    compile is the failure mode this exists to prevent. `env` is the environment
+    the build will run in, so the probes see the compiler the build will.
     """
     missing = missing_prerequisites(cfg)
     if missing:
@@ -1099,7 +1373,7 @@ def preflight(cfg: ProvisionConfig, emit: Emit) -> None:
         emit(_first_line(_run_text((os.environ.get("CXX", "c++"), "--version"))), False)
 
     if cfg.accelerator == "cuda":
-        _preflight_cuda(cfg, emit)
+        _preflight_cuda(cfg, emit, env or BuildEnvironment())
 
     free_bytes = shutil.disk_usage(cfg.provision_dir).free
     if free_bytes < 4 * 1024**3:
@@ -1110,7 +1384,7 @@ def preflight(cfg: ProvisionConfig, emit: Emit) -> None:
         )
 
 
-def _preflight_cuda(cfg: ProvisionConfig, emit: Emit) -> None:
+def _preflight_cuda(cfg: ProvisionConfig, emit: Emit, env: BuildEnvironment) -> None:
     """Verify nvcc can target every requested architecture, then prove it."""
     nvcc = os.environ.get("CUDACXX", "nvcc")
     emit(_last_line(_run_text((nvcc, "--version"))), False)
@@ -1149,13 +1423,15 @@ def _preflight_cuda(cfg: ProvisionConfig, emit: Emit) -> None:
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             text=True,
+            errors="replace",
             check=False,
+            env=env.variables,
         )
         if result.returncode != 0:
+            output = (result.stdout or "").strip()
             raise ProvisionError(
                 f"CUDA compiler/assembler smoke test failed for sm_{probe_arch}. "
-                f"Ensure nvcc and ptxas come from the same CUDA Toolkit installation.\n"
-                f"{(result.stdout or '').strip()}"
+                f"{probe_failure_hint(output)}\n{output}"
             )
     emit(f"CUDA probe compile succeeded for sm_{probe_arch}", False)
 
@@ -1279,6 +1555,43 @@ def validate_server(binary: Path, timeout: float = 20.0) -> str:
     raise ProvisionError(f"Installed {binary.name} failed validation. " + "; ".join(failures))
 
 
+# How `llama-server --list-devices` names each GPU backend's devices ("CUDA0: NVIDIA ...").
+DEVICE_PREFIXES = {"cuda": "CUDA", "vulkan": "Vulkan"}
+
+
+def validate_devices(binary: Path, accelerator: str, timeout: float = 60.0) -> str:
+    """The first device a GPU runtime sees, or "" for a backend this cannot check.
+
+    A GPU backend that fails to load (a driver too old for its CUDA runtime, say) leaves
+    llama-server running on the CPU without complaint, so a runtime installed for a GPU must
+    list that GPU.
+    """
+    prefix = DEVICE_PREFIXES.get(accelerator)
+    if prefix is None:
+        return ""
+    try:
+        completed = subprocess.run(
+            [str(binary), "--list-devices"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            timeout=timeout,
+            check=False,
+            text=True,
+            errors="replace",
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise ProvisionError(f"{binary.name} --list-devices failed: {exc}") from exc
+    output = completed.stdout or ""
+    for line in output.splitlines():
+        if re.match(rf"\s*{prefix}\d+:", line):
+            return line.strip()
+    tail = "\n".join(output.strip().splitlines()[-12:])
+    raise ProvisionError(
+        f"{binary.name} lists no {prefix} device, so its {accelerator} backend did not load "
+        f"and it would run on the CPU.\n{tail}"
+    )
+
+
 def _swap_staged_bin(bin_dir: Path, next_bin: Path) -> None:
     """Replace the live runtime while retaining and restoring the previous one."""
     previous = bin_dir.parent / "bin.previous"
@@ -1334,6 +1647,8 @@ def _install_source_build(cfg: ProvisionConfig, emit: Emit) -> None:
     target = next_bin / cfg.exe_name
     target.chmod(target.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
     emit(validate_server(target), False)
+    if device := validate_devices(target, cfg.accelerator):
+        emit(f"Sees {device}", False)
 
     _swap_staged_bin(bin_dir, next_bin)
     target = bin_dir / cfg.exe_name
@@ -1431,12 +1746,16 @@ def _ladder_rung(
     }
 
 
-def _record_ladder(provision_dir: Path, ladder: list[dict[str, Any]]) -> None:
+def _record_ladder(
+    provision_dir: Path, ladder: list[dict[str, Any]], requested: ProvisionConfig
+) -> None:
     """Attach the rungs of the run that installed the runtime to its record.
 
     Stored beside the version so a front end can show which rung stuck long
     after the provisioning dialog has closed. Skipped when no record exists,
-    since the ladder only means something next to an installed runtime.
+    since the ladder only means something next to an installed runtime. What
+    was asked for goes with it: a fallback records only what it installed, and
+    an update check must look for what was wanted.
     """
     state = Path(provision_dir) / "active-runtime.json"
     try:
@@ -1446,7 +1765,28 @@ def _record_ladder(provision_dir: Path, ladder: list[dict[str, Any]]) -> None:
     if not isinstance(record, dict):
         return
     record["ladder"] = ladder
+    record["requested_method"] = requested.install_method
+    record["requested_accelerator"] = requested.accelerator
     state.write_text(json.dumps(record, indent=2), encoding="utf-8")
+
+
+def requested_target(active: dict[str, Any]) -> tuple[str, str]:
+    """The install method and accelerator an installed runtime was asked for.
+
+    Records from before ``requested_*`` existed still carry their ladder, whose
+    first rung is the request and which only `auto` runs past one rung.
+    """
+    ladder = [rung for rung in active.get("ladder") or [] if isinstance(rung, dict)]
+    method = str(active.get("requested_method") or "")
+    if not method:
+        method = "auto" if len(ladder) > 1 else str(active.get("method") or "auto")
+    accelerator = str(
+        active.get("requested_accelerator")
+        or (ladder[0].get("accelerator") if ladder else "")
+        or active.get("accelerator")
+        or ""
+    )
+    return method, accelerator
 
 
 # ---------------------------------------------------------------------------
@@ -1588,7 +1928,7 @@ class LlamaProvisioner:
                     cfg, ok=True, detail="installed — last rung" if fell_back else "installed"
                 )
             )
-            _record_ladder(cfg.provision_dir, ladder)
+            _record_ladder(cfg.provision_dir, ladder, self.config)
 
             if fell_back:
                 self.target_mismatch = (
@@ -1699,6 +2039,7 @@ class LlamaProvisioner:
                 errors="replace",
                 start_new_session=os.name != "nt",
                 creationflags=creationflags,
+                env=step.env.variables if step.env is not None else None,
             )
         except OSError as exc:
             raise ProvisionError(f"could not run {step.argv[0]}: {exc}") from exc

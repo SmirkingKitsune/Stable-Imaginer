@@ -1,4 +1,5 @@
 import asyncio
+import hashlib
 import re
 from collections.abc import AsyncIterable, AsyncIterator, Awaitable, Callable
 from dataclasses import dataclass
@@ -19,7 +20,7 @@ from imaginer.domain import models as dto
 from imaginer.domain.enums import LABEL_PREFIX, ArtifactKind, ArtifactSource
 from imaginer.domain.errors import InvalidRequestError, NotFoundError
 from imaginer.services import mappers
-from imaginer.services.media import ImageInfo, inspect_image
+from imaginer.services.media import ImageInfo, inspect_image, inspect_image_bytes
 from imaginer.storage.base import ArtifactStore
 
 log = get_logger(__name__)
@@ -169,6 +170,32 @@ class ArtifactService:
             conversation_id, info, ArtifactSource.UPLOAD, kind, metadata=metadata or None
         )
         return await self.ingest(spec, _read_chunks(fileobj), max_bytes=self._max_upload_bytes)
+
+    async def import_image(
+        self,
+        conversation_id: str,
+        data: bytes,
+        *,
+        kind: ArtifactKind = ArtifactKind.IMAGE,
+        metadata: dict[str, Any] | None = None,
+    ) -> tuple[dto.Artifact, bool]:
+        """An image brought in from elsewhere (the artifact library), as an upload of this
+        conversation with a label of its own. When the conversation already has these bytes,
+        that artifact comes back instead (and False)."""
+        if kind not in (ArtifactKind.IMAGE, ArtifactKind.MASK):
+            raise InvalidRequestError(f"only images and masks can be imported, not {kind}")
+        sha256 = hashlib.sha256(data).hexdigest()
+        async with self._db.session() as session, session.begin():
+            await conv_repo.require_active(session, conversation_id)
+            existing = await art_repo.find_by_sha256(session, conversation_id, sha256, kind)
+        if existing is not None:
+            return mappers.artifact(existing), False
+        # Measured from the bytes: what another instance reported isn't trusted.
+        info = await asyncio.to_thread(inspect_image_bytes, data)
+        spec = NewArtifact.image(
+            conversation_id, info, ArtifactSource.UPLOAD, kind, metadata=metadata or None
+        )
+        return await self.ingest(spec, data), True
 
     async def get(self, artifact_id: str) -> dto.Artifact:
         return mappers.artifact(await self._get_row(artifact_id))

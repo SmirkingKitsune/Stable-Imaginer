@@ -29,7 +29,8 @@ backends:
     declared_capabilities: [t2i, edit, multi_ref, rgba, lora]
     launch:
       executable: tests/fakes/sd-server.cmd
-      extra_args: [--load-delay, "3"]
+      # "draw ... crashme" crashes it, to see what the chat model is told about a crash.
+      extra_args: [--load-delay, "3", --crash-on, crashme]
 
 routing:
   chat: llama

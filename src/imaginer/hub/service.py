@@ -17,14 +17,18 @@ rather than downloaded again.
 
 import asyncio
 import contextlib
+import hashlib
 import os
+import time
 from collections import defaultdict
 from collections.abc import Awaitable, Callable, Iterable
+from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 from typing import Any, Literal
 
 import httpx
 
+from imaginer.agents.fit import params_label, takes_tools
 from imaginer.backends import diffusers_inproc
 from imaginer.backends.diffusers_inproc import PIPELINE_CLASS
 from imaginer.core.config import (
@@ -35,17 +39,30 @@ from imaginer.core.config import (
     SdCppBackendConfig,
     Settings,
 )
+from imaginer.core.logging import get_logger
 from imaginer.domain import models as dto
-from imaginer.domain.errors import HubError, ImaginerError, InvalidRequestError, NotFoundError
+from imaginer.domain.errors import (
+    ConflictError,
+    HubAccessError,
+    HubError,
+    ImaginerError,
+    InvalidRequestError,
+    NotFoundError,
+)
 from imaginer.engines import launch
 from imaginer.engines.service import EngineService
 from imaginer.hub.client import (
+    GgufInfo,
     HubClient,
     RepoInfo,
     RepoSummary,
+    env_token,
     find_token,
+    forget_token,
     hub_cache_dir,
     resolve_endpoint,
+    save_token,
+    token_path,
 )
 from imaginer.hub.downloads import DownloadJob, DownloadManager
 from imaginer.hub.layout import (
@@ -77,6 +94,28 @@ HubFormat = Literal["gguf", "diffusers", "safetensors"]
 FORMATS: tuple[HubFormat, ...] = ("gguf", "diffusers", "safetensors")
 SORTS = {"downloads": "downloads", "trending": "trendingScore", "likes": "likes",
          "updated": "lastModified"}  # fmt: skip
+CHECK_TTL_S = 600.0  # how long what the Hub said of a token is trusted
+CHECK_RETRY_S = 60.0  # and how soon a check that couldn't reach it is tried again
+STATUS_CHECK_WAIT_S = 5.0
+MAX_TOKEN_CHARS = 1024
+
+log = get_logger(__name__)
+# A search for vision models asks the Hub for this many times the results it shows: those
+# without a vision projector are left out.
+VISION_OVERFETCH = 3
+
+
+@dataclass(frozen=True, slots=True)
+class AgentFiles:
+    """A repo as a new agent sees it: its GGUF chat models (the one to suggest first: the
+    asked-for quant, else Q4_K_M…) and vision projectors (F16 first), with copies already
+    here, and what the Hub read from its GGUF."""
+
+    ref: HubRef
+    info: RepoInfo
+    models: list[dto.HubVariant]
+    projectors: list[dto.HubVariant]
+    gguf: GgufInfo | None
 
 
 class HubService:
@@ -108,6 +147,9 @@ class HubService:
         self.on_agent_install: (
             Callable[[str, str, Path, dict[str, Any]], Awaitable[None]] | None
         ) = None
+        # What the Hub said of each token (by its SHA-256): when, its account, and whether
+        # it was accepted (None: the Hub couldn't be reached, or can't say).
+        self._checks: dict[str, tuple[float, str | None, bool | None]] = {}
 
     def _token(self) -> str | None:
         return find_token(self._settings.hub.token_env).token
@@ -127,7 +169,85 @@ class HubService:
             path = await asyncio.to_thread(_models_folder, body.models_dir)
             self._settings.hub.models_dir = path
             await self._engines.save_settings({"hub": {"models_dir": str(path)}})
-        return self.status()
+        return await self.status()
+
+    # --- the token --------------------------------------------------------------------------
+
+    async def set_token(self, body: dto.HubTokenUpdate) -> dto.HubStatus:
+        """Check a token with the Hub, then save it where ``hf auth login`` would, so the
+        ``hf`` CLI and Diffusers on this machine use it too. The token is never echoed."""
+        self._require_enabled()
+        self._require_file_token()
+        token = body.token.get_secret_value().strip()
+        if not token:
+            raise InvalidRequestError("paste a Hub token")
+        if (
+            len(token) > MAX_TOKEN_CHARS
+            or not token.isascii()
+            or not token.isprintable()
+            or any(c.isspace() for c in token)
+        ):
+            raise InvalidRequestError("that is not a Hub token: one word, like hf_…")
+        try:
+            account = await self.client.whoami(token)
+        except HubAccessError as exc:
+            raise InvalidRequestError(
+                "the Hub did not accept this token: check it was copied whole and hasn't "
+                "been revoked"
+            ) from exc
+        try:
+            path = await asyncio.to_thread(save_token, token)
+        except OSError as exc:
+            raise InvalidRequestError(
+                f"couldn't save the token to {token_path()}: {exc.strerror or exc}"
+            ) from exc
+        accepted = True if account is not None else None  # (a mirror may not say)
+        self._checks[_fingerprint(token)] = (time.monotonic(), account, accepted)
+        log.info("hub.token_saved", account=account, path=str(path))
+        return await self.status()
+
+    async def clear_token(self) -> dto.HubStatus:
+        """Remove the saved token, as ``hf auth logout`` does."""
+        self._require_file_token()
+        try:
+            removed = await asyncio.to_thread(forget_token)
+        except OSError as exc:
+            raise InvalidRequestError(
+                f"couldn't remove {token_path()}: {exc.strerror or exc}"
+            ) from exc
+        if removed:
+            log.info("hub.token_removed", path=str(token_path()))
+        return await self.status()
+
+    def _require_file_token(self) -> None:
+        name = env_token(self._settings.hub.token_env)
+        if name is not None:
+            raise ConflictError(
+                f"this server's Hub token comes from ${name}, which wins over one set here: "
+                "change or unset it where the server is started"
+            )
+
+    async def _check(self, token: str) -> tuple[str | None, bool | None]:
+        """Who the Hub says a token belongs to, and whether it accepts it. Remembered a
+        while, so opening the dialog doesn't ask the Hub every time."""
+        key = _fingerprint(token)
+        now = time.monotonic()
+        found = self._checks.get(key)
+        if found is not None:
+            at, known, accepted = found
+            if now - at < (CHECK_TTL_S if accepted is not None else CHECK_RETRY_S):
+                return known, accepted
+        account: str | None = None
+        valid: bool | None = None
+        try:
+            account = await self.client.whoami(token, wait_s=STATUS_CHECK_WAIT_S)
+            valid = True if account is not None else None  # (a mirror may not say)
+        except HubAccessError:
+            valid = False
+        except HubError:
+            pass  # unreachable: unknown, and asked again sooner
+        self._checks[key] = (now, account, valid)
+        return account, valid
 
     def _require_enabled(self) -> None:
         if not self._settings.hub.enabled:
@@ -139,14 +259,21 @@ class HubService:
 
     # --- status and search ------------------------------------------------------------
 
-    def status(self) -> dto.HubStatus:
+    async def status(self) -> dto.HubStatus:
         credentials = find_token(self._settings.hub.token_env)
+        account, valid = None, None
+        if credentials.token is not None and self._settings.hub.enabled:
+            account, valid = await self._check(credentials.token)
         cache = self.cache_dir
         return dto.HubStatus(
             enabled=self._settings.hub.enabled,
             endpoint=self.client.endpoint,
             token=credentials.token is not None,
             token_source=credentials.source,
+            token_valid=valid,
+            account=account,
+            token_file=str(token_path()),
+            token_editable=env_token(self._settings.hub.token_env) is None,
             models_dir=str(self.models_dir),
             hf_cache=str(cache) if cache is not None else None,
         )
@@ -161,9 +288,14 @@ class HubService:
         task: str | None = None,
         sort: str = "downloads",
         limit: int = 30,
+        vision: bool = False,
     ) -> list[dto.HubRepoSummary]:
+        """Model repos. ``vision``: only GGUF repos with a vision projector (what an agent
+        needs), each saying whether its chat template takes tools; those that do first."""
         self._require_enabled()
         filters: list[str] = []
+        if vision:
+            fmt = "gguf"
         if fmt in FORMATS:
             filters.append(fmt)
         if base_model:
@@ -177,13 +309,32 @@ class HubService:
             filters=filters,
             pipeline_tag=task,
             sort=SORTS.get(sort, "downloads"),
-            limit=limit,
+            limit=min(100, limit * VISION_OVERFETCH) if vision else limit,
+            expand=("siblings", "gguf") if vision else (),
         )
-        return [self._summary(r) for r in found]
+        if not vision:
+            return [self._summary(r) for r in found]
+        seen = [self._summary(r, agent=True) for r in found]
+        # Tool callers first; the rest (no tools, or no template to tell) in the Hub's order.
+        fit = sorted((r for r in seen if r.vision), key=lambda r: r.tools is not True)
+        return fit[:limit]
 
-    def _summary(self, repo: RepoSummary) -> dto.HubRepoSummary:
+    def _summary(self, repo: RepoSummary, *, agent: bool = False) -> dto.HubRepoSummary:
         tags = set(repo.tags)
+        fit: dict[str, Any] = {}
+        if agent:
+            gguf = _model_gguf(repo.gguf)
+            fit = {
+                "vision": any(
+                    f.lower().endswith(".gguf") and "mmproj" in PurePosixPath(f).name.lower()
+                    for f in repo.files
+                ),
+                "tools": takes_tools(gguf.chat_template) if gguf is not None else None,
+                "params": params_label(gguf.params) if gguf is not None else None,
+                "architecture": gguf.architecture if gguf is not None else None,
+            }
         return dto.HubRepoSummary(
+            **fit,
             id=repo.id,
             url=self.client.repo_url(repo.id),
             task=repo.pipeline_tag,
@@ -211,6 +362,40 @@ class HubService:
             self._repo_view, ref, info, layout, None if model else engine, config, bool(model)
         )
         return view.model_copy(update={"model": model}) if model else view
+
+    async def agent_files(self, reference: str) -> AgentFiles:
+        """A repo's GGUF chat models and vision projectors, for a new agent (see
+        ``AgentFiles``)."""
+        self._require_enabled()
+        ref = _parse(reference)
+        (info, layout), gguf = await asyncio.gather(self._load(ref), self._gguf(ref))
+        gguf = _model_gguf(gguf)
+        in_use = self._in_use()
+
+        def views(key: Literal["model", "mmproj"]) -> list[dto.HubVariant]:
+            found = [v for v in layout.variants if v.component == key and v.format == "gguf"]
+            first = None
+            if key == "model" and ref.path:
+                first = next(
+                    (v for v in found if ref.path in {v.id, *(f.path for f in v.files)}), None
+                )
+            if first is None:
+                first = suggest(found, key=key, quant=ref.quant if key == "model" else None)
+            order = ranked(found, key=key)
+            if first is not None:
+                order = [first, *(v for v in order if v is not first)]
+            return [self._variant(ref.repo_id, info.sha, v, in_use) for v in order]
+
+        models, projectors = await asyncio.to_thread(lambda: (views("model"), views("mmproj")))
+        return AgentFiles(ref, info, models, projectors, gguf)
+
+    async def _gguf(self, ref: HubRef) -> GgufInfo | None:
+        """What the Hub read from the repo's GGUF; None when it can't say."""
+        try:
+            return await self.client.gguf(ref.repo_id, ref.revision)
+        except (HubError, HubAccessError, NotFoundError) as exc:
+            log.info("hub.gguf_unavailable", repo=ref.repo_id, detail=str(exc))
+            return None
 
     def _model_config(self, card_id: str) -> SdCppBackendConfig:
         if self.model_config is None:
@@ -625,6 +810,13 @@ class HubService:
             raise InvalidRequestError("; ".join(failed))
 
 
+def _model_gguf(gguf: GgufInfo | None) -> GgufInfo | None:
+    """What the Hub read from a repo's GGUF, if it read a model: in some repos the first
+    GGUF it reads is the vision projector (architecture ``clip``), which says nothing of the
+    model's size or chat template."""
+    return None if gguf is None or gguf.architecture == "clip" else gguf
+
+
 def download_view(job: DownloadJob) -> dto.HubDownload:
     return dto.HubDownload(
         id=job.id,
@@ -674,6 +866,10 @@ def _models_folder(text: str) -> Path:
     if path.exists() and not path.is_dir():
         raise InvalidRequestError(f"{path} is a file, not a folder")
     return path
+
+
+def _fingerprint(token: str) -> str:
+    return hashlib.sha256(token.encode()).hexdigest()
 
 
 def _parse(reference: str) -> HubRef:

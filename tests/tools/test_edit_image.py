@@ -251,6 +251,36 @@ async def test_a_masked_edit_runs_on_the_model_card_when_the_edit_card_takes_no_
     await bench.registry.aclose()
 
 
+async def test_several_images_run_on_the_model_card_when_the_edit_card_takes_one(
+    database: Database, make_settings: SettingsFactory, fake_sd: FakeSdCpp, tmp_path: Path
+) -> None:
+    # FLUX.1 Kontext edits one image; Qwen-Image-2.1, the engine's model card, up to ten.
+    engine = two_card_engine(fake_sd.url, family="flux1-kontext")
+    bench = Bench(database, engine, make_settings, tmp_path / "s")
+    switcher = FakeSwitcher()
+    bench.registry.set_switcher(switcher)
+    cid = await bench.conversation()
+    cat, hat = image_bytes(320, 256, color=(200, 100, 50)), image_bytes(color=(10, 10, 200))
+    await bench.upload(cid, cat)
+    await bench.upload(cid, hat)
+
+    # The edit card's preset is for its edits: this one runs without it.
+    options = ImageRequestOptions(preset="lightning")
+    arguments = {"images": ["img-1", "img-2"], "prompt": "put the hat from image 2 on the cat"}
+    content = await bench.edit(cid, arguments, options)
+    assert content["status"] == "succeeded", content
+    assert switcher.calls[-1][1:] == ("main", "main")  # the model card's face, and card
+    body = fake_sd.requests[-1]
+    assert [base64.b64decode(r.split(",", 1)[1]) for r in body["ref_images"]] == [cat, hat]
+    assert body["sample_params"].get("sample_steps") != 4
+
+    content = await bench.edit(cid, {"images": ["img-1"], "prompt": "brighter"}, options)
+    assert content["status"] == "succeeded"
+    assert switcher.calls[-1][1:] == ("edit", "edit")  # one image: Kontext's
+    assert fake_sd.requests[-1]["sample_params"]["sample_steps"] == 4  # lightning
+    await bench.registry.aclose()
+
+
 async def test_a_mask_is_not_an_image_to_edit(bench: Bench, fake_sd: FakeSdCpp) -> None:
     cid = await bench.conversation()
     await bench.upload(cid, image_bytes())

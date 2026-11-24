@@ -88,8 +88,9 @@ for nesting, for example `IMAGINER_SERVER__PORT=9000` or `IMAGINER_DATA_ROOT=D:/
   The server binds to `127.0.0.1` by default and warns if you bind it more widely without a token.
   Linking with other instances over the network requires it.
 - Engine API keys: each backend's `api_key_env` names the env var that holds its key.
-- Hugging Face token, for gated repos: `HF_TOKEN`, or log in once with `hf auth login`. The
-  server reads it the way the `hf` CLI does (see [docs/huggingface.md](docs/huggingface.md)).
+- Hugging Face token, for gated repos: **Set token** in the Hugging Face dialog's footer, `HF_TOKEN`,
+  or `hf auth login`. The server reads it the way the `hf` CLI does, and the dialog saves it
+  where `hf auth login` would (see [docs/huggingface.md](docs/huggingface.md)).
 
 Sampler defaults (steps, CFG, sampler, sigmas, size) belong to the **model**. For sd-server
 they are the engine's model card's, seeded from its family's recipe
@@ -240,6 +241,7 @@ See [docs/linked-instances.md](docs/linked-instances.md) for the protocol and se
   conversations/<conversation_id>/
     artifacts/<artifact_id>.<ext>
   loras/covers/<lora id>.webp            # the LoRA library's covers
+  artifact_library/<pin id>.<ext>        # images pinned in the artifact library
 ```
 
 `data_root` defaults to `%LOCALAPPDATA%\imaginer` on Windows and `~/.local/share/imaginer`
@@ -287,6 +289,7 @@ conversation stays hidden and a background sweep finishes the delete later.
 | `GET`, `POST` | `/v1/agents`, `/v1/agents/{id}` | agents: a chat model (GGUF, vision projector, chat template) plus a persona (name, system prompt, portrait, tools, sampling); `POST` makes one from a file (`path`), a Hub reference (`ref`) or for whatever an engine runs. See [docs/agent-library.md](docs/agent-library.md) |
 | `PATCH`, `DELETE` | `/v1/agents/{id}` | name, engine, files, system prompt, viewer, tools, sampling, context, notes, tags, pin; `DELETE` forgets it (not while an engine runs it) |
 | `POST`, `PUT`, `GET` | `/v1/agents/{id}/use`, `/stop`, `/portrait`, `/portrait/upload`, `/portrait/paint`, `/portraits/{key}` | run its model on its engine; its portrait: the Hub uploader's avatar, an upload, or a self-portrait it paints with `set_portrait` |
+| `GET`, `POST` | `/v1/artifact-library`, `/v1/artifact-library/pins`, `/v1/artifact-library/import` | the artifact library: every image here and on linked instances, each distinct image once; pin one to keep a copy that outlives its conversation; copy one into a conversation. See [docs/artifact-library.md](docs/artifact-library.md) |
 | `GET` | `/v1/gallery?limit=&cursor=&include_archived=` | this instance's conversations and every linked instance's, newest activity first; each item has an `origin` (`base_path` reaches a remote one), each page `sources` with their status |
 | `GET`, `POST` | `/v1/links`, `/v1/links/discovered` | the Links screen: this instance, its links and what each shares (with VRAM fit); `POST {url, code, name?}` pairs |
 | `POST` | `/v1/links/pairing-code` | a code another instance can pair with (10 minutes, single use) |
@@ -553,6 +556,13 @@ It follows the "Imaginer Main Interface" design, which is built on the Industry 
   its tools, its files (GGUF, vision projector, chat template) and its sampling. **Use on** an
   engine restarts a llama-server launched here with the agent's model. See
   [docs/agent-library.md](docs/agent-library.md).
+- **Artifact library** (`#/artifacts`, from the gallery header or the status line's menu):
+  every image uploaded or made in any conversation, here and on linked instances, each distinct
+  image once, newest first; filters for source, pinned, instance and masks, and a search over
+  prompts, file names, titles and pins. An image's details show how it was made. **Use in next
+  prompt** (or the prompt bar's library button) copies images into the conversation when the
+  message is sent, where they get labels of their own. **Pin** keeps a copy that outlives its
+  conversation. See [docs/artifact-library.md](docs/artifact-library.md).
 - **Connection:** when the server can't be reached, a strip under the header counts down
   retries (1, 2, 4, 8, 16 s), running jobs dim to their last known step, and drafts are kept.
   Once back, running turns pick up from their last event.
@@ -673,7 +683,8 @@ uv run imaginer llama status
 
 The default installation directory is `<data_root>/engines/llama_cpp`; override it with
 `--cache-dir`. `auto` tries a matching official release, then a source build, then a CPU
-release as a last resort. Any CPU fallback is reported in stderr and the JSON result.
+release as a last resort. Any CPU fallback is reported in stderr and the JSON result, and
+on the Engines screen, where checking for updates offers the GPU build again.
 Use `--method release` or `--method source` to require that method and accelerator.
 Source builds require Git, CMake, a C++ compiler, and the selected accelerator's SDK.
 
@@ -701,8 +712,9 @@ Get llama.cpp from its [releases](https://github.com/ggml-org/llama.cpp/releases
 `b11970`:
 
 - **NAS (Linux x64, RTX 2000e Ada):** `llama-<tag>-bin-ubuntu-cuda-12.8-x64.tar.gz`.
-- **Windows with an RTX 5090:** `llama-<tag>-bin-win-cuda-13.4-x64.zip` plus
-  `cudart-llama-bin-win-cuda-13.4-x64.zip`. The CUDA 12.4 build can't target `sm_120`.
+- **Windows with an RTX 5090:** `llama-<tag>-bin-win-cuda-13.5-x64.zip` plus
+  `cudart-llama-bin-win-cuda-13.5-x64.zip` (13.4 before `b12527`). It runs on a driver
+  that reports CUDA 13.4. The CUDA 12.4 build can't target `sm_120`.
 - **DGX Spark (later):** `llama-<tag>-bin-ubuntu-cuda-13.4-arm64.tar.gz`.
 
 Keep llama-server on `127.0.0.1`, next to the server that uses it. Another computer that needs

@@ -14,14 +14,16 @@ from imaginer.db import models as orm
 from imaginer.db.engine import Database
 from imaginer.db.repositories import conversations as conv_repo
 from imaginer.domain.enums import Capability
+from imaginer.domain.errors import EngineUnavailableError
 from imaginer.domain.events import EventType
 from imaginer.orchestration.gates import EngineGates
 from imaginer.orchestration.jobs import JobManager
 from imaginer.services.artifacts import ArtifactService
 from imaginer.storage.local_fs import LocalFSArtifactStore
-from imaginer.tools.base import ToolContext, ToolRegistry
+from imaginer.tools.base import ENGINE_REPORT_NOTE, ToolContext, ToolOutcome, ToolRegistry
 from imaginer.tools.generate_image import GenerateImageTool
 from tests.conftest import SettingsFactory, sd_config
+from tests.fakes.fake_reporter import FakeReporter
 from tests.fakes.fake_sdcpp import FakeSdCpp
 
 
@@ -117,6 +119,27 @@ async def test_engine_failure_is_a_tool_error(bench: Bench, fake_sd: FakeSdCpp) 
     assert content["status"] == "error"
     assert content["error"]["code"] == "engine_error"
     assert "job_id" in content["error"]
+
+
+async def test_an_engine_failure_brings_the_engines_report_to_the_model(
+    bench: Bench, fake_sd: FakeSdCpp
+) -> None:
+    """The model sees what the engine's log showed, and is told what to do with it."""
+    bench.registry.set_reporter(FakeReporter(state="running"))
+    fake_sd.fail_next = "failed to decode the latent"
+    content = await bench.call({"prompt": "x"})
+    error = content["error"]
+    assert error["code"] == "engine_error" and "job_id" in error
+    assert error["engine_report"]["hints"] == ["A tensor shape mismatch"]
+    assert error["note"] == ENGINE_REPORT_NOTE
+
+
+def test_an_error_without_a_report_is_told_as_before() -> None:
+    outcome = ToolOutcome.failed(EngineUnavailableError("sd is unreachable", backend="sd"))
+    assert outcome.content == {
+        "status": "error",
+        "error": {"code": "engine_unavailable", "detail": "sd is unreachable"},
+    }
 
 
 async def test_missing_capability_is_a_tool_error(

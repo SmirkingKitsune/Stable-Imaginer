@@ -170,12 +170,13 @@ def accelerator_cmake_flags(cfg: shared.ProvisionConfig) -> list[str]:
 def build_source_plan(cfg: shared.ProvisionConfig) -> list[InstallStep]:
     src, build = cfg.source_dir, cfg.build_dir
     ref = "master" if cfg.version == "latest" else cfg.version
-    steps = []
+    env = shared.BuildEnvironment()
+    steps = shared.toolchain_steps(cfg, env)
     if not cfg.bypass_environment_checks:
         steps.append(
             InstallStep(
                 "Checking source-build prerequisites",
-                action=lambda emit: shared.preflight(cfg, emit),
+                action=lambda emit: shared.preflight(cfg, emit, env),
             )
         )
     if not (src / ".git").exists():
@@ -262,6 +263,8 @@ def build_source_plan(cfg: shared.ProvisionConfig) -> list[InstallStep]:
             InstallStep("Installing sd-server", action=lambda emit: _install_source(cfg, emit)),
         ]
     )
+    for step in steps:
+        step.env = env
     return steps
 
 
@@ -397,14 +400,26 @@ class UpdateStatus:
     update_available: bool = False
     action: str = "none"
     error: str = ""
+    # The accelerator installed in place of the one asked for, or "" (see llamacpp's).
+    fallback: str = ""
+    warning: str = ""
 
     @property
     def ok(self) -> bool:
         return not self.error
 
 
-def check_for_update(cfg: shared.ProvisionConfig, installed_version: str) -> UpdateStatus:
+def check_for_update(
+    cfg: shared.ProvisionConfig, installed_version: str, installed_accelerator: str = ""
+) -> UpdateStatus:
+    """`cfg` is the runtime asked for; another `installed_accelerator` is a fallback to replace."""
     status = UpdateStatus(installed_version)
+    if installed_accelerator and installed_accelerator != cfg.accelerator:
+        status.fallback = installed_accelerator
+        status.warning = (
+            f"The installed runtime is the {installed_accelerator} fallback: "
+            f"{cfg.accelerator} was asked for."
+        )
     try:
         releases = fetch_releases()
         newest = next(r for r in releases if r.get("assets") and r.get("tag_name"))
@@ -417,8 +432,8 @@ def check_for_update(cfg: shared.ProvisionConfig, installed_version: str) -> Upd
             and latest
             and int(installed.group(1)) + int(installed.group(2) or 0) > int(latest.group(1))
         )
-        status.update_available = not current
-        if not current:
+        status.update_available = not current or bool(status.fallback)
+        if status.update_available:
             try:
                 select_release_assets(
                     [a["name"] for a in newest["assets"]],

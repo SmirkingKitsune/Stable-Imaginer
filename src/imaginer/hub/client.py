@@ -4,7 +4,8 @@ It reads what the ``hf`` CLI and huggingface_hub read, so a machine that is alre
 in needs nothing more:
 
 * **Token:** ``$HF_TOKEN`` (or the env var ``hub.token_env`` names), else the file
-  ``hf auth login`` writes: ``$HF_TOKEN_PATH``, else ``$HF_HOME/token``.
+  ``hf auth login`` writes: ``$HF_TOKEN_PATH``, else ``$HF_HOME/token``. A token set in the
+  Hugging Face dialog is saved to that same file, so the ``hf`` CLI and Diffusers use it too.
 * **Endpoint:** ``hub.endpoint``, else ``$HF_ENDPOINT`` (a mirror), else https://huggingface.co.
 
 The token is read for each request, so logging in takes effect without a restart. It goes
@@ -58,17 +59,67 @@ class Credentials:
     source: str | None  # where it came from, for the UI: "$HF_TOKEN" or "hf auth login"
 
 
-def find_token(token_env: str = "HF_TOKEN") -> Credentials:
+LOGIN_SOURCE = "hf auth login"  # the source of a token from the token file
+
+
+def token_path() -> Path:
+    """The file ``hf auth login`` keeps the token in, and huggingface_hub reads it from."""
+    return Path(os.environ.get("HF_TOKEN_PATH") or hf_home() / "token").expanduser()
+
+
+def env_token(token_env: str = "HF_TOKEN") -> str | None:
+    """The environment variable a token comes from, if one is set: it wins over the file."""
     for name in dict.fromkeys((token_env, "HF_TOKEN", "HUGGING_FACE_HUB_TOKEN")):
-        value = os.environ.get(name, "").strip()
-        if value:
-            return Credentials(value, f"${name}")
-    path = Path(os.environ.get("HF_TOKEN_PATH") or hf_home() / "token").expanduser()
+        if os.environ.get(name, "").strip():
+            return name
+    return None
+
+
+def find_token(token_env: str = "HF_TOKEN") -> Credentials:
+    name = env_token(token_env)
+    if name is not None:
+        return Credentials(os.environ[name].strip(), f"${name}")
     try:
-        value = path.read_text(encoding="utf-8").strip()
+        value = token_path().read_text(encoding="utf-8").strip()
     except OSError:
         value = ""
-    return Credentials(value, "hf auth login") if value else Credentials(None, None)
+    return Credentials(value, LOGIN_SOURCE) if value else Credentials(None, None)
+
+
+def save_token(token: str) -> Path:
+    """Write the token file as ``hf auth login`` does: replaced whole, readable by its owner
+    only where the OS has such modes."""
+    path = token_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    partial = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    try:
+        fd = os.open(partial, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(token)
+        partial.replace(path)
+    finally:
+        partial.unlink(missing_ok=True)
+    return path
+
+
+def forget_token() -> bool:
+    """Remove the token file, as ``hf auth logout`` does. False if there was none."""
+    try:
+        token_path().unlink()
+    except FileNotFoundError:
+        return False
+    return True
+
+
+@dataclass(frozen=True, slots=True)
+class GgufInfo:
+    """What the Hub read from a repo's GGUF (``expand[]=gguf``): its first model file's
+    architecture, context length, parameter count and chat template."""
+
+    architecture: str | None = None
+    context_length: int | None = None
+    params: int | None = None
+    chat_template: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -82,6 +133,8 @@ class RepoSummary:
     private: bool = False
     updated_at: str | None = None
     tags: tuple[str, ...] = ()
+    files: tuple[str, ...] = ()  # with expand[]=siblings: the repo's file paths
+    gguf: GgufInfo | None = None  # with expand[]=gguf
 
 
 @dataclass(frozen=True, slots=True)
@@ -132,14 +185,17 @@ class HubClient:
         pipeline_tag: str | None = None,
         sort: str = "downloads",
         limit: int = 30,
+        expand: Sequence[str] = (),
     ) -> list[RepoSummary]:
+        """Model repos. ``expand`` asks for more of each: ``siblings`` (its files) and
+        ``gguf`` (what the Hub read from its GGUF)."""
         params: list[tuple[str, str | int]] = [("sort", sort), ("direction", -1), ("limit", limit)]
         if query:
             params.append(("search", query))
         if pipeline_tag:
             params.append(("pipeline_tag", pipeline_tag))
         params += [("filter", f) for f in filters]
-        params += [("expand[]", field) for field in _EXPAND]
+        params += [("expand[]", field) for field in (*_EXPAND, *expand)]
         data = await self._json(f"{self.endpoint}/api/models", params=params, what="the search")
         if not isinstance(data, list):
             raise HubError("the Hub's search answered with something other than a list")
@@ -173,6 +229,13 @@ class HubClient:
             instance_prompt=prompt.strip()[:500] or None if isinstance(prompt, str) else None,
             images=_card_images(card, data.get("widgetData"), {f.path for f in files}),
         )
+
+    async def gguf(self, repo_id: str, revision: str = "main") -> GgufInfo | None:
+        """What the Hub read from a repo's GGUF (its chat template, architecture…); None
+        when it has none, or the endpoint (a mirror) doesn't say."""
+        url = f"{self.endpoint}/api/models/{repo_id}/revision/{quote(revision, safe='')}"
+        data = await self._json(url, params=[("expand[]", "gguf")], what=repo_id)
+        return _gguf(data.get("gguf")) if isinstance(data, dict) else None
 
     async def json_file(self, repo_id: str, revision: str, path: str) -> Any:
         """A small JSON file from the repo, such as model_index.json."""
@@ -209,6 +272,30 @@ class HubClient:
             yield resp
         finally:
             await resp.aclose()
+
+    async def whoami(self, token: str, *, wait_s: float = 10.0) -> str | None:
+        """The account ``token`` belongs to. None when the endpoint can't say (a mirror
+        without whoami); HubAccessError when the Hub rejects the token, HubError when it
+        can't be reached within ``wait_s``."""
+        try:
+            resp = await self._http.get(
+                f"{self.endpoint}/api/whoami-v2",
+                headers={"Authorization": f"Bearer {token}"},
+                timeout=wait_s,
+            )
+        except httpx.HTTPError as exc:
+            raise HubError(f"couldn't reach {self.endpoint}: {_reason(exc)}") from exc
+        if resp.status_code in {401, 403}:
+            raise HubAccessError("the Hub did not accept this token")
+        if resp.status_code in {404, 405}:
+            return None
+        await _raise_for(resp, "the token check")
+        try:
+            data = resp.json()
+        except ValueError:
+            return None
+        name = data.get("name") if isinstance(data, dict) else None
+        return name if isinstance(name, str) and name else None
 
     async def avatar_url(self, owner: str) -> str | None:
         """Where the avatar of a Hub organization or user is, if it has one."""
@@ -272,8 +359,8 @@ async def _raise_for(resp: httpx.Response, what: str) -> None:
         message = _error_text(resp) or f"HTTP {resp.status_code}"
     if code == "GatedRepo":
         raise HubAccessError(
-            f"{what} is gated: accept its terms on the Hub, then log in here "
-            "(set HF_TOKEN, or run `hf auth login`)"
+            f"{what} is gated: accept its terms on the Hub, then set a Hub token here "
+            "(in the Hugging Face dialog, with HF_TOKEN, or with `hf auth login`)"
         )
     if code in {"RepoNotFound", "RevisionNotFound", "EntryNotFound"} or resp.status_code == 404:
         hint = "" if resp.status_code == 404 else " (or it is private: set a Hub token)"
@@ -315,8 +402,22 @@ def _card_images(card: Any, widget_data: Any, paths: set[str]) -> tuple[str, ...
     return tuple(found[:12])
 
 
+def _gguf(value: Any) -> GgufInfo | None:
+    if not isinstance(value, dict):
+        return None
+    template = value.get("chat_template")
+    arch = value.get("architecture")
+    return GgufInfo(
+        architecture=arch if isinstance(arch, str) and arch else None,
+        context_length=_int(value.get("context_length")),
+        params=_int(value.get("total")),
+        chat_template=template if isinstance(template, str) else None,
+    )
+
+
 def _summary(item: dict[str, Any]) -> RepoSummary:
     gated = item.get("gated")
+    siblings = item.get("siblings") or ()
     return RepoSummary(
         id=str(item["id"]),
         downloads=_int(item.get("downloads")),
@@ -327,6 +428,12 @@ def _summary(item: dict[str, Any]) -> RepoSummary:
         private=bool(item.get("private")),
         updated_at=item.get("lastModified"),
         tags=tuple(t for t in item.get("tags") or () if isinstance(t, str)),
+        files=tuple(
+            s["rfilename"]
+            for s in siblings
+            if isinstance(s, dict) and isinstance(s.get("rfilename"), str)
+        ),
+        gguf=_gguf(item.get("gguf")),
     )
 
 

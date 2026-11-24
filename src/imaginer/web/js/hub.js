@@ -5,9 +5,13 @@
 // pipelines, ComfyUI repackages) and matches it to the engine, so this dialog only shows the
 // result. Downloads run on the server and keep going after the dialog closes; once done, they
 // set the engine's setting, as an edit on the Engines screen would.
+//
+// For a new agent (agentTarget), it only lists GGUF repos with a vision projector, since an
+// agent must see images, and those whose chat template takes tools first. Picking one hands
+// the repo back: the agent dialog then picks its quant and projector.
 
 import { api, readEvents } from './api.js';
-import { announce, modal, toast } from './chrome.js';
+import { announce, dialog, modal, toast } from './chrome.js';
 import { append, corners, h, icon, clear } from './dom.js';
 
 const FORMATS = [['gguf', 'GGUF'], ['diffusers', 'Diffusers'], ['safetensors', 'Safetensors'], ['any', 'Any']];
@@ -27,6 +31,8 @@ const WHERE = { hf_cache: 'in the HF cache', models_dir: 'downloaded', lora_dir:
 /** A LoRA not in the LoRA folder yet, but on this machine: installing copies it. */
 const COPY_FROM = { hf_cache: 'copies from the HF cache', models_dir: 'copies from the models folder' };
 const EXE_WORD = 'sd-server';
+// Tokens are made on the Hub itself, whichever endpoint (a mirror) the server reads through.
+const TOKENS_PAGE = 'https://huggingface.co/settings/tokens';
 
 const size = (bytes) => (bytes == null ? '' : bytes >= 1e9 ? `${(bytes / 1e9).toFixed(1)} GB`
   : bytes >= 1e6 ? `${Math.round(bytes / 1e6)} MB` : `${Math.max(1, Math.round(bytes / 1e3))} KB`);
@@ -45,10 +51,16 @@ export function looksLikeRef(value) {
 /** A repo id on its own (owner/name): opened directly rather than searched for. */
 const isRepoId = (v) => /^[A-Za-z0-9][\w.-]*\/[A-Za-z0-9][\w.-]*$/.test(v.trim());
 
+/** The dialog's target for a new agent: vision models only, tool callers first. */
+export function agentTarget() {
+  return { name: 'new-agent', label: 'New agent', type: 'llamacpp', agent: true };
+}
+
 /** Open the dialog for engine e. ref opens that repo straight away.
  *
- * A model card can be the target instead (modelTarget): its slots are matched instead of an
- * engine's settings, and a download or a "Use" fills the card's slot.
+ * A model card can be the target instead (modelTarget, whose `card` is the card's id): its
+ * slots are matched instead of an engine's settings, and a download or a "Use" fills the
+ * card's slot. (An engine's own `model` is what it reports running, not a card.)
  *
  * With onPick, nothing is downloaded: a repo lists its model files, and the one picked is
  * handed back ({repo, sha, variant, name, size_bytes, local, ref}) for a card not made yet. */
@@ -66,6 +78,9 @@ export function hubDialog(e, { ref = null, onChange = () => {}, onPick = null } 
     status: null,
     focusSearch: !ref, // once, when the search view is first shown
     editingFolder: false,
+    editingToken: false,
+    focusToken: false, // once, when the token field opens
+    tokenDraft: '', // what is typed so far, kept across re-renders (a download's progress)
   };
   const jobs = new Map(); // download id -> latest job
   const meters = new Map(); // variant id ('' for the pipeline) -> {bar, label}
@@ -96,21 +111,104 @@ export function hubDialog(e, { ref = null, onChange = () => {}, onPick = null } 
   function foot() {
     const s = state.status;
     if (!s) return null;
-    const token = s.token ? `Hub token from ${s.token_source}` : 'no Hub token: gated repos need HF_TOKEN or `hf auth login`';
+    return h('div.hub-foot', tokenRow(s), folderRow(s));
+  }
+
+  /** Whose token the server uses, and setting it here: saved where `hf auth login` saves it. */
+  function tokenRow(s) {
+    if (state.editingToken) {
+      const input = h('input.seed-input.path-input', {
+        type: 'password', value: state.tokenDraft, autocomplete: 'off', spellcheck: false,
+        placeholder: 'hf_…', 'aria-label': 'Hugging Face access token',
+        oninput: () => { state.tokenDraft = input.value; },
+        onkeydown: (ev) => { if (ev.key === 'Enter') { ev.preventDefault(); saveToken(input, save); } },
+      });
+      const save = h('button.mini.primary', { type: 'button', onclick: () => saveToken(input, save) }, 'Save');
+      if (state.focusToken) {
+        state.focusToken = false;
+        setTimeout(() => input.focus());
+      }
+      return h('div.hub-foot-edit',
+        h('div.hub-foot-row.hub-folder',
+          h('label.seed-field', icon('key', 13), input), save,
+          h('button.mini', { type: 'button', onclick: closeToken }, 'Cancel')),
+        h('span.tray-hint.wrap', 'A read token is enough: ',
+          h('a', { href: TOKENS_PAGE, target: '_blank', rel: 'noopener noreferrer' }, 'make one on the Hub'),
+          `. The Hub checks it first. It is saved to ${s.token_file}, where the hf CLI and Diffusers on this machine find it too.`));
+    }
+    const text = !s.token ? 'No Hub token: gated and private repos need one'
+      : s.token_valid === false ? `The Hub rejected the token from ${s.token_source}`
+        : s.account ? `Signed in to the Hub as ${s.account} · token from ${s.token_source}`
+          : `Hub token from ${s.token_source}`;
+    const fromEnv = s.token && !s.token_editable;
+    return h('div.hub-foot-row', { class: s.token_valid === false ? 'bad' : '' },
+      icon('key', 13),
+      h('span.tray-hint.wrap', { title: fromEnv ? 'Set where the server starts; it wins over a token set here.' : '' },
+        fromEnv ? `${text} (the server's environment)` : text),
+      s.token_editable && h('button.mini', { type: 'button', onclick: editToken }, s.token ? 'Change token' : 'Set token'),
+      s.token_editable && s.token && h('button.mini', { type: 'button', onclick: logOut }, 'Log out'));
+  }
+
+  function folderRow(s) {
     if (state.editingFolder) {
       const input = h('input.seed-input.path-input', {
         type: 'text', value: s.models_dir, spellcheck: false, 'aria-label': 'Models folder',
         onkeydown: (ev) => { if (ev.key === 'Enter') { ev.preventDefault(); saveFolder(input.value); } },
       });
       setTimeout(() => input.select());
-      return h('div.hub-foot.hub-folder',
+      return h('div.hub-foot-row.hub-folder',
         h('label.seed-field', icon('folder', 13), input),
         h('button.mini.primary', { type: 'button', onclick: () => saveFolder(input.value) }, 'Save'),
         h('button.mini', { type: 'button', onclick: () => { state.editingFolder = false; render(); } }, 'Cancel'));
     }
-    return h('div.hub-foot',
-      h('span.tray-hint.wrap', `${token} · downloads go to ${s.models_dir}${s.hf_cache ? ' · copies in the Hugging Face cache are used in place' : ''}`),
-      h('button.mini', { type: 'button', onclick: () => { state.editingFolder = true; render(); } }, 'Change folder'));
+    return h('div.hub-foot-row',
+      icon('folder', 13),
+      h('span.tray-hint.wrap', `Downloads go to ${s.models_dir}${s.hf_cache ? ' · copies in the Hugging Face cache are used in place' : ''}`),
+      h('button.mini', { type: 'button', onclick: () => { state.editingFolder = true; state.editingToken = false; render(); } }, 'Change folder'));
+  }
+
+  function editToken() {
+    Object.assign(state, { editingToken: true, editingFolder: false, focusToken: true, tokenDraft: '' });
+    render();
+  }
+
+  function closeToken() {
+    Object.assign(state, { editingToken: false, tokenDraft: '' });
+    render();
+  }
+
+  async function saveToken(input, button) {
+    const value = input.value.trim();
+    if (!value) { input.focus(); return; }
+    button.disabled = true;
+    try {
+      state.status = await api.setHubToken(value);
+      toast(state.status.account ? `Signed in to the Hub as ${state.status.account}` : 'Hub token saved');
+      Object.assign(state, { editingToken: false, tokenDraft: '' });
+      if (state.repo) await reloadRepo();
+      render();
+    } catch (err) {
+      button.disabled = false;
+      toast(err.message, { error: true });
+      input.select();
+    }
+  }
+
+  async function logOut() {
+    const s = state.status;
+    const ok = await dialog({
+      title: 'Log out of the Hub?',
+      body: `This removes the token saved at ${s.token_file}, so the hf CLI on this machine is logged out too. Gated and private repos stop working until a token is set again.`,
+      confirm: 'Log out', danger: true,
+    });
+    if (!ok) return;
+    try {
+      state.status = await api.clearHubToken();
+      toast('Logged out of the Hub');
+      render();
+    } catch (err) {
+      toast(err.message, { error: true });
+    }
   }
 
   async function saveFolder(value) {
@@ -136,7 +234,7 @@ export function hubDialog(e, { ref = null, onChange = () => {}, onPick = null } 
       state.focusSearch = false;
       setTimeout(() => input.focus());
     }
-    const seg = h('div.tray-seg.hub-formats', FORMATS.map(([key, text]) => h('button.pick', {
+    const seg = !e.agent && h('div.tray-seg.hub-formats', FORMATS.map(([key, text]) => h('button.pick', {
       type: 'button', class: state.format === key ? 'on' : '', 'aria-pressed': String(state.format === key),
       onclick: () => { state.format = key; state.base = null; search(); },
     }, text)));
@@ -152,17 +250,51 @@ export function hubDialog(e, { ref = null, onChange = () => {}, onPick = null } 
       seg,
       state.base && h('div.hub-banner', h('span.mono-meta.wrap', `quantized versions of ${state.base}`),
         h('button.mini', { type: 'button', onclick: () => { state.base = null; search(); } }, 'Clear')),
-      h('span.eyebrow', state.query || state.base ? 'Results'
-        : ['Trending', TRENDING_TASK[e.type], FORMATS.find(([k]) => k === state.format)[1]].filter(Boolean).join(' · ')),
+      e.agent
+        ? h('span.eyebrow', `${state.query || state.base ? 'Results' : 'Trending'} · GGUF that sees images · tool callers first`)
+        : h('span.eyebrow', state.query || state.base ? 'Results'
+          : ['Trending', TRENDING_TASK[e.type], FORMATS.find(([k]) => k === state.format)[1]].filter(Boolean).join(' · ')),
+      e.agent && h('span.tray-hint.wrap', 'Only models with a vision projector are listed: an agent sees the images it makes. Those whose chat template takes tools can make images themselves.'),
       h('div.hub-results', rows));
   }
 
+  function gatedNote(s) {
+    if (s?.token && s.token_valid !== false) {
+      const who = s.account ? `the account ${s.account}` : 'the account whose token this server uses';
+      return h('div.tool-error', h('span', `Gated: accept its terms on the Hub with ${who}.`));
+    }
+    const text = !s?.token ? 'Gated: accept its terms on the Hub, then set a Hub token.'
+      : s.token_editable ? 'Gated, and the Hub rejected this server\'s token.'
+        : `Gated, and the Hub rejected this server's token: change ${s.token_source} where the server starts.`;
+    return h('div.tool-error', h('span', text),
+      s?.token_editable && h('button.mini', { type: 'button', onclick: editToken }, icon('key', 12), s.token ? 'Change token' : 'Set token'));
+  }
+
   function resultRow(r) {
+    if (e.agent) return agentRow(r);
     const meta = [r.task, r.downloads != null && `↓ ${count(r.downloads)}`, r.likes != null && `♥ ${count(r.likes)}`,
       day(r.updated_at), ...r.formats.map((f) => f.toUpperCase())].filter(Boolean).join(' · ');
     return h('button.hub-result', { type: 'button', onclick: () => openRepo(r.id) },
       h('span.hub-result-id', r.id, r.gated && h('span.state.wait', 'GATED')),
       h('span.mono-meta', meta));
+  }
+
+  /** A vision model for a new agent: whether it calls tools, then its size and standing. */
+  function agentRow(r) {
+    const meta = [r.params, r.architecture, r.downloads != null && `↓ ${count(r.downloads)}`,
+      r.likes != null && `♥ ${count(r.likes)}`, day(r.updated_at)].filter(Boolean).join(' · ');
+    const tools = r.tools === true ? h('span.state.done', { title: 'Its chat template takes tools' }, 'CALLS TOOLS')
+      : r.tools === false ? h('span.state.wait', { title: 'Its chat template takes no tools: it can’t make images itself' }, 'NO TOOLS')
+        : h('span.state', { title: 'The Hub has no chat template for it' }, 'TOOLS ?');
+    return h('button.hub-result.hub-agent', { type: 'button', onclick: () => pickRepo(r.id) },
+      h('span.hub-result-id', r.id, r.gated && h('span.state.wait', 'GATED')),
+      h('span.hub-agent-fit', h('span.state.done', 'SEES IMAGES'), tools),
+      h('span.mono-meta', meta));
+  }
+
+  function pickRepo(id) {
+    box.close();
+    onPick?.({ ref: id, repo: id });
   }
 
   function repoView() {
@@ -177,9 +309,7 @@ export function hubDialog(e, { ref = null, onChange = () => {}, onPick = null } 
     const body = h('div.hub-body',
       h('div.hub-repo-head', back, h('span.mono-meta.wrap', meta), h('span.spacer'),
         h('a.mini', { href: r.url, target: '_blank', rel: 'noopener noreferrer' }, 'Open on the Hub', icon('external', 12))),
-      r.gated && h('div.tool-error', h('span', state.status?.token
-        ? 'Gated: accept its terms on the Hub with the account whose token this server uses.'
-        : 'Gated: accept its terms on the Hub, then set HF_TOKEN (or run `hf auth login`) on this server.')),
+      r.gated && gatedNote(state.status),
       r.notes.map((n) => h('span.tray-hint.wrap', n)));
     if (onPick) {
       body.append(pickCell(r));
@@ -374,6 +504,10 @@ export function hubDialog(e, { ref = null, onChange = () => {}, onPick = null } 
     const value = text.trim();
     state.query = value;
     state.base = null;
+    if (e.agent && value && (looksLikeRef(value) || isRepoId(value))) {
+      pickRepo(value);
+      return;
+    }
     if (value && (looksLikeRef(value) || isRepoId(value))) {
       if (await openRepo(value, { quiet: isRepoId(value) && !looksLikeRef(value) })) return;
     }
@@ -388,6 +522,10 @@ export function hubDialog(e, { ref = null, onChange = () => {}, onPick = null } 
     const trending = !state.query && !state.base;
     const params = { q: state.query, format: state.format, sort: trending ? 'trending' : 'downloads', limit: 30 };
     if (trending && TRENDING_TASK[e.type]) params.task = TRENDING_TASK[e.type];
+    if (e.agent) {
+      Object.assign(params, { format: 'gguf', vision: 'true' });
+      if (trending) params.task = 'image-text-to-text';
+    }
     if (state.base) Object.assign(params, { base_model: state.base, relation: 'quantized' });
     try {
       state.results = await api.hubSearch(params);
@@ -440,13 +578,13 @@ export function hubDialog(e, { ref = null, onChange = () => {}, onPick = null } 
   }
 
   const repoFor = (refText) => (onPick ? api.hubRepo(refText)
-    : e.model ? api.hubRepo(refText, null, e.model) : api.hubRepo(refText, e.name));
+    : e.card ? api.hubRepo(refText, null, e.card) : api.hubRepo(refText, e.name));
 
   async function assign(key, value) {
     const patch = key === 'model_id' ? { model_id: value } : { launch: { files: { [key]: value } } };
     try {
       // An engine that runs a model card loads the card's files.
-      const card = e.model ?? (key !== 'model_id' ? e.model_card : null);
+      const card = e.card ?? (key !== 'model_id' ? e.model_card : null);
       if (card) await api.updateModel(card, { components: { [key]: value } });
       else await api.updateEngine(e.name, patch);
       toast(`${key} set to ${value.split(/[\\/]/).pop()}`);
@@ -459,7 +597,7 @@ export function hubDialog(e, { ref = null, onChange = () => {}, onPick = null } 
 
   async function download(r, body) {
     try {
-      const target = e.model ? { model: e.model } : { engine: e.name };
+      const target = e.card ? { model: e.card } : { engine: e.name };
       const job = await api.hubDownload({ repo: r.id, revision: r.sha ?? undefined, ...target, ...body });
       jobs.set(job.id, job);
       announce(`Downloading ${job.label}`);
@@ -523,5 +661,5 @@ export function hubDialog(e, { ref = null, onChange = () => {}, onPick = null } 
 
 /** A model card's slot as the dialog's target (in place of an engine). */
 export function modelTarget(card, slot = null) {
-  return { name: `model:${card.id}`, label: slot ? `${card.name} · ${slot}` : card.name, type: 'sdcpp', model: card.id, slot };
+  return { name: `model:${card.id}`, label: slot ? `${card.name} · ${slot}` : card.name, type: 'sdcpp', card: card.id, slot };
 }

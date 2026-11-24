@@ -32,7 +32,9 @@ details and the build log path. Failures return exit code 1; Ctrl+C returns 130.
 `status` inspects disk without hardware probes or network requests. `plan` may probe
 hardware but does not create the installation directory, download, or compile.
 `check-update` queries GitHub and inherits the original 100-build notification threshold;
-its JSON includes the build distance even below that threshold.
+its JSON includes the build distance even below that threshold. It checks for the runtime
+the install asked for, not the one a fallback left: a CPU runtime that stands in for CUDA
+reports `"fallback": "cpu"` and an update, however new it is.
 
 Options shared by these commands:
 
@@ -58,13 +60,27 @@ accelerator, version pin, CUDA targets, and extra build arguments, plus executab
 ## Source builds and releases
 
 Release selection matches OS, architecture, accelerator, and CUDA driver compatibility.
+A CUDA build no newer than the driver's CUDA version comes first. Failing that, a newer
+build of the driver's own CUDA major is taken when the GPU is one the release carries
+compiled code for (`sm_86`, `sm_89`, `sm_120`, `sm_121`): CUDA's minor version compatibility
+runs, say, the 13.5 build on a driver that reports 13.4. Other GPUs run the release's PTX,
+which a driver older than the build cannot compile, so they need a driver at least as new.
 Windows CUDA installs include the base archive and matching CUDA runtime DLL archive.
+A CUDA or Vulkan runtime must list its GPU (`llama-server --list-devices`) before it is
+installed, since one whose backend fails to load runs on the CPU without complaint.
 Linux and macOS use their matching tar archives. Upstream release availability is discovered
 from GitHub rather than assuming every accelerator is published for every architecture.
 
-Source builds need Git, CMake, and a C++ toolchain. On Windows, use a Visual Studio developer
-terminal with the C++ workload installed. CUDA additionally requires the CUDA Toolkit;
-having only a working NVIDIA driver is insufficient. The provisioner checks `nvcc` targets
+Source builds need Git, CMake, and a C++ toolchain. On Windows, install Visual Studio or its
+Build Tools with the C++ workload. CUDA additionally requires the CUDA Toolkit;
+having only a working NVIDIA driver is insufficient. nvcc compiles host code with MSVC,
+and each CUDA Toolkit accepts only the MSVC versions it knows: CUDA 13.1 stops before MSVC
+14.50, Visual Studio 2026's compiler. So a Windows CUDA build first finds the newest
+installed MSVC toolset this nvcc accepts (read from its `crt/host_config.h`), loads that
+toolset's environment with `vcvarsall.bat`, and builds with the Ninja that Visual Studio
+ships. If only newer toolsets are installed it stops and says to add the
+`MSVC v143 - VS 2022 C++ x64/x86 build tools` component, or a newer CUDA Toolkit. Started
+from a developer prompt, it keeps the compiler already on PATH. The provisioner checks `nvcc` targets
 and performs a small compile probe before starting the build. `CUDACXX` selects a particular
 CUDA compiler. ROCm needs `hipcc`, Vulkan needs `glslc`, SYCL needs `icpx`, and OpenVINO
 needs its toolkit environment. The source checkout is managed by the provisioner; do not

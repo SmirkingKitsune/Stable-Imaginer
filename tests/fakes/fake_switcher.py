@@ -40,7 +40,8 @@ class FakeSwitcher:
 
 
 def two_card_engine(url: str, **edit: Any) -> SdCppBackendConfig:
-    """Qwen-Image-2.1 for text-to-image, Qwen-Image-Edit-2511 for edits."""
+    """Qwen-Image-2.1 for text-to-image, Qwen-Image-Edit-2511 for edits (or the edit card
+    ``edit`` describes, e.g. ``family="flux1-kontext"``)."""
     launch = SdCppLaunch(diffusion_model=Path("main.gguf"))
     main = sd_config(
         url,
@@ -52,10 +53,12 @@ def two_card_engine(url: str, **edit: Any) -> SdCppBackendConfig:
     )
     view = sd_config(
         url,
-        family="qwen-image-edit-2511",
-        model_card="edit",
-        launch=SdCppLaunch(diffusion_model=Path("edit.gguf")),
-        presets={"lightning": ImagePreset(steps=4, cfg_scale=1.0)},
-        **edit,
+        **{
+            "family": "qwen-image-edit-2511",
+            "model_card": "edit",
+            "launch": SdCppLaunch(diffusion_model=Path("edit.gguf")),
+            "presets": {"lightning": ImagePreset(steps=4, cfg_scale=1.0)},
+            **edit,
+        },
     )
     return main.model_copy(update={"edit_view": view})

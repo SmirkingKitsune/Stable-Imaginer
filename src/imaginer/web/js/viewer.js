@@ -20,11 +20,11 @@
 // job's progress and Cancel, and the reel a tile for each image on its way.
 
 import { portrait } from './agents.js';
-import { download, setImage } from './api.js';
-import { connectionStrip, modelName, toast } from './chrome.js';
+import { api, download, setImage } from './api.js';
+import { connectionStrip, modelName, toast, toastRefusal } from './chrome.js';
 import { corners, h, icon, iconButton, clear } from './dom.js';
 import { clock, imagesSummary, parseArgs, plural, specOf, truncate } from './format.js';
-import { convHash } from './origin.js';
+import { convHash, linkOf } from './origin.js';
 import { promptBar } from './promptbar.js';
 import {
   agentOf, agentOfMessage, attacherOf, branchAt, byLabel, cancelJob, currentBranch, editEngine, ensureLoaded, imageEngine,
@@ -158,6 +158,7 @@ export function viewerScreen({ id, label, navigate }) {
     editBtn,
     maskBtn,
     retryBtn,
+    action('pin', 'Pin', 'Keep it in the artifact library, even if this conversation goes', () => current && keep(current)),
     action('download', 'Download', 'Download', () => current && save(current)));
   const pixelNote = h('span.mono-meta.side-note');
   const prompt = h('p.side-prompt');
@@ -669,9 +670,18 @@ export function viewerScreen({ id, label, navigate }) {
       await retry(id, by.id);
       navigate(chat);
     } catch (err) {
-      if (err.status === 409) {
-        toast('A turn is already running here.', { error: true, action: { label: 'Show', onclick: () => openChat() } });
-      } else toast(err.message, { error: true });
+      toastRefusal(err, { onRunning: () => openChat() });
+    }
+  }
+
+  async function keep(artifact) {
+    try {
+      await api.pinImage({ ref: { origin: linkOf(id) ?? 'local', artifact_id: artifact.id } });
+      toast(`${artifact.label} is pinned in the artifact library`, {
+        action: { label: 'Library', onclick: () => navigate('#/artifacts') },
+      });
+    } catch (err) {
+      toast(`Couldn't pin it: ${err.message}`, { error: true });
     }
   }
 

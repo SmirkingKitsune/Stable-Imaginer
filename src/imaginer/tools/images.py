@@ -76,16 +76,19 @@ def user_preset(
     task: Literal["t2i", "edit"] = "t2i",
     *,
     mask: bool = False,
+    images: int = 1,
 ) -> dict[str, Any]:
     """The backend preset the user picked, as keyword arguments for the lease and the job
     (only the user picks one: its LoRAs and settings aren't offered to the model). A preset
     of an engine's edit card is for its edits, and one of its model card for the rest (and
-    for edits with a ``mask``, when only the model card takes one): a request the other card
-    runs goes without it."""
+    for edits with a ``mask`` or more ``images`` than the edit card takes, when only the
+    model card makes them): a request the other card runs goes without it."""
     if options is None or not options.preset:
         return {}
     if registry is not None:
-        mine = registry.image_preset(task, options.backend, options.preset, mask=mask)
+        mine = registry.image_preset(
+            task, options.backend, options.preset, mask=mask, images=images
+        )
         tasks: tuple[Literal["t2i", "edit"], ...] = ("t2i", "edit")
         if mine is None and any(
             registry.image_preset(card, options.backend, options.preset) for card in tasks
@@ -154,7 +157,7 @@ async def run_image_job(
     try:
         artifacts = await jobs.wait(job_id)
     except ImaginerError as exc:
-        outcome = ToolOutcome.error(exc.code, exc.detail, job_id=job_id)
+        outcome = ToolOutcome.failed(exc, job_id=job_id)
         partial = await jobs.outputs(job_id)
         if partial:
             outcome.content["error"]["images"] = outputs_summary(partial)

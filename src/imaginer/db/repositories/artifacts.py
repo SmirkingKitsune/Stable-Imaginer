@@ -47,6 +47,23 @@ async def get_by_label(session: AsyncSession, conversation_id: str, label: str) 
     return (await session.execute(stmt)).scalar_one_or_none()
 
 
+async def find_by_sha256(
+    session: AsyncSession, conversation_id: str, sha256: str, kind: ArtifactKind
+) -> Artifact | None:
+    """The earliest artifact of ``conversation_id`` with these bytes, if it has one."""
+    stmt = (
+        _active_artifacts()
+        .where(
+            Artifact.conversation_id == conversation_id,
+            Artifact.sha256 == sha256,
+            Artifact.kind == kind,
+        )
+        .order_by(Artifact.id)
+        .limit(1)
+    )
+    return (await session.execute(stmt)).scalar_one_or_none()
+
+
 async def get_many_in_conversation(
     session: AsyncSession, conversation_id: str, artifact_ids: Sequence[str]
 ) -> list[Artifact]:

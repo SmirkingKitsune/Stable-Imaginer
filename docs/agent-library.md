@@ -9,6 +9,37 @@ shows while it thinks.
 The **agent library** (`#/agents` in the UI, `GET /v1/agents` in the API) lists them like the
 model library lists image models: a tile per agent with its portrait as the cover.
 
+## Adding an agent
+
+**Add an agent** takes three steps, like importing a model:
+
+1. **Source.** Drop a `.gguf` on the dialog, browse for one, paste its path, or search Hugging
+   Face. A dropped file is looked for by its name and size (`POST /v1/agents/locate`) in the
+   download folder, the Hugging Face cache, every agent's and llama-server's model folder (and
+   the folder above), and Downloads. "Use what <engine> runs" makes one for an engine started
+   elsewhere.
+2. **Check.** Whether the model can be an agent (`POST /v1/agents/detect`):
+   - **It must see images.** An agent looks at the images it makes, so its model needs a
+     vision projector (`--mmproj`, an `mmproj*.gguf`): one beside a file here, or in the repo.
+     Without one it can't be made. Dropping the projector itself picks the model beside it.
+   - **It should call tools.** Its chat template must take a `tools` list, or llama-server
+     offers it none and it can only talk about images. A model whose template takes none can
+     still be made, with a warning; a chat template file that takes tools
+     (`--chat-template-file`) can replace its own.
+   - The model file (a repo's quants, Q4_K_M first, or the one a `repo:QUANT` asks for) and
+     the projector (F16 first) to use, with copies already on this machine.
+3. **Persona.** Its name, the engine it runs on and its system prompt. Its portrait is its
+   Hub uploader's avatar until it paints its own.
+
+A repo's files download into the agent once it is made. On Hugging Face the dialog lists only
+GGUF repos with a vision projector (`GET /v1/hub/search?vision=true`), each marked CALLS TOOLS
+or NO TOOLS from the chat template the Hub read from its GGUF; tool callers come first.
+
+`POST /v1/agents` holds to the same rule: a path needs a projector (`mmproj`, else the one
+beside it), a repo must have one, and an engine started elsewhere must not report a model
+without vision. Agents made before this rule, and those made at startup from an engine's own
+files, are left as they are.
+
 ## Which agent answers
 
 A message goes to:
@@ -34,7 +65,11 @@ Raw mode runs no LLM, so it has no agent.
   agent's model, vision projector, chat template and context size over its own. **Use on**
   (`POST /v1/agents/{id}/use`) points the engine at the agent and restarts it if it is running;
   it is refused while a turn is using the engine. A turn as an agent whose engine runs another
-  agent's model is refused with 409, so a persona never answers with the wrong model.
+  agent's model is refused with 409, so a persona never answers with the wrong model. That
+  includes a reply, an edit & branch or a retry in an older conversation whose agent the engine
+  no longer runs. The refusal carries `agent_id`, `engine` and `use` (the Use on call), unlike
+  the 409 for a turn already running in the conversation, which carries `turn_id`; the web UI
+  tells them apart and links to the agent's card.
 - **An engine started elsewhere** (a remote llama-server, or one a linked instance shares)
   runs its own model. Its agents carry no files of their own; their persona applies to whatever
   it runs. Several agents can share it; "Make it the default" sets which one new prompts go to.
@@ -85,7 +120,9 @@ A prompt sent from the gallery opens the conversation's viewer:
 | Method | Path | |
 |---|---|---|
 | `GET` | `/v1/agents` | every agent, the chat engines, and the default agent |
-| `POST` | `/v1/agents` | a new agent: `path` (a GGUF here, with `mmproj`), `ref` (a Hub reference), or neither (whatever `engine` runs) |
+| `POST` | `/v1/agents` | a new agent: `path` (a GGUF here, with `mmproj`), `ref` (a Hub reference), or neither (whatever `engine` runs); optionally `chat_template`. Its model must see images |
+| `POST` | `/v1/agents/detect` | whether a model can be an agent (`fit`: vision, tools, problems), with its model files and projectors: `path` (with `mmproj`, `chat_template`), `ref`, or `engine` |
+| `POST` | `/v1/agents/locate` | where a dropped GGUF (`name`, `size_bytes`) is on this machine |
 | `GET`, `PATCH`, `DELETE` | `/v1/agents/{id}` | one agent: name, engine, files, system prompt, viewer, tools, sampling, context, notes, tags, pin |
 | `POST` | `/v1/agents/{id}/use`, `/stop` | run its model on its engine (restarting it), or stop that engine |
 | `PUT` | `/v1/agents/{id}/portrait` | show one of its portraits (`key`), an image from a conversation (`artifact_id`), the Hub avatar fetched again (`refresh`), or none (`key: none`) |

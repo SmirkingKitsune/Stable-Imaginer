@@ -48,8 +48,10 @@ from imaginer.db.engine import Database
 from imaginer.db.repositories import links as links_repo
 from imaginer.domain import models as dto
 from imaginer.domain.errors import (
+    EngineUnavailableError,
     ForbiddenError,
     ImaginerError,
+    InvalidRequestError,
     NotFoundError,
     PairingError,
     TooManyRequestsError,
@@ -442,6 +444,45 @@ class LinkService:
         if link.checked_at is not None and time.monotonic() - link.checked_at < max_age_s:
             return
         self._spawn(self.poll(link))
+
+    def check(self, link: Link, recheck_after_s: float = 5.0) -> None:
+        """Raise at once for a link known not to answer (or not to take this instance's
+        requests), asking an unreachable one again in the background."""
+        if link.status in ("unauthorized", "incompatible"):
+            raise InvalidRequestError(link.detail or f"{link.peer_name} is {link.status}")
+        if link.status == "unreachable":
+            self.recheck(link, recheck_after_s)
+            raise EngineUnavailableError(link.detail or f"{link.peer_name} is unreachable")
+
+    async def ask(
+        self,
+        link: Link,
+        method: str,
+        path: str,
+        *,
+        params: dict[str, Any] | None = None,
+        timeout_s: float,
+        accept_status: frozenset[int] = frozenset(),
+        recheck_after_s: float = 5.0,
+    ) -> httpx.Response:
+        """One request to a linked instance, failing fast when it is known to be down.
+
+        A link last seen unreachable isn't waited for (a refused connection alone can take
+        seconds): the call fails at once and the link is asked again in the background, at
+        most every ``recheck_after_s``. A request that fails marks it for a recheck now."""
+        self.check(link, recheck_after_s)
+        try:
+            return await link.transport.request(
+                method,
+                path,
+                params=params,
+                timeout_s=timeout_s,
+                attempts=1,
+                accept_status=accept_status,
+            )
+        except ImaginerError:
+            self.recheck(link, 0)  # so the next requests know without waiting
+            raise
 
     async def poll(self, link: Link) -> None:
         """Ask the peer what it shares. Concurrent callers share one request."""

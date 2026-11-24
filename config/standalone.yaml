@@ -50,8 +50,8 @@ routing:
   edit: sdcpp
 
 # Hugging Face: the Engines screen finds models on the Hub and downloads them here, or uses
-# copies already in the Hugging Face cache (docs/huggingface.md). Gated repos need HF_TOKEN
-# in the environment, or `hf auth login`.
+# copies already in the Hugging Face cache (docs/huggingface.md). Gated repos need a Hub
+# token: Set token in the Hugging Face dialog, HF_TOKEN in the environment, or `hf auth login`.
 # hub:
 #   models_dir: D:/models   # default: <data_root>/models
 

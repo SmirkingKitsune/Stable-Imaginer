@@ -114,6 +114,14 @@ class EngineError(ImaginerError):
     title = "Engine error"
 
 
+class EngineCrashedError(EngineError):
+    """The engine process this server started exited while it had work. ``engine_report``
+    in its extras says what its log showed (engines/diagnostics.py)."""
+
+    code = "engine_crashed"
+    title = "Engine crashed"
+
+
 class EngineInterruptedError(EngineError):
     """The engine's stream ended before it said it was finished."""
 
